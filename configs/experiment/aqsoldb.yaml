@@ -1,0 +1,46 @@
+# @package _global_
+general:
+    name : 'aqsoldb'
+    gpus : 1
+    wandb: 'online'
+    remove_h: True
+    resume: null
+    test_only: null
+    check_val_every_n_epochs: 1
+    val_check_interval: null
+    sample_every_val: 4
+    samples_to_generate: 256
+    samples_to_save: 20
+    chains_to_save: 5
+    log_every_steps: 50
+
+    final_model_samples_to_generate: 10000
+    final_model_samples_to_save: 50
+    final_model_chains_to_save: 20
+
+train:
+    optimizer: adamw
+    n_epochs: 300
+    batch_size: 128                                 # Smaller batch size for ~11k dataset
+    save_model: True
+    lr: 2e-4
+    num_workers: 4
+    time_distortion: 'polydec'
+
+sample:
+    time_distortion: 'polydec'
+    omega: 0.3                                      # Target guidance (can be optimized)
+    eta: 100                                        # Stochasticity (can be optimized)
+
+model:
+    n_layers: 9                                     # Slightly smaller for smaller dataset
+    type: 'discrete'
+    transition: 'marginal'                          # uniform or marginal
+    model: 'graph_tf'
+
+    # Do not set hidden_mlp_E, dim_ffE too high, computing large tensors on the edges is costly
+    hidden_mlp_dims: { 'X': 256, 'E': 128, 'y': 256}
+    rrwp_steps: 20
+
+    # The dimensions should satisfy dx % n_head == 0
+    hidden_dims: { 'dx': 256, 'de': 64, 'dy': 128, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 128, 'dim_ffy': 256}

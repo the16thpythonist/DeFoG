@@ -2,7 +2,7 @@ import os
 import pathlib
 import warnings
 
-import graph_tool
+# import graph_tool  # Only needed for non-molecular datasets, imported in their modules
 import torch
 
 torch.cuda.empty_cache()
@@ -78,7 +78,7 @@ def main(cfg: DictConfig):
         )
 
 
-    elif dataset_config["name"] in ["qm9", "guacamol", "moses", "zinc"]:
+    elif dataset_config["name"] in ["qm9", "guacamol", "moses", "zinc", "aqsoldb"]:
         from metrics.molecular_metrics import (
             TrainMolecularMetrics,
             SamplingMolecularMetrics,
@@ -127,6 +127,15 @@ def main(cfg: DictConfig):
                 datamodule=datamodule,
                 dataset_infos=dataset_infos,
                 evaluate_datasets=False,
+            )
+        elif dataset_config["name"] == "aqsoldb":
+            from datasets import aqsoldb_dataset
+
+            datamodule = aqsoldb_dataset.AqSolDBDataModule(cfg)
+            dataset_infos = aqsoldb_dataset.AqSolDBinfos(datamodule, cfg)
+            dataset_smiles = aqsoldb_dataset.get_smiles(
+                raw_dir=datamodule.train_dataset.raw_dir,
+                filter_dataset=cfg.dataset.filter,
             )
         else:
             raise ValueError("Dataset not implemented")

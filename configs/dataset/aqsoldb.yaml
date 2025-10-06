@@ -1,0 +1,5 @@
+name: 'aqsoldb'
+datadir: 'data/aqsoldb/aqsoldb_pyg/'     # Relative to the aqsoldb_dataset.py file
+remove_h: null
+filter: False                             # Set to True to filter invalid molecules
+compute_fcd: False                        # Compute FCD scores (requires FCD package)
