@@ -141,6 +141,10 @@ class MolecularVisualization:
                 {"chain": wandb.Video(gif_path, fps=5, format="gif")}, commit=True
             )
 
+        # Clean up individual frame files
+        for frame_file in save_paths:
+            os.remove(frame_file)
+
         # draw grid image
         try:
             img = Draw.MolsToGridImage(mols, molsPerRow=10, subImgSize=(200, 200))
@@ -304,3 +308,7 @@ class NonMolecularVisualization:
             wandb.log(
                 {"chain": [wandb.Video(gif_path, caption=gif_path, format="gif")]}
             )
+
+        # Clean up individual frame files
+        for frame_file in save_paths:
+            os.remove(frame_file)

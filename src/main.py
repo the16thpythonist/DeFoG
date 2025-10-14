@@ -1,13 +1,63 @@
 import os
 import pathlib
 import warnings
+import random
+import string
 
 # import graph_tool  # Only needed for non-molecular datasets, imported in their modules
 import torch
 
 torch.cuda.empty_cache()
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
+
+# Fix for PyTorch 2.6+: Allow OmegaConf and custom objects in checkpoint loading
+# PyTorch 2.6 changed torch.load() default to weights_only=True for security
+# Our checkpoints contain OmegaConf config objects and model classes, so we need to allowlist them
+# These are trusted checkpoints created by this codebase, so it's safe to add these globals
+
+# Import all required classes for safe_globals
+from omegaconf.base import ContainerMetadata, Metadata
+from omegaconf.listconfig import ListConfig
+from omegaconf.nodes import AnyNode
+import numpy as np
+from collections import defaultdict
+from typing import Any
+
+# Add all required classes to safe globals
+torch.serialization.add_safe_globals([
+    # OmegaConf classes
+    DictConfig, ListConfig, ContainerMetadata, Metadata, AnyNode,
+    # NumPy classes
+    np.dtype, type(np.array(0).item()),  # numpy.core.multiarray.scalar
+    # Python builtins and typing
+    dict, list, int, defaultdict, Any,
+    # PyTorch classes
+    torch.distributions.categorical.Categorical,
+])
+
+# Project-specific classes will be added dynamically after they're imported
+# This function will be called before loading checkpoints
+def add_project_safe_globals():
+    """Add project-specific classes to safe globals for checkpoint loading"""
+    import sys
+    safe_classes = []
+
+    # Collect all classes from project modules that might be in checkpoints
+    for module_name in list(sys.modules.keys()):
+        if any(module_name.startswith(prefix) for prefix in ['models.', 'datasets.', 'analysis.', 'metrics.']):
+            try:
+                module = sys.modules[module_name]
+                # Get all classes from the module
+                for attr_name in dir(module):
+                    attr = getattr(module, attr_name)
+                    if isinstance(attr, type):  # It's a class
+                        safe_classes.append(attr)
+            except (AttributeError, ImportError):
+                pass
+
+    if safe_classes:
+        torch.serialization.add_safe_globals(safe_classes)
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -21,10 +71,93 @@ from models.extra_features import DummyExtraFeatures, ExtraFeatures
 
 warnings.filterwarnings("ignore", category=PossibleUserWarning)
 
+# Register custom resolver for unique random ID to prevent output directory collisions
+OmegaConf.register_new_resolver(
+    "random_id",
+    lambda: ''.join(random.choices(string.ascii_lowercase + string.digits, k=4)),
+    use_cache=True  # Ensures same ID is used throughout config
+)
+
+
+def print_config_summary(cfg: DictConfig):
+    """Print a formatted summary of all configuration parameters"""
+    print("\n" + "=" * 80)
+    print("CONFIGURATION SUMMARY".center(80))
+    print("=" * 80)
+
+    # General Settings
+    print("\n[GENERAL SETTINGS]")
+    print(f"  Experiment name:        {cfg.general.name}")
+    print(f"  Wandb mode:             {cfg.general.wandb}")
+    print(f"  GPUs:                   {cfg.general.gpus}")
+    print(f"  Seed:                   {cfg.train.seed}")
+    print(f"  Test only:              {cfg.general.test_only}")
+    print(f"  Resume from:            {cfg.general.resume}")
+
+    # Dataset Settings
+    print("\n[DATASET SETTINGS]")
+    print(f"  Dataset name:           {cfg.dataset.name}")
+    if hasattr(cfg.dataset, 'datadir'):
+        print(f"  Data directory:         {cfg.dataset.datadir}")
+    print(f"  Batch size:             {cfg.train.batch_size}")
+    print(f"  Num workers:            {cfg.train.num_workers}")
+
+    # Training Settings
+    print("\n[TRAINING SETTINGS]")
+    print(f"  Number of epochs:       {cfg.train.n_epochs}")
+    print(f"  Learning rate:          {cfg.train.lr}")
+    print(f"  Optimizer:              {cfg.train.optimizer}")
+    print(f"  Weight decay:           {cfg.train.weight_decay}")
+    print(f"  Gradient clipping:      {cfg.train.clip_grad}")
+    print(f"  EMA decay:              {cfg.train.ema_decay}")
+    print(f"  Time distortion:        {cfg.train.time_distortion}")
+    print(f"  Save model:             {cfg.train.save_model}")
+
+    # Model Settings
+    print("\n[MODEL SETTINGS]")
+    print(f"  Model type:             {cfg.model.model}")
+    print(f"  Transition:             {cfg.model.transition}")
+    print(f"  Number of layers:       {cfg.model.n_layers}")
+    print(f"  Hidden dims:            {cfg.model.hidden_dims}")
+    print(f"  Hidden MLP dims:        {cfg.model.hidden_mlp_dims}")
+    print(f"  Extra features:         {cfg.model.extra_features}")
+    print(f"  RRWP steps:             {cfg.model.rrwp_steps}")
+    print(f"  Lambda train [E, y]:    {cfg.model.lambda_train}")
+
+    # Sampling Settings
+    print("\n[SAMPLING SETTINGS]")
+    print(f"  Eta:                    {cfg.sample.eta}")
+    print(f"  Omega:                  {cfg.sample.omega}")
+    print(f"  Sample steps:           {cfg.sample.sample_steps}")
+    print(f"  Time distortion:        {cfg.sample.time_distortion}")
+    print(f"  Search mode:            {cfg.sample.search}")
+    print(f"  RDB type:               {cfg.sample.rdb}")
+
+    # Validation Settings
+    print("\n[VALIDATION SETTINGS]")
+    print(f"  Check val every:        {cfg.general.check_val_every_n_epochs} epochs")
+    print(f"  Sample every val:       {cfg.general.sample_every_val}")
+    print(f"  Samples to generate:    {cfg.general.samples_to_generate}")
+    print(f"  Samples to save:        {cfg.general.samples_to_save}")
+    print(f"  Chains to save:         {cfg.general.chains_to_save}")
+
+    # Conditional Generation (if applicable)
+    if cfg.general.conditional:
+        print("\n[CONDITIONAL GENERATION]")
+        print(f"  Conditional:            {cfg.general.conditional}")
+        print(f"  Target:                 {cfg.general.target}")
+        print(f"  Guidance weight:        {cfg.general.guidance_weight}")
+
+    print("\n" + "=" * 80 + "\n")
+
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
     pl.seed_everything(cfg.train.seed)
+
+    # Print configuration summary
+    print_config_summary(cfg)
+
     dataset_config = cfg["dataset"]
 
     if dataset_config["name"] in [
@@ -252,6 +385,9 @@ def main(cfg: DictConfig):
         log_every_n_steps=50 if name != "debug" else 1,
         logger=[],
     )
+
+    # Add project-specific classes to safe globals before loading any checkpoints
+    add_project_safe_globals()
 
     if not cfg.general.test_only and cfg.general.generated_path is None:
         trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.general.resume)

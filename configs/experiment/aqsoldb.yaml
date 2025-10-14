@@ -2,26 +2,26 @@
 general:
     name : 'aqsoldb'
     gpus : 1
-    wandb: 'online'
+    wandb: 'disabled'
     remove_h: True
     resume: null
     test_only: null
-    check_val_every_n_epochs: 1
+    check_val_every_n_epochs: 5
     val_check_interval: null
-    sample_every_val: 4
-    samples_to_generate: 256
-    samples_to_save: 20
+    sample_every_val: 5
+    samples_to_generate: 64
+    samples_to_save: 10
     chains_to_save: 5
-    log_every_steps: 50
+    log_every_steps: 200
 
-    final_model_samples_to_generate: 10000
+    final_model_samples_to_generate: 1000
     final_model_samples_to_save: 50
-    final_model_chains_to_save: 20
+    final_model_chains_to_save: 30
 
 train:
-    optimizer: adamw
-    n_epochs: 300
-    batch_size: 128                                 # Smaller batch size for ~11k dataset
+    optimizer: adam
+    n_epochs: 200
+    batch_size: 16                                # Smaller batch size for ~11k dataset
     save_model: True
     lr: 2e-4
     num_workers: 4

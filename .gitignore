@@ -157,3 +157,6 @@ src/analysis/orca/tmp*
 src/timer.dat
 checkpoints
 wandb/
+
+slurm-*.out
+**/.aslurm/*

@@ -206,5 +206,10 @@ def setup_wandb(cfg):
         "mode": cfg.general.wandb,
     }
     config_dict["general"]["local_dir"] = os.getcwd()
-    wandb.init(**kwargs)
-    wandb.save("*.txt")
+
+    try:
+        wandb.init(**kwargs)
+        wandb.save("*.txt")
+    except Exception as e:
+        print(f"[WARNING] Failed to initialize wandb: {e}")
+        print("[WARNING] Continuing without wandb logging...")

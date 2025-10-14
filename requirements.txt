@@ -11,6 +11,7 @@ PyGSP==0.5.1
 pytorch_lightning==2.0.4
 scipy==1.11.0
 setuptools==68.0.0
+torch==2.5.1
 torch_geometric==2.3.1
 torchmetrics==0.11.4
 tqdm==4.65.0

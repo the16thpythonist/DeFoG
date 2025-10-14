@@ -10,5 +10,5 @@ hydra:
   job:
     chdir: True
   run:
-    dir: ../outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-${dataset.name}-${general.name}
+    dir: ../outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-${random_id:}-${dataset.name}-${general.name}
 
