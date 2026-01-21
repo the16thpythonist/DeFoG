@@ -279,6 +279,90 @@ g++ -O2 -std=c++11 -o orca orca.cpp
 
 ---
 
+## 7. Standalone Sampling Script (sample.py)
+
+For user-specified conditional generation with detailed output and distribution plots.
+
+### Installation
+
+```bash
+# Install additional dependencies
+pip install rich rich-click
+```
+
+### Basic Usage
+
+```bash
+cd src
+
+# Unconditional generation
+python sample.py --checkpoint path/to/model.ckpt --num-samples 100
+
+# Conditional generation (single property, e.g., dipole moment)
+python sample.py --checkpoint path/to/model.ckpt --condition 2.5 --num-samples 100
+
+# Conditional generation (multiple properties, e.g., mu and homo)
+python sample.py --checkpoint path/to/model.ckpt --condition 2.5 -0.25 --num-samples 100
+```
+
+### All Options
+
+```bash
+python sample.py \
+    --checkpoint path/to/model.ckpt \    # Required: path to trained model
+    --condition 2.5 -0.25 \              # Optional: condition values
+    --num-samples 100 \                   # Number of samples to generate
+    --output-dir ./generated \            # Output directory
+    --eta 0 \                             # Stochasticity parameter
+    --omega 0.05 \                        # Target guidance parameter
+    --steps 1000 \                        # Number of sampling steps
+    --time-distortion polydec \           # Time distortion type
+    --guidance-weight 1.0 \               # Classifier-free guidance weight
+    --seed 42                             # Random seed for reproducibility
+```
+
+### Output Structure
+
+```
+generated/
+├── summary.json                 # Run metadata and parameters
+├── samples.csv                  # All samples with SMILES and properties
+├── samples.pkl                  # Raw graph data
+├── smiles.txt                   # One SMILES per line
+├── condition_1/                 # First property analysis
+│   ├── info.json               # Property info and percentile
+│   └── distribution_plot.png   # Dataset vs generated distribution
+├── condition_2/                 # Second property (if multi-property)
+│   └── ...
+```
+
+### Features
+
+- **Condition validation**: Checks if condition is within dataset range, shows percentile
+- **Distribution plots**: Compares generated samples to training distribution
+- **Property computation**: Uses PSI4 for quantum chemistry calculations (mu, homo)
+- **Progress bars**: Rich progress bars during sampling and property computation
+- **Multiple formats**: JSON summary, CSV table, PKL for raw data, TXT for SMILES
+
+### Example: Generate molecules with specific dipole moment
+
+```bash
+# Generate 50 molecules with dipole moment = 3.0 Debye
+python sample.py \
+    --checkpoint checkpoints/qm9_conditional.ckpt \
+    --condition 3.0 \
+    --num-samples 50 \
+    --output-dir ./dipole_3.0 \
+    --eta 10 --omega 0.1 --steps 500
+
+# Output shows:
+# - Validation: "Dipole Moment: 3.0 Debye, Percentile: 72.3%"
+# - Results: "Valid: 48/50 (96.0%), Unique: 45/48 (93.8%)"
+# - Distribution plot comparing generated vs dataset
+```
+
+---
+
 ## Additional Resources
 
 - **Paper**: https://arxiv.org/pdf/2410.04263
