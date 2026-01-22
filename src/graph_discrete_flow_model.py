@@ -508,6 +508,16 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             elif "tls" in self.cfg.dataset.name:
                 z_T.y = torch.zeros(batch_size, 1).to(self.device)
                 z_T.y[: batch_size // 2] = 1
+            elif "aqsoldb" in self.cfg.dataset.name:
+                target = getattr(self.cfg.general, 'target', 'logp')
+                if target in ["logp_binary", "solubility_binary"]:
+                    # Binary conditioning: half high (1), half low (0)
+                    z_T.y = torch.zeros(batch_size, 1).to(self.device)
+                    z_T.y[: batch_size // 2] = 1
+                else:
+                    # Continuous conditioning: sample from normalized range [-2, 2]
+                    # This covers most of the training distribution
+                    z_T.y = torch.linspace(-2, 2, batch_size).unsqueeze(1).to(self.device)
             else:
                 raise NotImplementedError
         X, E, y = z_T.X, z_T.E, z_T.y

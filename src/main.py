@@ -151,12 +151,61 @@ def print_config_summary(cfg: DictConfig):
     print("\n" + "=" * 80 + "\n")
 
 
+def print_gpu_info(cfg: DictConfig):
+    """Print GPU availability and usage information"""
+    print("\n" + "=" * 80)
+    print("GPU INFORMATION".center(80))
+    print("=" * 80)
+
+    cuda_available = torch.cuda.is_available()
+    print(f"\n[GPU AVAILABILITY]")
+    print(f"  CUDA available:         {cuda_available}")
+    print(f"  CUDA version:           {torch.version.cuda if cuda_available else 'N/A'}")
+    print(f"  PyTorch version:        {torch.__version__}")
+
+    if cuda_available:
+        device_count = torch.cuda.device_count()
+        print(f"  Number of GPUs:         {device_count}")
+
+        for i in range(device_count):
+            print(f"\n[GPU {i}: {torch.cuda.get_device_name(i)}]")
+            props = torch.cuda.get_device_properties(i)
+            print(f"  Compute capability:     {props.major}.{props.minor}")
+            print(f"  Total memory:           {props.total_memory / 1024**3:.2f} GB")
+            print(f"  Multi-processor count:  {props.multi_processor_count}")
+
+            # Current memory usage (if any tensors are allocated)
+            mem_allocated = torch.cuda.memory_allocated(i) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(i) / 1024**3
+            print(f"  Memory allocated:       {mem_allocated:.2f} GB")
+            print(f"  Memory reserved:        {mem_reserved:.2f} GB")
+
+    # Determine if GPU will be used
+    use_gpu = cfg.general.gpus > 0 and cuda_available
+    print(f"\n[USAGE DECISION]")
+    print(f"  Requested GPUs (config):{cfg.general.gpus}")
+    print(f"  Will use GPU:           {use_gpu}")
+    if use_gpu:
+        print(f"  Accelerator:            gpu")
+        print(f"  Devices:                {cfg.general.gpus}")
+    else:
+        print(f"  Accelerator:            cpu")
+        print(f"  Devices:                1")
+        if cfg.general.gpus > 0 and not cuda_available:
+            print(f"  Warning:                GPU requested but CUDA not available, falling back to CPU")
+
+    print("\n" + "=" * 80 + "\n")
+
+
 @hydra.main(version_base="1.3", config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
     pl.seed_everything(cfg.train.seed)
 
     # Print configuration summary
     print_config_summary(cfg)
+
+    # Print GPU information
+    print_gpu_info(cfg)
 
     dataset_config = cfg["dataset"]
 
