@@ -10,8 +10,8 @@ Tests cover:
 import pytest
 import torch
 
-from src.core.rate_matrix import RateMatrixDesigner
-from src.core.noise import LimitDistribution
+from defog.core.rate_matrix import RateMatrixDesigner
+from defog.core.noise import LimitDistribution
 
 
 @pytest.fixture

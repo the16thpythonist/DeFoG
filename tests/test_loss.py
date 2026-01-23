@@ -9,7 +9,7 @@ Tests cover:
 import pytest
 import torch
 
-from src.core.loss import TrainLoss, compute_loss_components
+from defog.core.loss import TrainLoss, compute_loss_components
 
 
 @pytest.fixture

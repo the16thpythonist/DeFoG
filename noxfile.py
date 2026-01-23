@@ -27,8 +27,8 @@ def install(session: nox.Session) -> None:
     session.install("-e", ".")
 
     # Verify the package is importable
-    session.run("python", "-c", "import src.core; print('src.core imported successfully')")
-    session.run("python", "-c", "from src.core import DeFoGModel; print('DeFoGModel imported successfully')")
+    session.run("python", "-c", "import defog.core; print('defog.core imported successfully')")
+    session.run("python", "-c", "from defog.core import DeFoGModel; print('DeFoGModel imported successfully')")
 
 
 @nox.session(python="3.9")

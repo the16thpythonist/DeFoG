@@ -10,8 +10,8 @@ Tests cover:
 import pytest
 import torch
 
-from src.core.transformer import GraphTransformer
-from src.core.data import PlaceHolder
+from defog.core.transformer import GraphTransformer
+from defog.core.data import PlaceHolder
 
 
 @pytest.fixture

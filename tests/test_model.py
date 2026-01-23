@@ -15,7 +15,7 @@ import tempfile
 import os
 from torch_geometric.data import Data, Batch
 
-from src.core import DeFoGModel
+from defog.core import DeFoGModel
 
 
 class TestDeFoGModelCreation:

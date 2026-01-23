@@ -11,12 +11,12 @@ Tests cover:
 import pytest
 import torch
 
-from src.core.noise import (
+from defog.core.noise import (
     LimitDistribution,
     sample_noise,
     sample_from_probs,
 )
-from src.core.data import PlaceHolder
+from defog.core.data import PlaceHolder
 
 
 class TestLimitDistribution:

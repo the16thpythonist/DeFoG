@@ -9,8 +9,8 @@ Tests cover:
 import pytest
 import torch
 
-from src.core.features import ExtraFeatures, RRWPFeatures
-from src.core.data import PlaceHolder
+from defog.core.features import ExtraFeatures, RRWPFeatures
+from defog.core.data import PlaceHolder
 
 
 @pytest.fixture

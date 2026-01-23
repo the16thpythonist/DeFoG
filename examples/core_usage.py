@@ -21,7 +21,7 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 
 # Import the core module
-from src.core import (
+from defog.core import (
     DeFoGModel,
     PlaceHolder,
     to_dense,

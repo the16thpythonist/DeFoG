@@ -13,7 +13,7 @@ import pytest
 import torch
 from torch_geometric.data import Data, Batch
 
-from src.core.data import (
+from defog.core.data import (
     PlaceHolder,
     to_dense,
     dense_to_pyg,

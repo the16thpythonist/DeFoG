@@ -205,7 +205,7 @@ def edge_marginals():
 @pytest.fixture
 def limit_distribution(node_marginals, edge_marginals):
     """Create a LimitDistribution for testing."""
-    from src.core.noise import LimitDistribution
+    from defog.core.noise import LimitDistribution
     return LimitDistribution(
         noise_type="marginal",
         num_node_classes=4,
@@ -218,7 +218,7 @@ def limit_distribution(node_marginals, edge_marginals):
 @pytest.fixture
 def uniform_limit_distribution():
     """Create a uniform LimitDistribution for testing."""
-    from src.core.noise import LimitDistribution
+    from defog.core.noise import LimitDistribution
     return LimitDistribution(
         noise_type="uniform",
         num_node_classes=4,
@@ -229,7 +229,7 @@ def uniform_limit_distribution():
 @pytest.fixture
 def small_model(small_model_config, node_counts_distribution):
     """Create a small DeFoGModel for testing."""
-    from src.core import DeFoGModel
+    from defog.core import DeFoGModel
     return DeFoGModel(
         **small_model_config,
         noise_type="uniform",

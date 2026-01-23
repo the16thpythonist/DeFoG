@@ -10,7 +10,7 @@ Tests cover:
 import pytest
 import torch
 
-from src.core.layers import (
+from defog.core.layers import (
     XEyTransformerLayer,
     NodeEdgeBlock,
     Xtoy,

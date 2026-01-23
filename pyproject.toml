@@ -67,7 +67,10 @@ Documentation = "https://github.com/qym7/DeFoG"
 Repository = "https://github.com/qym7/DeFoG"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["defog"]
+
+[tool.hatch.build.targets.sdist]
+include = ["defog/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

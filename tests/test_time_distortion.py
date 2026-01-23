@@ -11,7 +11,7 @@ Tests cover:
 import pytest
 import torch
 
-from src.core.time_distortion import TimeDistorter
+from defog.core.time_distortion import TimeDistorter
 
 
 class TestTimeDistorter:
