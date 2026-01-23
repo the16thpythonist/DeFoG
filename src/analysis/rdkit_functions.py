@@ -9,6 +9,7 @@ from torchmetrics import MeanSquaredError, MeanAbsoluteError
 
 try:
     from rdkit import Chem
+    from rdkit.Chem import Crippen
     from rdkit.Chem.rdDistGeom import ETKDGv3, EmbedMolecule
     from rdkit.Chem.rdForceFieldHelpers import (
         MMFFHasAllMoleculeParams,
@@ -415,6 +416,178 @@ def mol2smiles(mol):
 
 def mol2smilesWithNoSanitize(mol):
     return Chem.MolToSmiles(mol)
+
+
+def compute_logp_from_smiles(smiles):
+    """Compute Crippen logP from a SMILES string.
+
+    Args:
+        smiles: SMILES string
+
+    Returns:
+        logP value or None if computation fails
+    """
+    if smiles is None:
+        return None
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        return Crippen.MolLogP(mol)
+    except Exception:
+        return None
+
+
+def compute_logp_metrics(
+    all_smiles,
+    target_logp_normalized,
+    logp_mean=2.5,
+    logp_std=1.5,
+    output_dir=".",
+    test=False,
+):
+    """Compute logP verification metrics for conditional generation.
+
+    Computes the logP of generated molecules and compares with conditioning targets.
+
+    Args:
+        all_smiles: List of generated SMILES (may contain None for invalid molecules)
+        target_logp_normalized: Tensor of normalized target logP values used for conditioning
+        logp_mean: Mean used for logP normalization
+        logp_std: Std used for logP normalization
+        output_dir: Directory to save detailed results
+        test: Whether this is test-time evaluation
+
+    Returns:
+        Dictionary with:
+            - mae: Mean absolute error between target and generated logP
+            - correlation: Pearson correlation
+            - per_bin_accuracy: Accuracy per logP bin
+            - results_df: DataFrame with detailed per-molecule results
+    """
+    import os
+    from scipy import stats
+
+    # Denormalize target logP
+    if isinstance(target_logp_normalized, torch.Tensor):
+        target_logp = target_logp_normalized.cpu().numpy().flatten() * logp_std + logp_mean
+    else:
+        target_logp = np.array(target_logp_normalized).flatten() * logp_std + logp_mean
+
+    # Compute logP for generated molecules
+    generated_logp = []
+    valid_indices = []
+
+    for i, smiles in enumerate(all_smiles):
+        logp = compute_logp_from_smiles(smiles)
+        generated_logp.append(logp)
+        if logp is not None:
+            valid_indices.append(i)
+
+    # Create results DataFrame
+    results_df = pd.DataFrame({
+        'smiles': all_smiles,
+        'target_logp': target_logp[:len(all_smiles)],
+        'generated_logp': generated_logp,
+        'valid': [logp is not None for logp in generated_logp],
+    })
+
+    # Compute metrics only on valid molecules
+    if len(valid_indices) == 0:
+        print("No valid molecules for logP verification")
+        return {
+            'mae': -1,
+            'rmse': -1,
+            'correlation': -1,
+            'valid_fraction': 0,
+            'per_bin_accuracy': {},
+            'results_df': results_df,
+        }
+
+    valid_target = target_logp[valid_indices]
+    valid_generated = np.array([generated_logp[i] for i in valid_indices])
+
+    # Aggregate statistics
+    mae = np.mean(np.abs(valid_target - valid_generated))
+    rmse = np.sqrt(np.mean((valid_target - valid_generated) ** 2))
+
+    # Correlation
+    if len(valid_indices) > 1:
+        correlation, p_value = stats.pearsonr(valid_target, valid_generated)
+    else:
+        correlation = 0.0
+
+    # Per-bin accuracy (binned by target logP)
+    bins = [-np.inf, 0, 1, 2, 3, 4, np.inf]
+    bin_labels = ['<0', '0-1', '1-2', '2-3', '3-4', '>4']
+    per_bin_mae = {}
+
+    target_bins = np.digitize(valid_target, bins) - 1
+    for bin_idx, label in enumerate(bin_labels):
+        bin_mask = target_bins == bin_idx
+        if np.sum(bin_mask) > 0:
+            bin_mae = np.mean(np.abs(valid_target[bin_mask] - valid_generated[bin_mask]))
+            bin_count = np.sum(bin_mask)
+            per_bin_mae[label] = {'mae': bin_mae, 'count': int(bin_count)}
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print("LogP Verification Results")
+    print(f"{'='*60}")
+    print(f"  Valid molecules:     {len(valid_indices)} / {len(all_smiles)} ({100*len(valid_indices)/len(all_smiles):.1f}%)")
+    print(f"  Target logP:         mean={np.mean(valid_target):.3f}, std={np.std(valid_target):.3f}")
+    print(f"  Generated logP:      mean={np.mean(valid_generated):.3f}, std={np.std(valid_generated):.3f}")
+    print(f"  MAE:                 {mae:.3f}")
+    print(f"  RMSE:                {rmse:.3f}")
+    print(f"  Correlation:         {correlation:.3f}")
+    print(f"\n  Per-bin MAE:")
+    for label, data in per_bin_mae.items():
+        print(f"    {label}: MAE={data['mae']:.3f} (n={data['count']})")
+    print(f"{'='*60}\n")
+
+    # Save to file
+    if test:
+        results_path = os.path.join(output_dir, "logp_verification_results.csv")
+        results_df.to_csv(results_path, index=False)
+        print(f"Detailed results saved to: {results_path}")
+
+        # Save summary
+        summary_path = os.path.join(output_dir, "logp_verification_summary.txt")
+        with open(summary_path, 'w') as f:
+            f.write("LogP Verification Summary\n")
+            f.write("="*60 + "\n\n")
+            f.write(f"Valid molecules: {len(valid_indices)} / {len(all_smiles)} ({100*len(valid_indices)/len(all_smiles):.1f}%)\n")
+            f.write(f"Target logP: mean={np.mean(valid_target):.3f}, std={np.std(valid_target):.3f}\n")
+            f.write(f"Generated logP: mean={np.mean(valid_generated):.3f}, std={np.std(valid_generated):.3f}\n")
+            f.write(f"MAE: {mae:.3f}\n")
+            f.write(f"RMSE: {rmse:.3f}\n")
+            f.write(f"Correlation: {correlation:.3f}\n\n")
+            f.write("Per-bin MAE:\n")
+            for label, data in per_bin_mae.items():
+                f.write(f"  {label}: MAE={data['mae']:.3f} (n={data['count']})\n")
+        print(f"Summary saved to: {summary_path}")
+
+    # Log to wandb
+    if wandb.run:
+        wandb.log({
+            'logp/mae': mae,
+            'logp/rmse': rmse,
+            'logp/correlation': correlation,
+            'logp/valid_fraction': len(valid_indices) / len(all_smiles),
+        }, commit=False)
+
+        # Log per-bin metrics
+        for label, data in per_bin_mae.items():
+            wandb.log({f'logp/bin_{label}_mae': data['mae']}, commit=False)
+
+    return {
+        'mae': mae,
+        'rmse': rmse,
+        'correlation': correlation,
+        'valid_fraction': len(valid_indices) / len(all_smiles),
+        'per_bin_mae': per_bin_mae,
+        'results_df': results_df,
+    }
 
 
 def build_molecule(atom_types, edge_types, atom_decoder, verbose=False):

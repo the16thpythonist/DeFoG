@@ -1,0 +1,61 @@
+# @package _global_
+general:
+    name : 'aqsoldb_conditional'
+    gpus : 1
+    wandb: 'disabled'
+    remove_h: True
+    resume: null
+    test_only: null
+    check_val_every_n_epochs: 5
+    val_check_interval: null
+    sample_every_val: 5
+    samples_to_generate: 64
+    samples_to_save: 10
+    chains_to_save: 5
+    log_every_steps: 200
+
+    final_model_samples_to_generate: 1000
+    final_model_samples_to_save: 50
+    final_model_chains_to_save: 30
+
+    # Conditional generation settings
+    conditional: True
+    target: 'logp'                   # Options: 'logp', 'logp_binary', 'solubility', 'solubility_binary'
+    guidance_weight: 2.0             # Classifier-free guidance weight
+
+    # LogP normalization parameters (update after running scripts/add_logp_to_csv.py)
+    logp_mean: 2.5                   # Mean logP from dataset
+    logp_std: 1.5                    # Std logP from dataset
+    logp_threshold: 2.5              # Threshold for binary classification
+
+    # Solubility normalization parameters (if using solubility target)
+    solubility_mean: -3.0            # Mean solubility from dataset
+    solubility_std: 2.0              # Std solubility from dataset
+    solubility_threshold: -3.0       # Threshold for binary classification
+
+train:
+    optimizer: adam
+    n_epochs: 200
+    batch_size: 16                                # Smaller batch size for ~11k dataset
+    save_model: True
+    lr: 2e-4
+    num_workers: 4
+    time_distortion: 'polydec'
+
+sample:
+    time_distortion: 'polydec'
+    omega: 0.3                                      # Target guidance (can be optimized)
+    eta: 100                                        # Stochasticity (can be optimized)
+
+model:
+    n_layers: 9                                     # Slightly smaller for smaller dataset
+    type: 'discrete'
+    transition: 'marginal'                          # uniform or marginal
+    model: 'graph_tf'
+
+    # Do not set hidden_mlp_E, dim_ffE too high, computing large tensors on the edges is costly
+    hidden_mlp_dims: { 'X': 256, 'E': 128, 'y': 256}
+    rrwp_steps: 20
+
+    # The dimensions should satisfy dx % n_head == 0
+    hidden_dims: { 'dx': 256, 'de': 64, 'dy': 128, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 128, 'dim_ffy': 256}

@@ -124,12 +124,20 @@ class AqSolDBDataset(InMemoryDataset):
         smiles_list = df["SMILES"].values
         solubility_list = df["Solubility"].values
 
+        # Load logP if available (computed by scripts/add_logp_to_csv.py)
+        if "logp" in df.columns:
+            logp_list = df["logp"].values
+        else:
+            logp_list = [None] * len(smiles_list)
+            print("Warning: 'logp' column not found in CSV. Run scripts/add_logp_to_csv.py first.")
+
         data_list = []
         smiles_kept = []
 
-        for i, (smile, solubility) in enumerate(tqdm(zip(smiles_list, solubility_list),
-                                                      total=len(smiles_list),
-                                                      desc=f"Processing {self.stage}")):
+        for i, (smile, solubility, logp) in enumerate(tqdm(
+                zip(smiles_list, solubility_list, logp_list),
+                total=len(smiles_list),
+                desc=f"Processing {self.stage}")):
             mol = Chem.MolFromSmiles(smile)
 
             if mol is None:
@@ -170,8 +178,10 @@ class AqSolDBDataset(InMemoryDataset):
 
             x = F.one_hot(torch.tensor(type_idx), num_classes=len(types)).float()
 
-            # Store solubility as target (not used in unconditional generation but available)
-            y = torch.zeros(size=(1, 0), dtype=torch.float)
+            # Store both solubility and logP for conditional generation
+            # y[:, 0] = solubility, y[:, 1] = logP
+            logp_val = logp if logp is not None and not np.isnan(logp) else 0.0
+            y = torch.tensor([[solubility, logp_val]], dtype=torch.float)
 
             data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y, idx=i)
 
@@ -222,6 +232,82 @@ class AqSolDBDataset(InMemoryDataset):
             print(f"Number of molecules kept: {len(smiles_kept)} / {len(smiles_list)}")
 
 
+class BinarizeSolubilityTransform:
+    """Transform solubility to binary classification (high/low).
+
+    Uses median solubility (~-3.0) as threshold:
+    - High solubility (more soluble): solubility > threshold -> label 1
+    - Low solubility (less soluble): solubility <= threshold -> label 0
+
+    Note: data.y has shape (1, 2) with [solubility, logp]. This transform selects solubility.
+    """
+    def __init__(self, threshold=-3.0):
+        self.threshold = threshold
+
+    def __call__(self, data):
+        # Select solubility (column 0) and convert to binary label
+        solubility = data.y[:, 0:1]
+        data.y = (solubility > self.threshold).float()
+        return data
+
+
+class NormalizeSolubilityTransform:
+    """Normalize solubility values for regression conditioning.
+
+    Standardizes solubility to roughly [-1, 1] range using dataset statistics.
+    Mean ~-3.0, std ~2.0 for AqSolDB.
+
+    Note: data.y has shape (1, 2) with [solubility, logp]. This transform selects solubility.
+    """
+    def __init__(self, mean=-3.0, std=2.0):
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, data):
+        # Select solubility (column 0) and normalize
+        solubility = data.y[:, 0:1]
+        data.y = (solubility - self.mean) / self.std
+        return data
+
+
+class NormalizeLogPTransform:
+    """Normalize logP values for regression conditioning.
+
+    Standardizes logP using dataset statistics.
+    Default values are estimates - update after running scripts/add_logp_to_csv.py
+
+    Note: data.y has shape (1, 2) with [solubility, logp]. This transform selects logP.
+    """
+    def __init__(self, mean=2.5, std=1.5):
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, data):
+        # Select logP (column 1) and normalize
+        logp = data.y[:, 1:2]
+        data.y = (logp - self.mean) / self.std
+        return data
+
+
+class BinarizeLogPTransform:
+    """Transform logP to binary classification (high/low lipophilicity).
+
+    Uses threshold to classify:
+    - High lipophilicity: logP > threshold -> label 1
+    - Low lipophilicity: logP <= threshold -> label 0
+
+    Note: data.y has shape (1, 2) with [solubility, logp]. This transform selects logP.
+    """
+    def __init__(self, threshold=2.5):
+        self.threshold = threshold
+
+    def __call__(self, data):
+        # Select logP (column 1) and convert to binary label
+        logp = data.y[:, 1:2]
+        data.y = (logp > self.threshold).float()
+        return data
+
+
 class AqSolDBDataModule(MolecularDataModule):
     def __init__(self, cfg):
         self.remove_h = False
@@ -235,18 +321,46 @@ class AqSolDBDataModule(MolecularDataModule):
         # Path to the CSV file (should be in repository root)
         csv_path = os.path.join(base_path, "aqsoldb.csv")
 
+        # For conditional generation
+        is_conditional = cfg.general.conditional
+        target = getattr(cfg.general, 'target', 'logp')
+
+        transform = None
+        if is_conditional:
+            if target == "solubility_binary":
+                # Binary classification: high vs low solubility
+                threshold = getattr(cfg.general, 'solubility_threshold', -3.0)
+                transform = BinarizeSolubilityTransform(threshold=threshold)
+            elif target == "solubility":
+                # Normalized continuous solubility
+                mean = getattr(cfg.general, 'solubility_mean', -3.0)
+                std = getattr(cfg.general, 'solubility_std', 2.0)
+                transform = NormalizeSolubilityTransform(mean=mean, std=std)
+            elif target == "logp":
+                # Normalized continuous logP (default for aqsoldb)
+                mean = getattr(cfg.general, 'logp_mean', 2.5)
+                std = getattr(cfg.general, 'logp_std', 1.5)
+                transform = NormalizeLogPTransform(mean=mean, std=std)
+            elif target == "logp_binary":
+                # Binary classification: high vs low lipophilicity
+                threshold = getattr(cfg.general, 'logp_threshold', 2.5)
+                transform = BinarizeLogPTransform(threshold=threshold)
+            else:
+                raise ValueError(f"Unknown target {target} for AqSolDB conditioning. "
+                               f"Valid options: 'logp', 'logp_binary', 'solubility', 'solubility_binary'")
+
         datasets = {
             "train": AqSolDBDataset(
                 stage="train", root=root_path, csv_path=csv_path,
-                filter_dataset=self.filter_dataset
+                filter_dataset=self.filter_dataset, transform=transform
             ),
             "val": AqSolDBDataset(
                 stage="val", root=root_path, csv_path=csv_path,
-                filter_dataset=self.filter_dataset
+                filter_dataset=self.filter_dataset, transform=transform
             ),
             "test": AqSolDBDataset(
                 stage="test", root=root_path, csv_path=csv_path,
-                filter_dataset=self.filter_dataset
+                filter_dataset=self.filter_dataset, transform=transform
             ),
         }
         super().__init__(cfg, datasets)

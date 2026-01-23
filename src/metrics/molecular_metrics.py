@@ -161,6 +161,43 @@ class SamplingMolecularMetrics(nn.Module):
 
         print("fcd", to_log["fcd"])
 
+        # LogP verification for aqsoldb conditional generation
+        if (labels is not None and
+            hasattr(self.cfg, 'dataset') and
+            'aqsoldb' in self.cfg.dataset.name and
+            hasattr(self.cfg.general, 'conditional') and
+            self.cfg.general.conditional and
+            hasattr(self.cfg.general, 'target') and
+            self.cfg.general.target in ['logp', 'logp_binary']):
+
+            from analysis.rdkit_functions import compute_logp_metrics
+
+            # Get normalization parameters from config
+            logp_mean = getattr(self.cfg.general, 'logp_mean', 2.5)
+            logp_std = getattr(self.cfg.general, 'logp_std', 1.5)
+
+            # Stack labels into tensor
+            import torch
+            if isinstance(labels, list):
+                labels_tensor = torch.stack(labels) if len(labels) > 0 else torch.tensor([])
+            else:
+                labels_tensor = labels
+
+            print("\nRunning logP verification...")
+            logp_results = compute_logp_metrics(
+                all_smiles=all_smiles,
+                target_logp_normalized=labels_tensor,
+                logp_mean=logp_mean,
+                logp_std=logp_std,
+                output_dir=".",
+                test=test,
+            )
+
+            # Add to logging dict
+            to_log['logp_mae'] = logp_results['mae']
+            to_log['logp_rmse'] = logp_results['rmse']
+            to_log['logp_correlation'] = logp_results['correlation']
+
         print("Starting custom metrics")
         self.generated_n_dist(molecules)
         generated_n_dist = self.generated_n_dist.compute()

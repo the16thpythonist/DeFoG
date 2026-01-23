@@ -16,4 +16,6 @@ torch_geometric==2.3.1
 torchmetrics==0.11.4
 tqdm==4.65.0
 wandb==0.15.4
+rich>=13.0.0
+rich-click>=1.7.0
 seaborn
