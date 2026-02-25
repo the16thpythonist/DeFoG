@@ -43,6 +43,9 @@ class DeFoGModel(pl.LightningModule):
     noisy inputs during training, and generates graphs via CTMC denoising
     at sampling time.
 
+    Supports optional conditioning via a continuous vector and classifier-free
+    guidance (CFG) for improved conditional generation quality.
+
     Args:
         num_node_classes: Number of node feature classes
         num_edge_classes: Number of edge feature classes (including no-edge)
@@ -66,6 +69,11 @@ class DeFoGModel(pl.LightningModule):
         eta: Stochasticity parameter for sampling (default: 0.0)
         omega: Target guidance strength for sampling (default: 0.0)
         sample_time_distortion: Time distortion for sampling (default: "identity")
+        cond_dim: Dimension of the conditioning vector (default: 0, unconditional)
+        cond_drop_prob: Probability of dropping the condition during training
+            for classifier-free guidance (default: 0.1)
+        guidance_scale: Default guidance scale for CFG sampling (default: 2.0).
+            1.0 = purely conditional, >1.0 = amplified conditioning.
 
     Example:
         >>> model = DeFoGModel(
@@ -79,6 +87,8 @@ class DeFoGModel(pl.LightningModule):
         >>> # Sampling
         >>> samples = model.sample(num_samples=10)
     """
+
+    COND_SENTINEL = -100.0
 
     def __init__(
         self,
@@ -111,6 +121,10 @@ class DeFoGModel(pl.LightningModule):
         eta: float = 0.0,
         omega: float = 0.0,
         sample_time_distortion: str = "identity",
+        # Conditioning / classifier-free guidance
+        cond_dim: int = 0,
+        cond_drop_prob: float = 0.1,
+        guidance_scale: float = 2.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -129,6 +143,11 @@ class DeFoGModel(pl.LightningModule):
         self.eta = eta
         self.omega = omega
         self.sample_time_distortion = sample_time_distortion
+
+        # Store conditioning params
+        self.cond_dim = cond_dim
+        self.cond_drop_prob = cond_drop_prob
+        self.guidance_scale = guidance_scale
 
         # Create limit distribution
         self.limit_dist = LimitDistribution(
@@ -161,11 +180,11 @@ class DeFoGModel(pl.LightningModule):
         extra_dims = self.extra_features.output_dims()
 
         # Compute input/output dimensions
-        # Input: node/edge classes + extra features + time
+        # Input: node/edge classes + extra features + time + condition
         self.input_dims = {
             "X": actual_node_classes + extra_dims["X"],
             "E": actual_edge_classes + extra_dims["E"],
-            "y": 1 + extra_dims["y"],  # time + extra global features
+            "y": cond_dim + 1 + extra_dims["y"],  # condition + time + extra global features
         }
         self.output_dims = {
             "X": actual_node_classes,
@@ -251,14 +270,24 @@ class DeFoGModel(pl.LightningModule):
         )
         dense_data = dense_data.mask(node_mask)
         X, E = dense_data.X, dense_data.E
+        bs = X.size(0)
 
-        # Get y (global features) if available
-        if hasattr(batch, 'y') and batch.y is not None:
-            y = batch.y
-            if y.dim() == 1:
-                y = y.unsqueeze(-1)
+        # Build conditioning vector y
+        if self.cond_dim > 0:
+            if hasattr(batch, 'y') and batch.y is not None:
+                cond = batch.y
+                if cond.dim() == 1:
+                    cond = cond.unsqueeze(-1)
+                cond = cond[:, :self.cond_dim].float()
+            else:
+                cond = torch.zeros(bs, self.cond_dim, device=X.device)
+
+            # Per-sample CFG dropout: replace condition with sentinel
+            drop_mask = torch.rand(bs, device=X.device) < self.cond_drop_prob
+            cond[drop_mask] = self.COND_SENTINEL
+            y = cond
         else:
-            y = torch.zeros(X.size(0), 0, device=X.device)
+            y = torch.zeros(bs, 0, device=X.device)
 
         # Apply noise
         noisy_data = self._apply_noise(X, E, y, node_mask)
@@ -281,7 +310,78 @@ class DeFoGModel(pl.LightningModule):
         )
 
         self.log("train/loss", loss, prog_bar=True)
-        return {"loss": loss}
+        return {
+            "loss": loss,
+            "_pred_X": pred.X.detach(),
+            "_pred_E": pred.E.detach(),
+            "_true_X": X.detach(),
+            "_true_E": E.detach(),
+            "_node_mask": node_mask.detach(),
+        }
+
+    def validation_step(self, batch: Batch, batch_idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Validation step for a batch of PyG graphs.
+
+        Same as training_step but without CFG dropout, providing a clean
+        validation signal.
+
+        Args:
+            batch: PyG Batch object
+            batch_idx: Batch index
+
+        Returns:
+            Dict with "val_loss" key
+        """
+        if batch.edge_index.numel() == 0:
+            return None
+
+        # Convert PyG batch to dense tensors
+        dense_data, node_mask = to_dense(
+            batch.x,
+            batch.edge_index,
+            batch.edge_attr,
+            batch.batch,
+        )
+        dense_data = dense_data.mask(node_mask)
+        X, E = dense_data.X, dense_data.E
+        bs = X.size(0)
+
+        # Build conditioning vector y (no CFG dropout for validation)
+        if self.cond_dim > 0:
+            if hasattr(batch, 'y') and batch.y is not None:
+                cond = batch.y
+                if cond.dim() == 1:
+                    cond = cond.unsqueeze(-1)
+                cond = cond[:, :self.cond_dim].float()
+            else:
+                cond = torch.zeros(bs, self.cond_dim, device=X.device)
+            y = cond
+        else:
+            y = torch.zeros(bs, 0, device=X.device)
+
+        # Apply noise
+        noisy_data = self._apply_noise(X, E, y, node_mask)
+
+        # Compute extra features
+        extra_data = self._compute_extra_data(noisy_data)
+
+        # Forward pass
+        pred = self.forward(noisy_data, extra_data, node_mask)
+
+        # Compute loss
+        loss = self.train_loss(
+            pred_X=pred.X,
+            pred_E=pred.E,
+            pred_y=pred.y,
+            true_X=X,
+            true_E=E,
+            true_y=y,
+            node_mask=node_mask,
+        )
+
+        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        return {"val_loss": loss}
 
     def configure_optimizers(self):
         """Configure AdamW optimizer."""
@@ -303,6 +403,8 @@ class DeFoGModel(pl.LightningModule):
         time_distortion: Optional[str] = None,
         device: Optional[torch.device] = None,
         show_progress: bool = True,
+        condition: Optional[torch.Tensor] = None,
+        guidance_scale: Optional[float] = None,
     ) -> List[Data]:
         """
         Generate graph samples.
@@ -317,6 +419,11 @@ class DeFoGModel(pl.LightningModule):
             time_distortion: Time distortion type (overrides default)
             device: Device to sample on (defaults to model device)
             show_progress: Whether to show progress bar
+            condition: Conditioning vector of shape (num_samples, cond_dim).
+                      If None and cond_dim > 0, generates unconditionally.
+            guidance_scale: CFG guidance scale (overrides default).
+                           1.0 = purely conditional, >1.0 = amplified conditioning.
+                           Only used when condition is provided.
 
         Returns:
             List of PyG Data objects, each containing:
@@ -330,6 +437,7 @@ class DeFoGModel(pl.LightningModule):
         sample_steps = sample_steps if sample_steps is not None else self.sample_steps
         time_distortion = time_distortion if time_distortion is not None else self.sample_time_distortion
         device = device if device is not None else self.device
+        guidance_scale = guidance_scale if guidance_scale is not None else self.guidance_scale
 
         # Update rate matrix designer parameters
         self.rate_matrix_designer.eta = eta
@@ -351,7 +459,23 @@ class DeFoGModel(pl.LightningModule):
         # Sample initial noise
         z_T = sample_noise(self.limit_dist, node_mask)
         X, E = z_T.X, z_T.E
-        y = torch.zeros(num_samples, 0, device=device)
+
+        # Build conditioning vector
+        use_cfg = False
+        if self.cond_dim > 0:
+            if condition is not None:
+                y = condition.to(device).float()
+                if y.dim() == 1:
+                    y = y.unsqueeze(-1)
+                y = y[:, :self.cond_dim]
+                use_cfg = (guidance_scale != 1.0)
+            else:
+                # No condition provided: fully unconditional (sentinel, no CFG)
+                y = torch.full(
+                    (num_samples, self.cond_dim), self.COND_SENTINEL, device=device
+                )
+        else:
+            y = torch.zeros(num_samples, 0, device=device)
 
         # Sampling loop
         iterator = range(sample_steps)
@@ -374,7 +498,10 @@ class DeFoGModel(pl.LightningModule):
             s_norm = self.time_distorter.sample_ft(s_norm, time_distortion)
 
             # Sample next state
-            X, E, y = self._sample_step(t_norm, s_norm, X, E, y, node_mask)
+            X, E, y = self._sample_step(
+                t_norm, s_norm, X, E, y, node_mask,
+                guidance_scale=guidance_scale if use_cfg else None,
+            )
 
         # Final cleanup: remove virtual classes if absorbing
         X, E, _ = self.limit_dist.ignore_virtual_classes(X, E)
@@ -484,6 +611,7 @@ class DeFoGModel(pl.LightningModule):
         E_t: torch.Tensor,
         y_t: torch.Tensor,
         node_mask: torch.Tensor,
+        guidance_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample z_s given z_t (one CTMC step).
@@ -495,6 +623,8 @@ class DeFoGModel(pl.LightningModule):
             E_t: Current edge features one-hot (bs, n, n, de)
             y_t: Current global features (bs, dy)
             node_mask: Boolean mask (bs, n)
+            guidance_scale: If not None, apply CFG with this scale by running
+                a dual forward pass and blending rate matrices geometrically.
 
         Returns:
             Tuple of (X_s, E_s, y_s) for next state
@@ -513,7 +643,7 @@ class DeFoGModel(pl.LightningModule):
             "node_mask": node_mask,
         }
 
-        # Compute extra features and forward pass
+        # Conditional forward pass
         extra_data = self._compute_extra_data(noisy_data)
         pred = self.forward(noisy_data, extra_data, node_mask)
 
@@ -521,10 +651,41 @@ class DeFoGModel(pl.LightningModule):
         pred_X = F.softmax(pred.X, dim=-1)
         pred_E = F.softmax(pred.E, dim=-1)
 
-        # Compute rate matrices
+        # Compute conditional rate matrices
         R_t_X, R_t_E = self.rate_matrix_designer.compute_rate_matrices(
             t, node_mask, X_t, E_t, pred_X, pred_E
         )
+
+        # CFG: unconditional forward pass + geometric rate matrix blending
+        if guidance_scale is not None:
+            uncond_y = torch.full_like(y_t, self.COND_SENTINEL)
+            noisy_data_uncond = {
+                "X_t": X_t,
+                "E_t": E_t,
+                "y_t": uncond_y,
+                "t": t,
+                "node_mask": node_mask,
+            }
+            extra_data_uncond = self._compute_extra_data(noisy_data_uncond)
+            pred_uncond = self.forward(noisy_data_uncond, extra_data_uncond, node_mask)
+
+            pred_X_uncond = F.softmax(pred_uncond.X, dim=-1)
+            pred_E_uncond = F.softmax(pred_uncond.E, dim=-1)
+
+            R_t_X_uncond, R_t_E_uncond = self.rate_matrix_designer.compute_rate_matrices(
+                t, node_mask, X_t, E_t, pred_X_uncond, pred_E_uncond
+            )
+
+            # Geometric blending in log space
+            w = guidance_scale
+            R_t_X = torch.exp(
+                torch.log(R_t_X_uncond + 1e-6) * (1 - w)
+                + torch.log(R_t_X + 1e-6) * w
+            )
+            R_t_E = torch.exp(
+                torch.log(R_t_E_uncond + 1e-6) * (1 - w)
+                + torch.log(R_t_E + 1e-6) * w
+            )
 
         # Compute step probabilities
         prob_X, prob_E = self._compute_step_probs(R_t_X, R_t_E, X_t, E_t, dt)
@@ -755,8 +916,13 @@ class DeFoGModel(pl.LightningModule):
         return model
 
     def __repr__(self) -> str:
-        return (
-            f"DeFoGModel(node_classes={self.num_node_classes}, "
-            f"edge_classes={self.num_edge_classes}, "
-            f"n_layers={self.model.n_layers})"
-        )
+        parts = [
+            f"DeFoGModel(node_classes={self.num_node_classes}",
+            f"edge_classes={self.num_edge_classes}",
+            f"n_layers={self.model.n_layers}",
+        ]
+        if self.cond_dim > 0:
+            parts.append(f"cond_dim={self.cond_dim}")
+            parts.append(f"cond_drop_prob={self.cond_drop_prob}")
+            parts.append(f"guidance_scale={self.guidance_scale}")
+        return ", ".join(parts) + ")"

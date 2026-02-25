@@ -235,3 +235,51 @@ def small_model(small_model_config, node_counts_distribution):
         noise_type="uniform",
         node_counts=node_counts_distribution,
     )
+
+
+# ============================================================================
+# Conditional model fixtures
+# ============================================================================
+
+@pytest.fixture
+def cond_dim():
+    """Default conditioning dimension for tests."""
+    return 2
+
+
+@pytest.fixture
+def small_cond_model(small_model_config, node_counts_distribution, cond_dim):
+    """Create a small conditional DeFoGModel for testing."""
+    from defog.core import DeFoGModel
+    return DeFoGModel(
+        **small_model_config,
+        noise_type="uniform",
+        node_counts=node_counts_distribution,
+        cond_dim=cond_dim,
+        cond_drop_prob=0.1,
+        guidance_scale=2.0,
+    )
+
+
+@pytest.fixture
+def cond_graph_batch(cond_dim):
+    """Create a batch of graphs with conditioning labels."""
+    graphs = []
+    for i in range(4):
+        n = 4 + i  # 4, 5, 6, 7 nodes
+        x = torch.zeros(n, 4)
+        x[torch.arange(n), torch.randint(0, 4, (n,))] = 1
+
+        adj = (torch.rand(n, n) < 0.3).float()
+        adj = ((adj + adj.t()) > 0).float()
+        adj.fill_diagonal_(0)
+        edge_index = adj.nonzero(as_tuple=False).t()
+
+        edge_attr = torch.zeros(edge_index.size(1), 2)
+        edge_attr[:, 1] = 1
+
+        y = torch.randn(1, cond_dim)
+
+        graphs.append(Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y))
+
+    return Batch.from_data_list(graphs)

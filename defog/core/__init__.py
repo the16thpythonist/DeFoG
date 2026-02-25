@@ -36,6 +36,7 @@ Utility Functions:
 """
 
 from .model import DeFoGModel
+from .callbacks import TrainingMonitorCallback, SampleVisualizationCallback
 from .data import (
     PlaceHolder,
     to_dense,
@@ -60,6 +61,9 @@ from .layers import XEyTransformerLayer, NodeEdgeBlock, timestep_embedding
 __all__ = [
     # Main model
     "DeFoGModel",
+    # Callbacks
+    "TrainingMonitorCallback",
+    "SampleVisualizationCallback",
     # Data utilities
     "PlaceHolder",
     "to_dense",

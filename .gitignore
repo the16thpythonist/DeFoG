@@ -160,3 +160,6 @@ wandb/
 
 slurm-*.out
 **/.aslurm/*
+
+# Experiment results
+experiments/results/
