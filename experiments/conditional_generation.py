@@ -12,6 +12,7 @@ Usage:
 """
 import os
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -31,6 +32,9 @@ from experiments.utils import (
 )
 from defog.core import DeFoGModel, TrainingMonitorCallback, SampleVisualizationCallback
 
+# Project root directory (repo root, one level up from experiments/)
+_PROJECT_DIR = Path(__file__).parent.parent.resolve()
+
 # ============================================================================
 # Parameters
 # ============================================================================
@@ -39,7 +43,7 @@ from defog.core import DeFoGModel, TrainingMonitorCallback, SampleVisualizationC
 
 # :param CSV_PATH:
 #     Path to the CSV file containing SMILES and property columns.
-CSV_PATH: str = "data/molecules.csv"
+CSV_PATH: str = str(_PROJECT_DIR / "data" / "molecules.csv")
 
 # :param SMILES_COLUMN:
 #     Name of the column containing SMILES strings.
@@ -531,7 +535,7 @@ def experiment(e: Experiment) -> None:
 @experiment.testing
 def testing(e: Experiment):
     """Reduce parameters for quick testing."""
-    e.CSV_PATH = "data/test_molecules.csv"
+    e.CSV_PATH = str(_PROJECT_DIR / "data" / "test_molecules.csv")
     e.EPOCHS = 2
     e.BATCH_SIZE = 4
     e.NUM_EVAL_SAMPLES = 5
