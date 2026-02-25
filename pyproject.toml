@@ -49,6 +49,12 @@ dependencies = [
 
     # Data handling
     "pandas>=1.4",
+
+    # Chemistry
+    "rdkit>=2023.3",
+
+    # Experiment management
+    "pycomex>=0.13",
 ]
 
 [project.optional-dependencies]
