@@ -166,3 +166,4 @@ slurm-*.out
 experiments/results/
 # Local smoke-test artifact
 experiments/_aqsoldb_smoke.csv
+experiments/_aqsoldb_uncond_smoke.csv
