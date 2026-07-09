@@ -261,3 +261,36 @@ def mol_to_smiles(mol: Chem.Mol) -> Optional[str]:
     finally:
         RDLogger.EnableLog("rdApp.*")
     return Chem.MolToSmiles(mol)
+
+
+def make_generation_metrics_fn(atom_decoder, bond_decoder, train_smiles):
+    """
+    Build a ``metrics_fn(samples) -> {validity, uniqueness, novelty}`` for the
+    TrainingMonitorCallback, given how to decode graphs and the reference set of
+    training SMILES (for novelty).
+
+    - validity   = valid molecules / total sampled
+    - uniqueness = distinct canonical SMILES / valid molecules
+    - novelty    = unique molecules not in ``train_smiles`` / unique molecules
+    """
+    train_set = set(train_smiles)
+
+    def metrics_fn(samples):
+        valid = []
+        for s in samples:
+            mol = pyg_data_to_mol(s, atom_decoder, bond_decoder)
+            smi = mol_to_smiles(mol) if mol is not None else None
+            if smi is not None and Chem.MolFromSmiles(smi) is not None:
+                valid.append(smi)
+        n = len(samples)
+        n_valid = len(valid)
+        unique = set(valid)
+        n_unique = len(unique)
+        n_novel = sum(1 for smi in unique if smi not in train_set)
+        return {
+            "validity": n_valid / n if n else 0.0,
+            "uniqueness": n_unique / n_valid if n_valid else 0.0,
+            "novelty": n_novel / n_unique if n_unique else 0.0,
+        }
+
+    return metrics_fn

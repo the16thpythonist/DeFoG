@@ -25,6 +25,7 @@ from experiments.utils import (
     smiles_to_pyg_data,
     pyg_data_to_mol,
     mol_to_smiles,
+    make_generation_metrics_fn,
 )
 from defog.core import DeFoGModel, TrainingMonitorCallback, SampleVisualizationCallback
 
@@ -104,6 +105,7 @@ def experiment(e: Experiment) -> None:
 
     # No condition attached -- purely unconditional graphs.
     dataset = []
+    dataset_smiles = []
     skipped = 0
     for _, row in df.iterrows():
         data = smiles_to_pyg_data(row[e.SMILES_COLUMN], atom_encoder, bond_encoder)
@@ -111,6 +113,7 @@ def experiment(e: Experiment) -> None:
             skipped += 1
             continue
         dataset.append(data)
+        dataset_smiles.append(row[e.SMILES_COLUMN])
     e.log(f"Converted {len(dataset)} graphs ({skipped} skipped)")
 
     from torch_geometric.loader import DataLoader
@@ -118,6 +121,7 @@ def experiment(e: Experiment) -> None:
     perm = torch.randperm(len(dataset)).tolist()
     train_set = [dataset[i] for i in perm[:n_train]]
     val_set = [dataset[i] for i in perm[n_train:]]
+    train_smiles = [dataset_smiles[i] for i in perm[:n_train]]
     train_loader = DataLoader(train_set, batch_size=e.BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=e.BATCH_SIZE) if val_set else None
     e.log(f"Train: {len(train_set)}  Val: {len(val_set)}")
@@ -137,8 +141,10 @@ def experiment(e: Experiment) -> None:
     e.log(f"Params: {e['model/num_params']:,}  (cond_dim={model.cond_dim})")
 
     # -- Train --------------------------------------------------------------
+    gen_metrics_fn = make_generation_metrics_fn(atom_decoder, bond_decoder, train_smiles)
     monitor = TrainingMonitorCallback(
-        smoothing_window=5, figure_callback=lambda fig: e.track("training_progress", fig)
+        smoothing_window=5, figure_callback=lambda fig: e.track("training_progress", fig),
+        generation_metrics_fn=gen_metrics_fn, gen_every_k=10, gen_num_samples=64,
     )
     sampler = SampleVisualizationCallback(
         num_samples=8, every_k_epochs=e.SAMPLE_VIS_EVERY_K, sample_steps=e.SAMPLE_STEPS,

@@ -22,6 +22,7 @@ Example:
 
 import time
 import threading
+import warnings
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
@@ -173,6 +174,14 @@ class TrainingMonitorCallback(pl.Callback):
         hw_sample_interval: Seconds between hardware stat samples.
         figure_callback: Optional callable(fig) invoked with the matplotlib
             figure each validation epoch (e.g. for ``e.track()``).
+        generation_metrics_fn: Optional callable(list_of_Data) -> dict with
+            keys "validity"/"uniqueness"/"novelty". When provided, the model is
+            sampled unconditionally every ``gen_every_k`` epochs and these
+            metrics are computed and added as an extra row of panels to the grid.
+        gen_every_k: Sample-and-evaluate the generation metrics every k epochs.
+        gen_num_samples: Number of graphs to sample for the metrics.
+        gen_sample_steps: Denoising steps for the metric sampling (defaults to
+            the model's configured ``sample_steps``).
     """
 
     def __init__(
@@ -180,11 +189,19 @@ class TrainingMonitorCallback(pl.Callback):
         smoothing_window: int = 5,
         hw_sample_interval: float = 2.0,
         figure_callback: Optional[Callable] = None,
+        generation_metrics_fn: Optional[Callable] = None,
+        gen_every_k: int = 10,
+        gen_num_samples: int = 64,
+        gen_sample_steps: Optional[int] = None,
     ):
         super().__init__()
         self.smoothing_window = smoothing_window
         self.hw_sample_interval = hw_sample_interval
         self.figure_callback = figure_callback
+        self.generation_metrics_fn = generation_metrics_fn
+        self.gen_every_k = gen_every_k
+        self.gen_num_samples = gen_num_samples
+        self.gen_sample_steps = gen_sample_steps
 
         # Per-epoch history (appended at each validation epoch end)
         self.history: Dict[str, List] = defaultdict(list)
@@ -401,6 +418,13 @@ class TrainingMonitorCallback(pl.Callback):
             for key in ["gpu_util", "gpu_mem", "cpu_util", "ram"]:
                 self.history[key].append(float("nan"))
 
+        # --- Generation metrics (sample the model every k epochs) ---
+        if self.generation_metrics_fn is not None and not trainer.sanity_checking:
+            current_idx = len(self.history["epoch_time"])  # 1-based epoch index
+            is_last = trainer.current_epoch >= trainer.max_epochs - 1
+            if current_idx % self.gen_every_k == 0 or is_last:
+                self._collect_generation_metrics(pl_module, current_idx)
+
         # --- Generate figure ---
         fig = self._generate_figure()
         self.last_figure = fig
@@ -410,12 +434,36 @@ class TrainingMonitorCallback(pl.Callback):
         else:
             plt.close(fig)
 
+    def _collect_generation_metrics(self, pl_module: pl.LightningModule, epoch_idx: int):
+        """Sample the model unconditionally and record validity/uniqueness/novelty."""
+        was_training = pl_module.training
+        try:
+            pl_module.eval()
+            steps = self.gen_sample_steps or getattr(pl_module, "sample_steps", 100)
+            samples = pl_module.sample(
+                num_samples=self.gen_num_samples,
+                sample_steps=steps,
+                show_progress=False,
+            )
+            metrics = self.generation_metrics_fn(samples)
+        except Exception as exc:  # never let metric sampling break training
+            warnings.warn(f"generation metrics sampling failed: {exc}")
+            metrics = {}
+        finally:
+            if was_training:
+                pl_module.train()
+
+        self.history["gen_epochs"].append(epoch_idx)
+        for key in ("validity", "uniqueness", "novelty"):
+            self.history[f"gen_{key}"].append(float(metrics.get(key, float("nan"))))
+
     # ------------------------------------------------------------------
     # Plotting
     # ------------------------------------------------------------------
 
     def _generate_figure(self) -> plt.Figure:
-        fig, axes = plt.subplots(5, 4, figsize=(20, 25))
+        n_rows = 6 if self.generation_metrics_fn is not None else 5
+        fig, axes = plt.subplots(n_rows, 4, figsize=(20, 5 * n_rows))
         sw = self.smoothing_window
         epochs = list(range(1, len(self.history["epoch_time"]) + 1))
 
@@ -469,8 +517,37 @@ class TrainingMonitorCallback(pl.Callback):
         self._plot_single_metric(axes[4, 2], epochs, "cpu_util", "CPU Utilization (%)", sw, ylabel="%")
         self._plot_single_metric(axes[4, 3], epochs, "ram", "RAM Usage (GB)", sw, ylabel="GB")
 
+        # ===== Row 6: Generation metrics (unconditional samples) =====
+        if self.generation_metrics_fn is not None:
+            self._plot_gen_metric(axes[5, 0], ["gen_validity"], ["validity"], "Validity")
+            self._plot_gen_metric(axes[5, 1], ["gen_uniqueness"], ["uniqueness"], "Uniqueness (of valid)")
+            self._plot_gen_metric(axes[5, 2], ["gen_novelty"], ["novelty"], "Novelty (of unique)")
+            self._plot_gen_metric(
+                axes[5, 3],
+                ["gen_validity", "gen_uniqueness", "gen_novelty"],
+                ["validity", "uniqueness", "novelty"],
+                "Generation Metrics",
+            )
+
         fig.tight_layout()
         return fig
+
+    def _plot_gen_metric(self, ax, keys, labels, title):
+        """Plot generation metrics against the epochs at which they were sampled."""
+        ax.set_title(title)
+        gen_epochs = self.history.get("gen_epochs", [])
+        plotted = False
+        for key, label in zip(keys, labels):
+            vals = self.history.get(key, [])
+            n = min(len(gen_epochs), len(vals))
+            if n > 0:
+                ax.plot(gen_epochs[:n], vals[:n], marker="o", markersize=3, label=label)
+                plotted = True
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("fraction")
+        ax.set_ylim(-0.02, 1.02)
+        if plotted and len(labels) > 1:
+            ax.legend(fontsize="small")
 
     # ------ individual subplot helpers ------
 
