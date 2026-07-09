@@ -55,7 +55,7 @@ RRWP_STEPS: int = 20
 
 # --- Training (matched to authors' AqSolDB recipe, stabilized) ---
 EPOCHS: int = 250
-BATCH_SIZE: int = 128            # larger batch -> less gradient noise (stability)
+BATCH_SIZE: int = 16             # small batch -> many more grad steps/epoch (faster learning); EMA handles stability
 LEARNING_RATE: float = 1.5e-4    # decreased from 2e-4 for stability
 LR_SCHEDULER: str = "cosine"     # decay LR to settle late-training generation
 LR_MIN: float = 1e-6
