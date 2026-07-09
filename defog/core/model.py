@@ -26,6 +26,12 @@ from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple, Union
 
 from .data import PlaceHolder, to_dense, dense_to_pyg, DistributionNodes
+from .size_distribution import (
+    SizeDistribution,
+    EmpiricalSizeDistribution,
+    FixedSizeDistribution,
+    ExplicitSizeDistribution,
+)
 from .transformer import GraphTransformer
 from .features import ExtraFeatures
 from .noise import LimitDistribution, sample_noise, sample_from_probs
@@ -69,7 +75,12 @@ class DeFoGModel(pl.LightningModule):
         eta: Stochasticity parameter for sampling (default: 0.0)
         omega: Target guidance strength for sampling (default: 0.0)
         sample_time_distortion: Time distortion for sampling (default: "identity")
-        cond_dim: Dimension of the conditioning vector (default: 0, unconditional)
+        cond_dim: Dimension of the conditioning vector (default: 0, unconditional).
+            Conditions are expected to be already normalized by the caller.
+        cond_emb_dim: Width of the learned condition embedding (default: 64).
+            Only used when cond_dim > 0.
+        cond_hidden_dim: Hidden width of the condition encoder MLP (default: 128).
+            Only used when cond_dim > 0.
         cond_drop_prob: Probability of dropping the condition during training
             for classifier-free guidance (default: 0.1)
         guidance_scale: Default guidance scale for CFG sampling (default: 2.0).
@@ -87,8 +98,6 @@ class DeFoGModel(pl.LightningModule):
         >>> # Sampling
         >>> samples = model.sample(num_samples=10)
     """
-
-    COND_SENTINEL = -100.0
 
     def __init__(
         self,
@@ -123,6 +132,8 @@ class DeFoGModel(pl.LightningModule):
         sample_time_distortion: str = "identity",
         # Conditioning / classifier-free guidance
         cond_dim: int = 0,
+        cond_emb_dim: int = 64,
+        cond_hidden_dim: int = 128,
         cond_drop_prob: float = 0.1,
         guidance_scale: float = 2.0,
     ):
@@ -146,6 +157,8 @@ class DeFoGModel(pl.LightningModule):
 
         # Store conditioning params
         self.cond_dim = cond_dim
+        self.cond_emb_dim = cond_emb_dim
+        self.cond_hidden_dim = cond_hidden_dim
         self.cond_drop_prob = cond_drop_prob
         self.guidance_scale = guidance_scale
 
@@ -171,6 +184,10 @@ class DeFoGModel(pl.LightningModule):
             counts[2:21] = 1.0
             self.node_dist = DistributionNodes(counts)
 
+        # Default (marginal) size distribution used when sample() is called
+        # without an explicit size_dist or num_nodes override.
+        self.default_size_dist = EmpiricalSizeDistribution(self.node_dist.prob)
+
         # Create extra features
         self.extra_features = ExtraFeatures(
             feature_type=extra_features_type,
@@ -180,11 +197,12 @@ class DeFoGModel(pl.LightningModule):
         extra_dims = self.extra_features.output_dims()
 
         # Compute input/output dimensions
-        # Input: node/edge classes + extra features + time + condition
+        # Input: node/edge classes + extra features + time + condition embedding
+        cond_y_dim = cond_emb_dim if cond_dim > 0 else 0
         self.input_dims = {
             "X": actual_node_classes + extra_dims["X"],
             "E": actual_edge_classes + extra_dims["E"],
-            "y": cond_dim + 1 + extra_dims["y"],  # condition + time + extra global features
+            "y": cond_y_dim + 1 + extra_dims["y"],  # condition emb + time + extra global features
         }
         self.output_dims = {
             "X": actual_node_classes,
@@ -224,6 +242,20 @@ class DeFoGModel(pl.LightningModule):
             omega=omega,
             limit_dist=self.limit_dist,
         )
+
+        # Conditioning modules (classifier-free guidance).
+        # The condition is projected into an embedding space; a learned null
+        # embedding represents the "unconditional" case (dropout / CFG uncond
+        # branch). Both the encoder output and the null are passed through a
+        # shared LayerNorm so they live on the same manifold.
+        if cond_dim > 0:
+            self.cond_encoder = nn.Sequential(
+                nn.Linear(cond_dim, cond_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(cond_hidden_dim, cond_emb_dim),
+            )
+            self.cond_norm = nn.LayerNorm(cond_emb_dim)
+            self.null_embedding = nn.Parameter(torch.randn(cond_emb_dim))
 
     def forward(
         self,
@@ -272,20 +304,30 @@ class DeFoGModel(pl.LightningModule):
         X, E = dense_data.X, dense_data.E
         bs = X.size(0)
 
-        # Build conditioning vector y
+        # Build conditioning embedding y
         if self.cond_dim > 0:
             if hasattr(batch, 'y') and batch.y is not None:
-                cond = batch.y
-                if cond.dim() == 1:
-                    cond = cond.unsqueeze(-1)
-                cond = cond[:, :self.cond_dim].float()
+                cond_raw = batch.y
             else:
-                cond = torch.zeros(bs, self.cond_dim, device=X.device)
+                cond_raw = None
 
-            # Per-sample CFG dropout: replace condition with sentinel
+            # Per-sample CFG dropout: replace condition with the null embedding
             drop_mask = torch.rand(bs, device=X.device) < self.cond_drop_prob
-            cond[drop_mask] = self.COND_SENTINEL
-            y = cond
+            if cond_raw is None:
+                # No labels available: treat the whole batch as unconditional
+                y = self._embed_condition(None, bs=bs, device=X.device)
+                drop_mask = torch.ones(bs, dtype=torch.bool, device=X.device)
+            else:
+                y = self._embed_condition(cond_raw, drop_mask=drop_mask)
+
+            # Monitor CFG collapse: distance between the null embedding and the
+            # mean of the (non-dropped) conditional embeddings. Trending to 0
+            # means the conditional and unconditional branches are converging.
+            kept = ~drop_mask
+            if kept.any():
+                null_vec = self.cond_norm(self.null_embedding)
+                mean_kept = y[kept].mean(dim=0)
+                self.log("train/cond_null_dist", (null_vec - mean_kept).norm())
         else:
             y = torch.zeros(bs, 0, device=X.device)
 
@@ -347,16 +389,12 @@ class DeFoGModel(pl.LightningModule):
         X, E = dense_data.X, dense_data.E
         bs = X.size(0)
 
-        # Build conditioning vector y (no CFG dropout for validation)
+        # Build conditioning embedding y (no CFG dropout for validation)
         if self.cond_dim > 0:
             if hasattr(batch, 'y') and batch.y is not None:
-                cond = batch.y
-                if cond.dim() == 1:
-                    cond = cond.unsqueeze(-1)
-                cond = cond[:, :self.cond_dim].float()
+                y = self._embed_condition(batch.y)
             else:
-                cond = torch.zeros(bs, self.cond_dim, device=X.device)
-            y = cond
+                y = self._embed_condition(None, bs=bs, device=X.device)
         else:
             y = torch.zeros(bs, 0, device=X.device)
 
@@ -392,6 +430,26 @@ class DeFoGModel(pl.LightningModule):
             weight_decay=self.weight_decay,
         )
 
+    def _resolve_size_dist(
+        self,
+        size_dist: Optional[SizeDistribution],
+        num_nodes: Optional[Union[int, torch.Tensor]],
+    ) -> SizeDistribution:
+        """
+        Resolve which SizeDistribution to use for a sampling call.
+
+        Precedence: an explicit ``size_dist`` wins; otherwise ``num_nodes`` is
+        converted into an ad-hoc distribution (int -> fixed, tensor/sequence ->
+        explicit per-sample); otherwise the model's default marginal is used.
+        """
+        if size_dist is not None:
+            return size_dist
+        if num_nodes is None:
+            return self.default_size_dist
+        if isinstance(num_nodes, int):
+            return FixedSizeDistribution(num_nodes)
+        return ExplicitSizeDistribution(num_nodes)
+
     @torch.no_grad()
     def sample(
         self,
@@ -405,6 +463,7 @@ class DeFoGModel(pl.LightningModule):
         show_progress: bool = True,
         condition: Optional[torch.Tensor] = None,
         guidance_scale: Optional[float] = None,
+        size_dist: Optional[SizeDistribution] = None,
     ) -> List[Data]:
         """
         Generate graph samples.
@@ -412,7 +471,14 @@ class DeFoGModel(pl.LightningModule):
         Args:
             num_samples: Number of graphs to generate
             num_nodes: Fixed number of nodes (int) or per-sample counts (Tensor).
-                      If None, samples from node distribution.
+                      Convenience shorthand that is internally converted into a
+                      SizeDistribution. Ignored if size_dist is given.
+                      If both are None, uses the model's default (marginal) size
+                      distribution.
+            size_dist: Optional SizeDistribution controlling how many nodes each
+                      graph gets. Overrides num_nodes. Condition-aware
+                      distributions (e.g. ConditionalSizeDistribution) receive
+                      the same `condition` passed here.
             eta: Stochasticity parameter (overrides default)
             omega: Target guidance strength (overrides default)
             sample_steps: Number of sampling steps (overrides default)
@@ -443,14 +509,14 @@ class DeFoGModel(pl.LightningModule):
         self.rate_matrix_designer.eta = eta
         self.rate_matrix_designer.omega = omega
 
-        # Sample number of nodes
-        if num_nodes is None:
-            n_nodes = self.node_dist.sample_n(num_samples, device)
-        elif isinstance(num_nodes, int):
-            n_nodes = num_nodes * torch.ones(num_samples, device=device, dtype=torch.int)
-        else:
-            n_nodes = num_nodes.to(device)
-        n_max = n_nodes.max().item()
+        # Sample number of nodes via the resolved size distribution. Explicit
+        # size_dist wins over num_nodes; num_nodes is turned into an ad-hoc
+        # distribution so there is a single code path. Condition-aware
+        # distributions receive the same condition as the model.
+        size_dist = self._resolve_size_dist(size_dist, num_nodes)
+        n_nodes = size_dist.sample(num_samples, condition=condition, device=device)
+        n_nodes = n_nodes.clamp(1, self.max_nodes).long()
+        n_max = int(n_nodes.max().item())
 
         # Build node mask
         arange = torch.arange(n_max, device=device).unsqueeze(0).expand(num_samples, -1)
@@ -460,20 +526,22 @@ class DeFoGModel(pl.LightningModule):
         z_T = sample_noise(self.limit_dist, node_mask)
         X, E = z_T.X, z_T.E
 
-        # Build conditioning vector
+        # Build conditioning embedding. y is the embedding threaded through the
+        # network; y_raw is the original condition attached to the output graphs.
         use_cfg = False
+        y_raw = None
         if self.cond_dim > 0:
             if condition is not None:
-                y = condition.to(device).float()
-                if y.dim() == 1:
-                    y = y.unsqueeze(-1)
-                y = y[:, :self.cond_dim]
+                cond_raw = condition.to(device).float()
+                if cond_raw.dim() == 1:
+                    cond_raw = cond_raw.unsqueeze(-1)
+                cond_raw = cond_raw[:, :self.cond_dim]
+                y_raw = cond_raw
+                y = self._embed_condition(cond_raw)
                 use_cfg = (guidance_scale != 1.0)
             else:
-                # No condition provided: fully unconditional (sentinel, no CFG)
-                y = torch.full(
-                    (num_samples, self.cond_dim), self.COND_SENTINEL, device=device
-                )
+                # No condition provided: fully unconditional (null, no CFG)
+                y = self._embed_condition(None, bs=num_samples, device=device)
         else:
             y = torch.zeros(num_samples, 0, device=device)
 
@@ -506,10 +574,57 @@ class DeFoGModel(pl.LightningModule):
         # Final cleanup: remove virtual classes if absorbing
         X, E, _ = self.limit_dist.ignore_virtual_classes(X, E)
 
-        # Convert to PyG Data objects
-        samples = dense_to_pyg(X, E, y, node_mask, n_nodes)
+        # Convert to PyG Data objects. Attach the raw condition (not the internal
+        # embedding) so downstream consumers see the original condition values.
+        samples = dense_to_pyg(X, E, y_raw, node_mask, n_nodes)
 
         return samples
+
+    def _embed_condition(
+        self,
+        cond_raw: Optional[torch.Tensor],
+        drop_mask: Optional[torch.Tensor] = None,
+        bs: Optional[int] = None,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """
+        Encode a (already-normalized) condition into embedding space.
+
+        A learned null embedding stands in for the unconditional case, used for
+        (a) per-sample CFG dropout during training, (b) sampling without a
+        condition, and (c) the unconditional branch of CFG guidance. The encoder
+        output and the null share a LayerNorm so they lie on the same manifold.
+
+        Args:
+            cond_raw: Raw condition (bs, cond_dim) or None for fully unconditional.
+            drop_mask: Optional boolean mask (bs,); rows set True are replaced by
+                the null embedding (CFG dropout). Ignored when cond_raw is None.
+            bs: Batch size, required when cond_raw is None (for null broadcast).
+            device: Unused (kept for call-site clarity); modules carry their device.
+
+        Returns:
+            Condition embedding of shape (bs, cond_emb_dim).
+        """
+        null = self.cond_norm(self.null_embedding).unsqueeze(0)  # (1, cond_emb_dim)
+
+        if cond_raw is None:
+            return null.expand(bs, -1)
+
+        if cond_raw.dim() == 1:
+            cond_raw = cond_raw.unsqueeze(-1)
+        cond_raw = cond_raw[:, :self.cond_dim].float()
+        assert torch.isfinite(cond_raw).all(), (
+            "Non-finite value in condition (batch.y); conditions must be "
+            "finite and normalized by the caller."
+        )
+
+        emb = self.cond_norm(self.cond_encoder(cond_raw))  # (bs, cond_emb_dim)
+
+        if drop_mask is not None:
+            emb = torch.where(
+                drop_mask.unsqueeze(-1), null.expand(emb.size(0), -1), emb
+            )
+        return emb
 
     def _apply_noise(
         self,
@@ -656,9 +771,11 @@ class DeFoGModel(pl.LightningModule):
             t, node_mask, X_t, E_t, pred_X, pred_E
         )
 
-        # CFG: unconditional forward pass + geometric rate matrix blending
+        # CFG: unconditional forward pass + geometric rate matrix blending.
+        # y_t is already an embedding; the unconditional branch uses the learned
+        # null embedding (in the same embedding space).
         if guidance_scale is not None:
-            uncond_y = torch.full_like(y_t, self.COND_SENTINEL)
+            uncond_y = self._embed_condition(None, bs=bs, device=device)
             noisy_data_uncond = {
                 "X_t": X_t,
                 "E_t": E_t,
@@ -923,6 +1040,7 @@ class DeFoGModel(pl.LightningModule):
         ]
         if self.cond_dim > 0:
             parts.append(f"cond_dim={self.cond_dim}")
+            parts.append(f"cond_emb_dim={self.cond_emb_dim}")
             parts.append(f"cond_drop_prob={self.cond_drop_prob}")
             parts.append(f"guidance_scale={self.guidance_scale}")
         return ", ".join(parts) + ")"

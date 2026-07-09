@@ -51,6 +51,15 @@ from .noise import (
     sample_noise,
     sample_from_probs,
 )
+from .size_distribution import (
+    SizeDistribution,
+    EmpiricalSizeDistribution,
+    FixedSizeDistribution,
+    ExplicitSizeDistribution,
+    UniformSizeDistribution,
+    CategoricalSizeDistribution,
+    ConditionalSizeDistribution,
+)
 from .rate_matrix import RateMatrixDesigner
 from .time_distortion import TimeDistorter
 from .transformer import GraphTransformer
@@ -72,6 +81,14 @@ __all__ = [
     "compute_dataset_statistics",
     "encode_no_edge",
     "symmetrize_edges",
+    # Size distributions
+    "SizeDistribution",
+    "EmpiricalSizeDistribution",
+    "FixedSizeDistribution",
+    "ExplicitSizeDistribution",
+    "UniformSizeDistribution",
+    "CategoricalSizeDistribution",
+    "ConditionalSizeDistribution",
     # Noise distribution
     "LimitDistribution",
     "sample_noise",

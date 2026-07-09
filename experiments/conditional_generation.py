@@ -31,6 +31,7 @@ from experiments.utils import (
     mol_to_smiles,
 )
 from defog.core import DeFoGModel, TrainingMonitorCallback, SampleVisualizationCallback
+from defog.core import ConditionalSizeDistribution
 
 # Project root directory (repo root, one level up from experiments/)
 _PROJECT_DIR = Path(__file__).parent.parent.resolve()
@@ -160,6 +161,14 @@ OMEGA: float = 0.0
 # :param SAMPLE_TIME_DISTORTION:
 #     Time distortion for sampling: "identity", "polydec", "cos".
 SAMPLE_TIME_DISTORTION: str = "identity"
+
+# :param SIZE_DIST_METHOD:
+#     How graph size is sampled at evaluation time. Many properties are
+#     size-dependent, so drawing size marginally can contradict the target.
+#       - "marginal":   P(n) over the whole training set (size-agnostic).
+#       - "kernel":     P(n | c) via non-parametric kernel resampling.
+#       - "regression": P(n | c) via a linear regression fit (extrapolates).
+SIZE_DIST_METHOD: str = "kernel"
 
 # :param NUM_EVAL_SAMPLES:
 #     Number of molecules to generate during evaluation.
@@ -441,6 +450,22 @@ def experiment(e: Experiment) -> None:
     for name, cfg in sorted(e.PROPERTIES.items()):
         e.log(f"  {name} ({cfg['type']}): target = {cfg['target']}")
 
+    # Build the size distribution. Since molecular properties are often
+    # size-dependent, condition the graph size on the target property so the
+    # sampled size is consistent with the requested property value.
+    size_dist = None
+    if e.SIZE_DIST_METHOD in ("kernel", "regression"):
+        size_dist = ConditionalSizeDistribution.from_dataloader(
+            train_loader, method=e.SIZE_DIST_METHOD
+        )
+        e.log(
+            f"Using conditional size distribution (method={e.SIZE_DIST_METHOD}); "
+            f"marginal size range [{int(size_dist.sizes.min())}, "
+            f"{int(size_dist.sizes.max())}]"
+        )
+    else:
+        e.log("Using marginal (size-agnostic) size distribution")
+
     # Generate samples
     model.eval()
     e.log(f"Generating {e.NUM_EVAL_SAMPLES} samples...")
@@ -452,6 +477,7 @@ def experiment(e: Experiment) -> None:
         eta=e.ETA,
         omega=e.OMEGA,
         time_distortion=e.SAMPLE_TIME_DISTORTION,
+        size_dist=size_dist,
         show_progress=True,
     )
     e.log(f"Generated {len(samples)} samples")

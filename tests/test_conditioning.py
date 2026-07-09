@@ -34,14 +34,17 @@ class TestConditionalModelCreation:
         """Test guidance_scale is stored correctly."""
         assert small_cond_model.guidance_scale == 2.0
 
-    def test_input_dims_include_condition(self, small_cond_model, cond_dim):
-        """Test input_dims['y'] accounts for cond_dim."""
-        # y dimension = cond_dim + 1 (time) + extra_features_y
-        assert small_cond_model.input_dims["y"] >= cond_dim + 1
+    def test_input_dims_include_condition(self, small_cond_model):
+        """Test input_dims['y'] accounts for the condition embedding, not cond_dim."""
+        # y dimension = cond_emb_dim + 1 (time) + extra_features_y
+        assert small_cond_model.input_dims["y"] >= small_cond_model.cond_emb_dim + 1
 
-    def test_sentinel_constant(self):
-        """Test sentinel constant is defined."""
-        assert DeFoGModel.COND_SENTINEL == -100.0
+    def test_conditioning_modules_exist(self, small_cond_model):
+        """Test the learned encoder, norm, and null embedding are created."""
+        assert hasattr(small_cond_model, "cond_encoder")
+        assert hasattr(small_cond_model, "cond_norm")
+        assert isinstance(small_cond_model.null_embedding, torch.nn.Parameter)
+        assert small_cond_model.null_embedding.shape == (small_cond_model.cond_emb_dim,)
 
     def test_repr_includes_cond_info(self, small_cond_model):
         """Test repr includes conditioning info for conditional models."""
@@ -79,9 +82,51 @@ class TestCFGTraining:
         has_grad = any(p.grad is not None for p in small_cond_model.parameters())
         assert has_grad
 
-    def test_cfg_dropout_applies_sentinel(self, small_model_config, node_counts_distribution):
-        """Test that CFG dropout replaces conditions with sentinel value."""
-        # Use 100% dropout to guarantee all samples get sentinel
+    def test_cfg_dropout_replaces_with_null_embedding(self, small_model_config,
+                                                       node_counts_distribution):
+        """Dropped rows map to the (LayerNorm'd) learned null embedding."""
+        model = DeFoGModel(
+            **small_model_config,
+            noise_type="uniform",
+            node_counts=node_counts_distribution,
+            cond_dim=2,
+        )
+        model.eval()
+
+        bs = 4
+        cond = torch.randn(bs, 2)
+        drop_mask = torch.tensor([True, False, True, False])
+        emb = model._embed_condition(cond, drop_mask=drop_mask)
+
+        null = model.cond_norm(model.null_embedding)
+        # Dropped rows equal the null embedding, kept rows do not.
+        assert torch.allclose(emb[0], null, atol=1e-6)
+        assert torch.allclose(emb[2], null, atol=1e-6)
+        assert not torch.allclose(emb[1], null, atol=1e-6)
+        assert not torch.allclose(emb[3], null, atol=1e-6)
+
+    def test_cfg_no_dropout_uses_encoder_output(self, small_model_config,
+                                                node_counts_distribution):
+        """With no dropout, embeddings are pure encoder outputs (no null)."""
+        model = DeFoGModel(
+            **small_model_config,
+            noise_type="uniform",
+            node_counts=node_counts_distribution,
+            cond_dim=2,
+        )
+        model.eval()
+
+        cond = torch.randn(4, 2)
+        drop_mask = torch.zeros(4, dtype=torch.bool)
+        emb = model._embed_condition(cond, drop_mask=drop_mask)
+        expected = model.cond_norm(model.cond_encoder(cond))
+
+        assert torch.allclose(emb, expected, atol=1e-6)
+
+    def test_null_embedding_receives_gradient(self, small_model_config,
+                                              node_counts_distribution,
+                                              cond_graph_batch):
+        """With 100% dropout, the null embedding is trained and the encoder is not."""
         model = DeFoGModel(
             **small_model_config,
             noise_type="uniform",
@@ -89,18 +134,20 @@ class TestCFGTraining:
             cond_dim=2,
             cond_drop_prob=1.0,
         )
+        model.train()
+        result = model.training_step(cond_graph_batch, 0)
+        result["loss"].backward()
 
-        # Manually test the dropout logic
-        bs = 4
-        cond = torch.randn(bs, 2)
-        drop_mask = torch.rand(bs) < model.cond_drop_prob  # All True
-        cond[drop_mask] = DeFoGModel.COND_SENTINEL
+        assert model.null_embedding.grad is not None
+        assert model.null_embedding.grad.abs().sum() > 0
+        # Encoder is never used when every row is dropped.
+        enc_grads = [p.grad for p in model.cond_encoder.parameters() if p.grad is not None]
+        assert all(g.abs().sum() == 0 for g in enc_grads)
 
-        assert torch.all(cond == DeFoGModel.COND_SENTINEL)
-
-    def test_cfg_dropout_preserves_some_conditions(self, small_model_config,
-                                                    node_counts_distribution):
-        """Test that with 0% dropout, no conditions are replaced."""
+    def test_encoder_receives_gradient_without_dropout(self, small_model_config,
+                                                       node_counts_distribution,
+                                                       cond_graph_batch):
+        """With 0% dropout, the condition encoder receives gradient."""
         model = DeFoGModel(
             **small_model_config,
             noise_type="uniform",
@@ -108,14 +155,15 @@ class TestCFGTraining:
             cond_dim=2,
             cond_drop_prob=0.0,
         )
+        model.train()
+        result = model.training_step(cond_graph_batch, 0)
+        result["loss"].backward()
 
-        bs = 4
-        cond = torch.randn(bs, 2)
-        original = cond.clone()
-        drop_mask = torch.rand(bs) < model.cond_drop_prob  # All False
-        cond[drop_mask] = DeFoGModel.COND_SENTINEL
-
-        assert torch.allclose(cond, original)
+        enc_grad = sum(
+            p.grad.abs().sum() for p in model.cond_encoder.parameters()
+            if p.grad is not None
+        )
+        assert enc_grad > 0
 
     def test_training_without_batch_y(self, small_cond_model, graph_batch):
         """Test training step handles missing batch.y gracefully (uses zeros)."""
@@ -184,11 +232,11 @@ class TestConditionalSampling:
 
         assert len(samples) == num_samples
 
-    def test_sample_without_condition_uses_sentinel(self, small_cond_model):
-        """Test sampling without condition on conditional model uses sentinel."""
+    def test_sample_without_condition_uses_null(self, small_cond_model):
+        """Test sampling without condition on conditional model uses null embedding."""
         small_cond_model.eval()
 
-        # Should not raise, generates unconditionally
+        # Should not raise, generates unconditionally via the null embedding.
         samples = small_cond_model.sample(
             num_samples=2,
             num_nodes=4,
@@ -197,6 +245,26 @@ class TestConditionalSampling:
         )
 
         assert len(samples) == 2
+        # No condition provided -> no condition attached to the outputs.
+        for s in samples:
+            assert not hasattr(s, "y") or s.y is None
+
+    def test_sample_attaches_raw_condition(self, small_cond_model, cond_dim):
+        """Sampled graphs carry the raw condition (not the internal embedding)."""
+        small_cond_model.eval()
+        condition = torch.randn(3, cond_dim)
+
+        samples = small_cond_model.sample(
+            num_samples=3,
+            num_nodes=4,
+            condition=condition,
+            sample_steps=3,
+            show_progress=False,
+        )
+
+        for i, s in enumerate(samples):
+            assert s.y.shape == (1, cond_dim)
+            assert torch.allclose(s.y[0], condition[i])
 
     def test_sample_1d_condition_unsqueezed(self, small_model_config,
                                              node_counts_distribution):
@@ -319,6 +387,12 @@ class TestBackwardCompatibility:
     def test_default_cond_dim_is_zero(self, small_model):
         """Test default model has cond_dim=0."""
         assert small_model.cond_dim == 0
+
+    def test_uncond_model_has_no_conditioning_modules(self, small_model):
+        """Test cond_dim=0 model does not create conditioning parameters."""
+        assert not hasattr(small_model, "cond_encoder")
+        assert not hasattr(small_model, "null_embedding")
+        assert not hasattr(small_model, "cond_norm")
 
     def test_uncond_model_input_dims_unchanged(self, small_model_config,
                                                 node_counts_distribution):
