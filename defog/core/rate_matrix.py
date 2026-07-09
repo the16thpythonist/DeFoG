@@ -404,8 +404,11 @@ class RateMatrixDesigner:
         R_t_E = torch.nan_to_num(R_t_E, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Clamp large values
-        R_t_X = R_t_X.clamp(max=1e5)
-        R_t_E = R_t_E.clamp(max=1e5)
+        # Zero out oversized rates (numerical noise from tiny late-time denominators)
+        # rather than clamping — clamping keeps a rate of 1e5 that forces spurious
+        # transitions near t->1 and corrupts near-finished graphs (matches src).
+        R_t_X[R_t_X > 1e5] = 0.0
+        R_t_E[R_t_E > 1e5] = 0.0
 
         # Zero out where p(x_t|x_1) = 0
         dx = R_t_X.shape[-1]

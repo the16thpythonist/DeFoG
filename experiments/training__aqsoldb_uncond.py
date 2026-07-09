@@ -62,13 +62,29 @@ LR_MIN: float = 1e-6
 WEIGHT_DECAY: float = 1e-5
 LAMBDA_EDGE: float = 5.0          # edge loss weighted 5x node loss (DeFoG default)
 TRAIN_TIME_DISTORTION: str = "polydec"
-EMA_DECAY: float = 0.999         # EMA of weights (0 = off); sampled/eval'd from EMA
+EMA_DECAY: float = 0.0           # EMA disabled (matches src; per user request)
 TRAIN_SPLIT: float = 0.9
+
+# :param MOLECULAR_FEATURES:
+#     Add per-atom charge/valency + molecular-weight features (matches src).
+MOLECULAR_FEATURES: bool = True
+
+# Per-atom nominal valency and atomic weight (for molecular features), keyed by symbol.
+ATOM_VALENCY: dict = {
+    "C": 4, "N": 3, "O": 2, "F": 1, "S": 2, "Cl": 1, "Br": 1, "P": 3,
+    "I": 1, "Na": 1, "Si": 4, "B": 3,
+}
+ATOM_WEIGHT_TABLE: dict = {
+    "C": 12.011, "N": 14.007, "O": 15.999, "F": 18.998, "S": 32.06, "Cl": 35.45,
+    "Br": 79.904, "P": 30.974, "I": 126.904, "Na": 22.99, "Si": 28.085, "B": 10.81,
+}
+MAX_ATOM_WEIGHT: float = 350.0
 
 # --- Sampling / evaluation ---
 SAMPLE_STEPS: int = 100          # model default (general sampling)
 EVAL_SAMPLE_STEPS: int = 1000    # definitive end-of-run eval
-GEN_SAMPLE_STEPS: int = 500      # in-training validation-epoch metric sampling
+GEN_SAMPLE_STEPS: int = 500      # in-training probe steps
+GEN_ETA: float = 5.0             # low eta for the in-training probe (unsaturated, trustworthy curve)
 ETA: float = 100.0               # error-correction stochasticity (authors' AqSolDB value)
 OMEGA: float = 0.3               # target guidance (authors' AqSolDB value)
 SAMPLE_TIME_DISTORTION: str = "polydec"   # sampling schedule
@@ -135,12 +151,18 @@ def experiment(e: Experiment) -> None:
     val_loader = DataLoader(val_set, batch_size=e.BATCH_SIZE) if val_set else None
     e.log(f"Train: {len(train_set)}  Val: {len(val_set)}")
 
+    # Molecular-feature tables aligned to the derived atom vocabulary.
+    atom_valencies = [e.ATOM_VALENCY[a] for a in atom_types]
+    atom_weights_list = [e.ATOM_WEIGHT_TABLE[a] for a in atom_types]
+
     # -- Model (cond_dim defaults to 0 -> unconditional) --------------------
     model = DeFoGModel.from_dataloader(
         train_loader,
         n_layers=e.N_LAYERS, hidden_dim=e.HIDDEN_DIM, hidden_mlp_dim=e.HIDDEN_MLP_DIM,
         n_heads=e.N_HEADS, dropout=e.DROPOUT, noise_type=e.NOISE_TYPE,
         extra_features_type=e.EXTRA_FEATURES_TYPE, rrwp_steps=e.RRWP_STEPS,
+        molecular_features=e.MOLECULAR_FEATURES, atom_valencies=atom_valencies,
+        atom_weights=atom_weights_list, max_atom_weight=e.MAX_ATOM_WEIGHT,
         lr=e.LEARNING_RATE, weight_decay=e.WEIGHT_DECAY,
         lambda_edge=e.LAMBDA_EDGE, train_time_distortion=e.TRAIN_TIME_DISTORTION,
         lr_scheduler=e.LR_SCHEDULER, lr_min=e.LR_MIN,
@@ -156,7 +178,7 @@ def experiment(e: Experiment) -> None:
     monitor = TrainingMonitorCallback(
         smoothing_window=5, figure_callback=lambda fig: e.track("training_progress", fig),
         generation_metrics_fn=gen_metrics_fn, gen_every_k=10, gen_num_samples=64,
-        gen_sample_steps=e.GEN_SAMPLE_STEPS, checkpoint_dir=e.path,
+        gen_sample_steps=e.GEN_SAMPLE_STEPS, gen_eta=e.GEN_ETA, checkpoint_dir=e.path,
     )
     sampler = SampleVisualizationCallback(
         num_samples=8, every_k_epochs=e.SAMPLE_VIS_EVERY_K, sample_steps=e.SAMPLE_STEPS,

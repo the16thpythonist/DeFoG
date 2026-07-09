@@ -194,6 +194,7 @@ class TrainingMonitorCallback(pl.Callback):
         gen_every_k: int = 10,
         gen_num_samples: int = 64,
         gen_sample_steps: Optional[int] = None,
+        gen_eta: Optional[float] = None,
         checkpoint_dir: Optional[str] = None,
     ):
         super().__init__()
@@ -204,6 +205,7 @@ class TrainingMonitorCallback(pl.Callback):
         self.gen_every_k = gen_every_k
         self.gen_num_samples = gen_num_samples
         self.gen_sample_steps = gen_sample_steps
+        self.gen_eta = gen_eta
         # When set (together with generation_metrics_fn), the model is saved to
         # <checkpoint_dir>/best_model whenever validity reaches a new maximum.
         self.checkpoint_dir = checkpoint_dir
@@ -449,6 +451,7 @@ class TrainingMonitorCallback(pl.Callback):
             samples = pl_module.sample(
                 num_samples=self.gen_num_samples,
                 sample_steps=steps,
+                eta=self.gen_eta,   # None -> model default; low eta keeps the probe unsaturated
                 show_progress=False,
             )
             metrics = self.generation_metrics_fn(samples)

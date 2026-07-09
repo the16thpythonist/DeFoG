@@ -343,3 +343,51 @@ class KNodeCycles:
         )
         y = (c6 / 12).unsqueeze(-1)
         return None, y
+
+
+class MolecularFeatures:
+    """
+    Molecular domain features fed to the transformer, matching the original
+    DeFoG ``ExtraMolecularFeatures``:
+      - per-atom CHARGE (nominal valency - current bonded valency) -> X
+      - per-atom current VALENCY -> X   (X gains 2 dims)
+      - normalized molecular WEIGHT -> y (y gains 1 dim)
+    Computed from the *noisy* graph on every forward pass (train and sample).
+
+    valencies / atom_weights are per-atom-class lists aligned with the model's
+    atom encoder order.
+    """
+
+    def __init__(self, valencies, atom_weights, max_weight: float = 350.0):
+        self.valencies = list(valencies)
+        self.atom_weights = list(atom_weights)
+        self.max_weight = float(max_weight)
+
+    def __call__(self, noisy_data: Dict[str, torch.Tensor]):
+        X_t = noisy_data["X_t"]  # (bs, n, dx) one-hot
+        E_t = noisy_data["E_t"]  # (bs, n, n, de) one-hot
+        de = E_t.shape[-1]
+        if de == 5:
+            bond_orders = torch.tensor([0, 1, 2, 3, 1.5], device=E_t.device).reshape(1, 1, 1, -1)
+        else:
+            bond_orders = torch.tensor([0, 1, 2, 3], device=E_t.device).reshape(1, 1, 1, -1)
+
+        weighted_E = E_t * bond_orders
+        current_valencies = weighted_E.argmax(dim=-1).sum(dim=-1)  # (bs, n)
+
+        valencies = torch.tensor(self.valencies, device=X_t.device).reshape(1, 1, -1)
+        Xv = X_t * valencies
+        normal_valencies = torch.argmax(Xv, dim=-1)  # (bs, n)
+
+        charge = (normal_valencies - current_valencies).type_as(X_t).unsqueeze(-1)   # (bs, n, 1)
+        valency = current_valencies.type_as(X_t).unsqueeze(-1)                        # (bs, n, 1)
+        X_extra = torch.cat((charge, valency), dim=-1)  # (bs, n, 2)
+
+        atom_w = torch.tensor(self.atom_weights, device=X_t.device).type_as(X_t)
+        X_idx = torch.argmax(X_t, dim=-1)  # (bs, n)
+        weight = atom_w[X_idx].sum(dim=-1).unsqueeze(-1) / self.max_weight  # (bs, 1)
+
+        return X_extra, weight
+
+    def output_dims(self) -> Dict[str, int]:
+        return {"X": 2, "E": 0, "y": 1}

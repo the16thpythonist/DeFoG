@@ -33,7 +33,7 @@ from .size_distribution import (
     ExplicitSizeDistribution,
 )
 from .transformer import GraphTransformer
-from .features import ExtraFeatures
+from .features import ExtraFeatures, MolecularFeatures
 from .noise import LimitDistribution, sample_noise, sample_from_probs
 from .rate_matrix import RateMatrixDesigner
 from .time_distortion import TimeDistorter
@@ -120,6 +120,11 @@ class DeFoGModel(pl.LightningModule):
         # Extra features
         extra_features_type: str = "rrwp",
         rrwp_steps: int = 10,
+        # Molecular domain features (per-atom charge/valency + molecular weight)
+        molecular_features: bool = False,
+        atom_valencies: Optional[list] = None,
+        atom_weights: Optional[list] = None,
+        max_atom_weight: float = 350.0,
         # Training
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
@@ -201,13 +206,22 @@ class DeFoGModel(pl.LightningModule):
         )
         extra_dims = self.extra_features.output_dims()
 
+        # Optional molecular domain features (charge/valency into X, weight into y)
+        self.mol_features = None
+        mol_dims = {"X": 0, "E": 0, "y": 0}
+        if molecular_features and atom_valencies is not None and atom_weights is not None:
+            self.mol_features = MolecularFeatures(
+                valencies=atom_valencies, atom_weights=atom_weights, max_weight=max_atom_weight
+            )
+            mol_dims = self.mol_features.output_dims()
+
         # Compute input/output dimensions
         # Input: node/edge classes + extra features + time + condition embedding
         cond_y_dim = cond_emb_dim if cond_dim > 0 else 0
         self.input_dims = {
-            "X": actual_node_classes + extra_dims["X"],
-            "E": actual_edge_classes + extra_dims["E"],
-            "y": cond_y_dim + 1 + extra_dims["y"],  # condition emb + time + extra global features
+            "X": actual_node_classes + extra_dims["X"] + mol_dims["X"],
+            "E": actual_edge_classes + extra_dims["E"] + mol_dims["E"],
+            "y": cond_y_dim + 1 + extra_dims["y"] + mol_dims["y"],  # cond emb + time + extra + mol
         }
         self.output_dims = {
             "X": actual_node_classes,
@@ -897,12 +911,19 @@ class DeFoGModel(pl.LightningModule):
             PlaceHolder with extra features
         """
         extra_features = self.extra_features(noisy_data)
+        extra_X = extra_features.X
 
         # Append time to global features
         t = noisy_data["t"]
         extra_y = torch.cat((extra_features.y, t), dim=1)
 
-        return PlaceHolder(X=extra_features.X, E=extra_features.E, y=extra_y)
+        # Molecular domain features (charge/valency into X, weight into y)
+        if self.mol_features is not None:
+            mol_X, mol_y = self.mol_features(noisy_data)
+            extra_X = torch.cat((extra_X, mol_X), dim=-1)
+            extra_y = torch.cat((extra_y, mol_y), dim=1)
+
+        return PlaceHolder(X=extra_X, E=extra_features.E, y=extra_y)
 
     @classmethod
     def from_dataloader(
