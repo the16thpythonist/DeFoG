@@ -204,7 +204,6 @@ def plot_target(dataset_df, generated, targets, property_names, title):
 )
 def experiment(e: Experiment) -> None:
     e.log("AqSolDB conditional generation (logP + SAS)")
-    e.log_parameters()
 
     # -- Data ---------------------------------------------------------------
     df = pd.read_csv(e.CSV_PATH)
