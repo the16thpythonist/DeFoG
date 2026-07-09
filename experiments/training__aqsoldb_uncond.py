@@ -41,30 +41,32 @@ CSV_PATH: str = os.path.join(_PROJECT_DIR, "data", "aqsoldb_conditional.csv")
 SMILES_COLUMN: str = "smiles"
 BOND_TYPES: list = ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
 
-# --- Model architecture (same as conditional) ---
-N_LAYERS: int = 6
+# --- Model architecture (matched to authors' configs/experiment/aqsoldb.yaml) ---
+N_LAYERS: int = 9
 HIDDEN_DIM: int = 256
 HIDDEN_MLP_DIM: int = 512
 N_HEADS: int = 8
 DROPOUT: float = 0.1
 NOISE_TYPE: str = "marginal"
 EXTRA_FEATURES_TYPE: str = "rrwp"
-RRWP_STEPS: int = 10
+RRWP_STEPS: int = 20
 
-# --- Training (same as conditional) ---
+# --- Training (matched to authors' AqSolDB recipe) ---
 EPOCHS: int = 250
 BATCH_SIZE: int = 64
-LEARNING_RATE: float = 1e-4
+LEARNING_RATE: float = 2e-4
 WEIGHT_DECAY: float = 1e-5
+LAMBDA_EDGE: float = 5.0          # edge loss weighted 5x node loss (DeFoG default)
+TRAIN_TIME_DISTORTION: str = "polydec"
 TRAIN_SPLIT: float = 0.9
 
 # --- Sampling / evaluation ---
 SAMPLE_STEPS: int = 100          # model default (general sampling)
 EVAL_SAMPLE_STEPS: int = 1000    # definitive end-of-run eval
 GEN_SAMPLE_STEPS: int = 500      # in-training validation-epoch metric sampling
-ETA: float = 1.0                 # small error-correction stochasticity
+ETA: float = 10.0                # error-correction stochasticity (authors use 100)
 OMEGA: float = 0.0
-SAMPLE_TIME_DISTORTION: str = "polydec"   # sampling schedule (training stays identity)
+SAMPLE_TIME_DISTORTION: str = "polydec"   # sampling schedule
 NUM_EVAL_SAMPLES: int = 1000
 EVAL_CHUNK: int = 32
 SAMPLE_VIS_EVERY_K: int = 25
@@ -135,6 +137,7 @@ def experiment(e: Experiment) -> None:
         n_heads=e.N_HEADS, dropout=e.DROPOUT, noise_type=e.NOISE_TYPE,
         extra_features_type=e.EXTRA_FEATURES_TYPE, rrwp_steps=e.RRWP_STEPS,
         lr=e.LEARNING_RATE, weight_decay=e.WEIGHT_DECAY,
+        lambda_edge=e.LAMBDA_EDGE, train_time_distortion=e.TRAIN_TIME_DISTORTION,
         sample_steps=e.SAMPLE_STEPS, eta=e.ETA, omega=e.OMEGA,
         sample_time_distortion=e.SAMPLE_TIME_DISTORTION,
     )
