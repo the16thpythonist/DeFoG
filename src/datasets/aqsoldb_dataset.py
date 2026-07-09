@@ -50,11 +50,15 @@ class AqSolDBDataset(InMemoryDataset):
         transform=None,
         pre_transform=None,
         pre_filter=None,
+        unconditional: bool = False,
     ):
         self.stage = stage
         self.atom_decoder = atom_decoder
         self.filter_dataset = filter_dataset
         self.csv_path = csv_path
+        # When True, do not attach any target (solubility/logP) to y -> a truly
+        # unconditional dataset (the model never sees the properties).
+        self.unconditional = unconditional
 
         if self.stage == "train":
             self.file_idx = 0
@@ -178,10 +182,14 @@ class AqSolDBDataset(InMemoryDataset):
 
             x = F.one_hot(torch.tensor(type_idx), num_classes=len(types)).float()
 
-            # Store both solubility and logP for conditional generation
-            # y[:, 0] = solubility, y[:, 1] = logP
-            logp_val = logp if logp is not None and not np.isnan(logp) else 0.0
-            y = torch.tensor([[solubility, logp_val]], dtype=torch.float)
+            if self.unconditional:
+                # Truly unconditional: no target attached (empty global feature).
+                y = torch.zeros((1, 0), dtype=torch.float)
+            else:
+                # Store both solubility and logP for conditional generation
+                # y[:, 0] = solubility, y[:, 1] = logP
+                logp_val = logp if logp is not None and not np.isnan(logp) else 0.0
+                y = torch.tensor([[solubility, logp_val]], dtype=torch.float)
 
             data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y, idx=i)
 
@@ -313,6 +321,7 @@ class AqSolDBDataModule(MolecularDataModule):
         self.remove_h = False
         self.datadir = cfg.dataset.datadir
         self.filter_dataset = cfg.dataset.filter
+        self.unconditional = getattr(cfg.dataset, "unconditional", False)
         self.train_smiles = []
 
         base_path = pathlib.Path(os.path.realpath(__file__)).parents[2]
@@ -352,15 +361,18 @@ class AqSolDBDataModule(MolecularDataModule):
         datasets = {
             "train": AqSolDBDataset(
                 stage="train", root=root_path, csv_path=csv_path,
-                filter_dataset=self.filter_dataset, transform=transform
+                filter_dataset=self.filter_dataset, transform=transform,
+                unconditional=self.unconditional,
             ),
             "val": AqSolDBDataset(
                 stage="val", root=root_path, csv_path=csv_path,
-                filter_dataset=self.filter_dataset, transform=transform
+                filter_dataset=self.filter_dataset, transform=transform,
+                unconditional=self.unconditional,
             ),
             "test": AqSolDBDataset(
                 stage="test", root=root_path, csv_path=csv_path,
-                filter_dataset=self.filter_dataset, transform=transform
+                filter_dataset=self.filter_dataset, transform=transform,
+                unconditional=self.unconditional,
             ),
         }
         super().__init__(cfg, datasets)

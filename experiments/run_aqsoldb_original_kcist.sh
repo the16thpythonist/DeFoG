@@ -23,4 +23,4 @@ export PYTHONUNBUFFERED=1
 
 echo "host: $(hostname)  job: $SLURM_JOB_ID"
 python -c "import torch; print('cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
-python main.py +experiment=aqsoldb dataset=aqsoldb general.gpus=1 "$@"
+python main.py +experiment=aqsoldb dataset=aqsoldb_uncond general.gpus=1 "$@"

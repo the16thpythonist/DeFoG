@@ -520,11 +520,6 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                     z_T.y = torch.linspace(-2, 2, batch_size).unsqueeze(1).to(self.device)
             else:
                 raise NotImplementedError
-        elif "aqsoldb" in self.cfg.dataset.name:
-            # Unconditional AqSolDB: the dataset always attaches a 2-col y
-            # ([solubility, logP]) that the model is trained on, so the sampling
-            # y must have the same width. Zero-fill it (option B).
-            z_T.y = torch.zeros(batch_size, 2).to(self.device)
         X, E, y = z_T.X, z_T.E, z_T.y
 
         # Init chain storing variables

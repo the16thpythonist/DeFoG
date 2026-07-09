@@ -1,0 +1,6 @@
+name: 'aqsoldb'                              # keep 'aqsoldb' so main.py dispatch matches
+datadir: 'data/aqsoldb/aqsoldb_pyg_uncond/'  # separate cache (empty-y processing)
+remove_h: null
+filter: False
+compute_fcd: False
+unconditional: True                          # do NOT attach solubility/logP to y
