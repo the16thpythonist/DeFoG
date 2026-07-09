@@ -113,10 +113,13 @@ WEIGHT_DECAY: float = 1e-5
 TRAIN_SPLIT: float = 0.9
 
 # --- Sampling / evaluation ---
-SAMPLE_STEPS: int = 100
-ETA: float = 0.0
+SAMPLE_STEPS: int = 100          # model default (general sampling)
+EVAL_SAMPLE_STEPS: int = 1000    # definitive end-of-run target-grid eval
+GEN_SAMPLE_STEPS: int = 500      # in-training validation-epoch metric sampling
+EVAL_CHUNK: int = 32             # chunk size for eval sampling (avoids giant batches)
+ETA: float = 1.0                 # small error-correction stochasticity
 OMEGA: float = 0.0
-SAMPLE_TIME_DISTORTION: str = "identity"
+SAMPLE_TIME_DISTORTION: str = "polydec"   # sampling schedule (training stays identity)
 
 # :param SIZE_DIST_METHOD:
 #     "kernel" / "regression" -> property-conditional size; "marginal" -> P(n).
@@ -269,6 +272,7 @@ def experiment(e: Experiment) -> None:
     monitor = TrainingMonitorCallback(
         smoothing_window=5, figure_callback=lambda fig: e.track("training_progress", fig),
         generation_metrics_fn=gen_metrics_fn, gen_every_k=10, gen_num_samples=64,
+        gen_sample_steps=e.GEN_SAMPLE_STEPS,
     )
     sampler = SampleVisualizationCallback(
         num_samples=8, every_k_epochs=e.SAMPLE_VIS_EVERY_K, sample_steps=e.SAMPLE_STEPS,
@@ -287,6 +291,8 @@ def experiment(e: Experiment) -> None:
     # -- Evaluation: 3x3 joint (logP, SAS) target grid ----------------------
     e.log("=" * 60)
     e.log("EVALUATION: joint target grid")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
     model.eval()
 
     # Property-conditional size distribution built from the training pairs.
@@ -315,14 +321,20 @@ def experiment(e: Experiment) -> None:
                 property_names[1]: float(levels[property_names[1]][lvl_b]),
             }
             cond_vec = target_condition_vector(targets, e.PROPERTIES, norm_stats)
-            condition = cond_vec.unsqueeze(0).expand(e.NUM_EVAL_SAMPLES, -1)
 
-            samples = model.sample(
-                num_samples=e.NUM_EVAL_SAMPLES, condition=condition,
-                guidance_scale=e.GUIDANCE_SCALE, sample_steps=e.SAMPLE_STEPS,
-                eta=e.ETA, omega=e.OMEGA, time_distortion=e.SAMPLE_TIME_DISTORTION,
-                size_dist=size_dist, show_progress=False,
-            )
+            # Chunked sampling (avoids memory-bound giant batches; runs on GPU).
+            samples = []
+            remaining = e.NUM_EVAL_SAMPLES
+            while remaining > 0:
+                cur = min(e.EVAL_CHUNK, remaining)
+                condition = cond_vec.unsqueeze(0).expand(cur, -1)
+                samples += model.sample(
+                    num_samples=cur, condition=condition,
+                    guidance_scale=e.GUIDANCE_SCALE, sample_steps=e.EVAL_SAMPLE_STEPS,
+                    eta=e.ETA, omega=e.OMEGA, time_distortion=e.SAMPLE_TIME_DISTORTION,
+                    size_dist=size_dist, device=device, show_progress=False,
+                )
+                remaining -= cur
 
             generated = {name: [] for name in property_names}
             n_valid = 0
@@ -371,6 +383,9 @@ def testing(e: Experiment):
     e.EPOCHS = 2
     e.BATCH_SIZE = 16
     e.SAMPLE_STEPS = 5
+    e.EVAL_SAMPLE_STEPS = 5
+    e.GEN_SAMPLE_STEPS = 5
+    e.EVAL_CHUNK = 8
     e.NUM_EVAL_SAMPLES = 20
     e.SAMPLE_VIS_EVERY_K = 1
     e.N_LAYERS = 2

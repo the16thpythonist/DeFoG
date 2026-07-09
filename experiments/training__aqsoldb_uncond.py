@@ -58,11 +58,13 @@ LEARNING_RATE: float = 1e-4
 WEIGHT_DECAY: float = 1e-5
 TRAIN_SPLIT: float = 0.9
 
-# --- Sampling / evaluation (same params as the conditional uncond eval) ---
-SAMPLE_STEPS: int = 100
-ETA: float = 0.0
+# --- Sampling / evaluation ---
+SAMPLE_STEPS: int = 100          # model default (general sampling)
+EVAL_SAMPLE_STEPS: int = 1000    # definitive end-of-run eval
+GEN_SAMPLE_STEPS: int = 500      # in-training validation-epoch metric sampling
+ETA: float = 1.0                 # small error-correction stochasticity
 OMEGA: float = 0.0
-SAMPLE_TIME_DISTORTION: str = "identity"
+SAMPLE_TIME_DISTORTION: str = "polydec"   # sampling schedule (training stays identity)
 NUM_EVAL_SAMPLES: int = 1000
 EVAL_CHUNK: int = 32
 SAMPLE_VIS_EVERY_K: int = 25
@@ -145,6 +147,7 @@ def experiment(e: Experiment) -> None:
     monitor = TrainingMonitorCallback(
         smoothing_window=5, figure_callback=lambda fig: e.track("training_progress", fig),
         generation_metrics_fn=gen_metrics_fn, gen_every_k=10, gen_num_samples=64,
+        gen_sample_steps=e.GEN_SAMPLE_STEPS,
     )
     sampler = SampleVisualizationCallback(
         num_samples=8, every_k_epochs=e.SAMPLE_VIS_EVERY_K, sample_steps=e.SAMPLE_STEPS,
@@ -173,7 +176,7 @@ def experiment(e: Experiment) -> None:
     while remaining > 0:
         cur = min(e.EVAL_CHUNK, remaining)
         samples += model.sample(
-            num_samples=cur, sample_steps=e.SAMPLE_STEPS, device=device,
+            num_samples=cur, sample_steps=e.EVAL_SAMPLE_STEPS, device=device,
             show_progress=False,
         )
         remaining -= cur
@@ -205,6 +208,8 @@ def testing(e: Experiment):
     e.EPOCHS = 2
     e.BATCH_SIZE = 16
     e.SAMPLE_STEPS = 5
+    e.EVAL_SAMPLE_STEPS = 5
+    e.GEN_SAMPLE_STEPS = 5
     e.NUM_EVAL_SAMPLES = 20
     e.EVAL_CHUNK = 8
     e.SAMPLE_VIS_EVERY_K = 1

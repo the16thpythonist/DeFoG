@@ -84,8 +84,10 @@ def main():
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--num-samples", type=int, default=500)
     ap.add_argument("--chunk", type=int, default=32)
-    ap.add_argument("--sample-steps", type=int, default=100)
+    ap.add_argument("--sample-steps", type=int, default=1000)
     ap.add_argument("--guidance-scale", type=float, default=2.0)
+    ap.add_argument("--time-distortion", type=str, default="polydec")
+    ap.add_argument("--eta", type=float, default=1.0)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -138,6 +140,7 @@ def main():
                 samples += model.sample(
                     num_samples=cur, condition=cond, guidance_scale=args.guidance_scale,
                     sample_steps=args.sample_steps, size_dist=size_dist,
+                    eta=args.eta, time_distortion=args.time_distortion,
                     device=device, show_progress=False,
                 )
                 remaining -= cur

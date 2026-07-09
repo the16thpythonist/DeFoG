@@ -41,7 +41,9 @@ def main():
     ap.add_argument("--csv", required=True)
     ap.add_argument("--num-samples", type=int, default=1000)
     ap.add_argument("--chunk", type=int, default=32)
-    ap.add_argument("--sample-steps", type=int, default=100)
+    ap.add_argument("--sample-steps", type=int, default=1000)
+    ap.add_argument("--time-distortion", type=str, default="polydec")
+    ap.add_argument("--eta", type=float, default=1.0)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -55,6 +57,8 @@ def main():
     model = model.to(device)
     model.eval()
     print(f"model on {next(model.parameters()).device}, cond_dim={model.cond_dim}", flush=True)
+    print(f"sampling: steps={args.sample_steps} distortion={args.time_distortion} "
+          f"eta={args.eta}", flush=True)
 
     # Unconditional sampling in chunks (condition=None -> learned null embedding;
     # size_dist=None -> the model's default marginal P(n)).
@@ -64,6 +68,7 @@ def main():
         cur = min(args.chunk, remaining)
         samples += model.sample(
             num_samples=cur, condition=None, sample_steps=args.sample_steps,
+            eta=args.eta, time_distortion=args.time_distortion,
             device=device, show_progress=False,
         )
         remaining -= cur
