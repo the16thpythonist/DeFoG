@@ -132,6 +132,7 @@ class DeFoGModel(pl.LightningModule):
         eta: float = 0.0,
         omega: float = 0.0,
         sample_time_distortion: str = "identity",
+        rdb: str = "general",  # detailed-balance design (authors use "general")
         # Conditioning / classifier-free guidance
         cond_dim: int = 0,
         cond_emb_dim: int = 64,
@@ -241,9 +242,11 @@ class DeFoGModel(pl.LightningModule):
         )
 
         # Create rate matrix designer
+        self.rdb = rdb
         self.rate_matrix_designer = RateMatrixDesigner(
             eta=eta,
             omega=omega,
+            rdb=rdb,
             limit_dist=self.limit_dist,
         )
 
@@ -834,7 +837,10 @@ class DeFoGModel(pl.LightningModule):
         X_s = F.one_hot(sampled_s.X, num_classes=len(limit_X)).float()
         E_s = F.one_hot(sampled_s.E, num_classes=len(limit_E)).float()
 
-        return X_s, E_s, y_t
+        # Re-mask padding nodes/edges each step so junk padding states don't
+        # contaminate the next step's RRWP features (train/inference parity).
+        masked = PlaceHolder(X=X_s, E=E_s, y=y_t).mask(node_mask)
+        return masked.X, masked.E, y_t
 
     def _compute_step_probs(
         self,

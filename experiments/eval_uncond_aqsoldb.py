@@ -43,7 +43,8 @@ def main():
     ap.add_argument("--chunk", type=int, default=32)
     ap.add_argument("--sample-steps", type=int, default=1000)
     ap.add_argument("--time-distortion", type=str, default="polydec")
-    ap.add_argument("--eta", type=float, default=1.0)
+    ap.add_argument("--eta", type=float, default=100.0)   # authors' AqSolDB value
+    ap.add_argument("--omega", type=float, default=0.3)   # authors' AqSolDB value
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -68,7 +69,7 @@ def main():
         cur = min(args.chunk, remaining)
         samples += model.sample(
             num_samples=cur, condition=None, sample_steps=args.sample_steps,
-            eta=args.eta, time_distortion=args.time_distortion,
+            eta=args.eta, omega=args.omega, time_distortion=args.time_distortion,
             device=device, show_progress=False,
         )
         remaining -= cur
