@@ -125,6 +125,8 @@ class DeFoGModel(pl.LightningModule):
         weight_decay: float = 1e-5,
         lambda_edge: float = 1.0,
         train_time_distortion: str = "identity",
+        lr_scheduler: Optional[str] = None,
+        lr_min: float = 1e-6,
         # Sampling defaults
         sample_steps: int = 100,
         eta: float = 0.0,
@@ -148,6 +150,8 @@ class DeFoGModel(pl.LightningModule):
         # Store training params
         self.lr = lr
         self.weight_decay = weight_decay
+        self.lr_scheduler = lr_scheduler
+        self.lr_min = lr_min
 
         # Store sampling params
         self.sample_steps = sample_steps
@@ -422,13 +426,23 @@ class DeFoGModel(pl.LightningModule):
         return {"val_loss": loss}
 
     def configure_optimizers(self):
-        """Configure AdamW optimizer."""
-        return torch.optim.AdamW(
+        """Configure AdamW optimizer, optionally with a cosine LR schedule."""
+        optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.lr,
             amsgrad=True,
             weight_decay=self.weight_decay,
         )
+        if self.lr_scheduler == "cosine":
+            t_max = self.trainer.max_epochs if self.trainer is not None else 250
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=t_max, eta_min=self.lr_min
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+            }
+        return optimizer
 
     def _resolve_size_dist(
         self,

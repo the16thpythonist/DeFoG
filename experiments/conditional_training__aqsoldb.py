@@ -52,6 +52,7 @@ from defog.core import (
     DeFoGModel,
     TrainingMonitorCallback,
     SampleVisualizationCallback,
+    EMACallback,
     ConditionalSizeDistribution,
 )
 
@@ -105,13 +106,16 @@ RRWP_STEPS: int = 20
 COND_DROP_PROB: float = 0.1
 GUIDANCE_SCALE: float = 2.0
 
-# --- Training (matched to authors' AqSolDB recipe) ---
+# --- Training (matched to authors' AqSolDB recipe, stabilized) ---
 EPOCHS: int = 250
-BATCH_SIZE: int = 64
-LEARNING_RATE: float = 2e-4
+BATCH_SIZE: int = 128            # larger batch -> less gradient noise (stability)
+LEARNING_RATE: float = 1.5e-4    # decreased from 2e-4 for stability
+LR_SCHEDULER: str = "cosine"     # decay LR to settle late-training generation
+LR_MIN: float = 1e-6
 WEIGHT_DECAY: float = 1e-5
 LAMBDA_EDGE: float = 5.0          # edge loss weighted 5x node loss (DeFoG default)
 TRAIN_TIME_DISTORTION: str = "polydec"
+EMA_DECAY: float = 0.999         # EMA of weights (0 = off); sampled/eval'd from EMA
 TRAIN_SPLIT: float = 0.9
 
 # --- Sampling / evaluation ---
@@ -262,6 +266,7 @@ def experiment(e: Experiment) -> None:
         extra_features_type=e.EXTRA_FEATURES_TYPE, rrwp_steps=e.RRWP_STEPS,
         lr=e.LEARNING_RATE, weight_decay=e.WEIGHT_DECAY,
         lambda_edge=e.LAMBDA_EDGE, train_time_distortion=e.TRAIN_TIME_DISTORTION,
+        lr_scheduler=e.LR_SCHEDULER, lr_min=e.LR_MIN,
         sample_steps=e.SAMPLE_STEPS, eta=e.ETA, omega=e.OMEGA,
         sample_time_distortion=e.SAMPLE_TIME_DISTORTION,
         cond_dim=cond_dim, cond_drop_prob=e.COND_DROP_PROB,
@@ -275,16 +280,21 @@ def experiment(e: Experiment) -> None:
     monitor = TrainingMonitorCallback(
         smoothing_window=5, figure_callback=lambda fig: e.track("training_progress", fig),
         generation_metrics_fn=gen_metrics_fn, gen_every_k=10, gen_num_samples=64,
-        gen_sample_steps=e.GEN_SAMPLE_STEPS,
+        gen_sample_steps=e.GEN_SAMPLE_STEPS, checkpoint_dir=e.path,
     )
     sampler = SampleVisualizationCallback(
         num_samples=8, every_k_epochs=e.SAMPLE_VIS_EVERY_K, sample_steps=e.SAMPLE_STEPS,
         figure_callback=lambda fig: e.track("samples", fig),
     )
+    # EMA first in the list so its weight-swap wraps validation sampling/metrics.
+    callbacks = [monitor, sampler]
+    if e.EMA_DECAY and e.EMA_DECAY > 0:
+        callbacks = [EMACallback(decay=e.EMA_DECAY)] + callbacks
+        e.log(f"EMA enabled (decay={e.EMA_DECAY}); validation/eval sample from EMA weights")
     trainer = pl.Trainer(
         max_epochs=e.EPOCHS, accelerator="auto", devices=1,
         enable_progress_bar=True, enable_checkpointing=False, logger=False,
-        callbacks=[monitor, sampler],
+        callbacks=callbacks,
     )
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
@@ -295,6 +305,11 @@ def experiment(e: Experiment) -> None:
     e.log("=" * 60)
     e.log("EVALUATION: joint target grid")
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    best_path = os.path.join(e.path, "best_model")
+    if os.path.exists(best_path + ".ckpt"):
+        e.log(f"Loading best-validity checkpoint (best in-train validity="
+              f"{monitor.best_validity:.3f})")
+        model = DeFoGModel.load(best_path)
     model = model.to(device)
     model.eval()
 

@@ -36,7 +36,7 @@ Utility Functions:
 """
 
 from .model import DeFoGModel
-from .callbacks import TrainingMonitorCallback, SampleVisualizationCallback
+from .callbacks import TrainingMonitorCallback, SampleVisualizationCallback, EMACallback
 from .data import (
     PlaceHolder,
     to_dense,
@@ -73,6 +73,7 @@ __all__ = [
     # Callbacks
     "TrainingMonitorCallback",
     "SampleVisualizationCallback",
+    "EMACallback",
     # Data utilities
     "PlaceHolder",
     "to_dense",

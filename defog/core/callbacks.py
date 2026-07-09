@@ -20,6 +20,7 @@ Example:
     >>> trainer.fit(model, train_loader, val_loader)
 """
 
+import os
 import time
 import threading
 import warnings
@@ -193,6 +194,7 @@ class TrainingMonitorCallback(pl.Callback):
         gen_every_k: int = 10,
         gen_num_samples: int = 64,
         gen_sample_steps: Optional[int] = None,
+        checkpoint_dir: Optional[str] = None,
     ):
         super().__init__()
         self.smoothing_window = smoothing_window
@@ -202,6 +204,10 @@ class TrainingMonitorCallback(pl.Callback):
         self.gen_every_k = gen_every_k
         self.gen_num_samples = gen_num_samples
         self.gen_sample_steps = gen_sample_steps
+        # When set (together with generation_metrics_fn), the model is saved to
+        # <checkpoint_dir>/best_model whenever validity reaches a new maximum.
+        self.checkpoint_dir = checkpoint_dir
+        self.best_validity = -1.0
 
         # Per-epoch history (appended at each validation epoch end)
         self.history: Dict[str, List] = defaultdict(list)
@@ -456,6 +462,20 @@ class TrainingMonitorCallback(pl.Callback):
         self.history["gen_epochs"].append(epoch_idx)
         for key in ("validity", "uniqueness", "novelty"):
             self.history[f"gen_{key}"].append(float(metrics.get(key, float("nan"))))
+
+        # Save the model whenever validity reaches a new best (captures the peak
+        # even if late-training generation quality oscillates).
+        validity = float(metrics.get("validity", float("nan")))
+        if (self.checkpoint_dir is not None and validity == validity  # not NaN
+                and validity > self.best_validity):
+            self.best_validity = validity
+            try:
+                pl_module.save(os.path.join(self.checkpoint_dir, "best_model"))
+                warnings.warn(
+                    f"[epoch {epoch_idx}] new best validity {validity:.3f} -> saved best_model"
+                )
+            except Exception as exc:
+                warnings.warn(f"best-checkpoint save failed: {exc}")
 
     # ------------------------------------------------------------------
     # Plotting
@@ -889,3 +909,65 @@ class SampleVisualizationCallback(pl.Callback):
             self.figure_callback(fig)
         else:
             plt.close(fig)
+
+
+class EMACallback(pl.Callback):
+    """
+    Exponential Moving Average of model weights.
+
+    Maintains a shadow copy of the trainable parameters, updated after every
+    optimizer step as ``shadow = decay * shadow + (1 - decay) * param``. During
+    validation the EMA weights are swapped into the model (and restored after),
+    so that the validation loss, the in-training generation-metric sampling, and
+    any best-checkpoint saved during validation all reflect the smoothed EMA
+    weights. At fit end the EMA weights are baked into the model so the final
+    saved model is the EMA model.
+
+    You MUST evaluate/sample from the EMA weights for EMA to help -- this
+    callback ensures that by swapping during validation and at fit end.
+    """
+
+    def __init__(self, decay: float = 0.999):
+        super().__init__()
+        self.decay = decay
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self._backup: Dict[str, torch.Tensor] = {}
+
+    @torch.no_grad()
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        if not self.shadow:  # don't clobber a resumed shadow
+            self.shadow = {
+                n: p.detach().clone()
+                for n, p in pl_module.named_parameters()
+                if p.requires_grad
+            }
+
+    @torch.no_grad()
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        for n, p in pl_module.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def on_validation_start(self, trainer, pl_module):
+        if not self.shadow:
+            return
+        self._backup = {}
+        for n, p in pl_module.named_parameters():
+            if n in self.shadow:
+                self._backup[n] = p.detach().clone()
+                p.data.copy_(self.shadow[n])
+
+    @torch.no_grad()
+    def on_validation_end(self, trainer, pl_module):
+        for n, p in pl_module.named_parameters():
+            if n in self._backup:
+                p.data.copy_(self._backup[n])
+        self._backup = {}
+
+    @torch.no_grad()
+    def on_fit_end(self, trainer, pl_module):
+        # Bake EMA weights into the model so the final saved model is the EMA one.
+        for n, p in pl_module.named_parameters():
+            if n in self.shadow:
+                p.data.copy_(self.shadow[n])
