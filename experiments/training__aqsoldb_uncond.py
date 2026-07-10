@@ -176,16 +176,24 @@ def experiment(e: Experiment) -> None:
 
     # -- Train --------------------------------------------------------------
     gen_metrics_fn = make_generation_metrics_fn(atom_decoder, bond_decoder, train_smiles)
+    # Single source of truth for in-training sampling: BOTH the validity/uniqueness
+    # metric probe AND the molecule preview render use these settings, so the
+    # rendered previews faithfully reflect the reported validity. (The model-default
+    # eta=100 / 100-step sampling is far harsher and made previews look far worse
+    # than the metric -- keep these two in lockstep going forward.)
+    PROBE_SAMPLE_STEPS = e.GEN_SAMPLE_STEPS
+    PROBE_ETA = e.GEN_ETA
     monitor = TrainingMonitorCallback(
         smoothing_window=5, figure_callback=lambda fig: e.track("training_progress", fig),
         generation_metrics_fn=gen_metrics_fn, gen_every_k=10, gen_num_samples=64,
-        gen_sample_steps=e.GEN_SAMPLE_STEPS, gen_eta=e.GEN_ETA, checkpoint_dir=e.path,
+        gen_sample_steps=PROBE_SAMPLE_STEPS, gen_eta=PROBE_ETA, checkpoint_dir=e.path,
     )
     # RDKit-backed molecule depictions for the in-training sample previews
     # (validity/SMILES captions). The metrics path stays independent (above).
     mol_domain = MoleculeDomain(atom_decoder, bond_decoder, reference_smiles=train_smiles)
     sampler = SampleVisualizationCallback(
-        num_samples=8, every_k_epochs=e.SAMPLE_VIS_EVERY_K, sample_steps=e.SAMPLE_STEPS,
+        num_samples=8, every_k_epochs=e.SAMPLE_VIS_EVERY_K,
+        sample_steps=PROBE_SAMPLE_STEPS, eta=PROBE_ETA,
         domain=mol_domain,
         figure_callback=lambda fig: e.track("samples", fig),
     )
