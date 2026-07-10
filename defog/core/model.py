@@ -921,16 +921,25 @@ class DeFoGModel(pl.LightningModule):
         """
         extra_features = self.extra_features(noisy_data)
         extra_X = extra_features.X
+        extra_y = extra_features.y
 
-        # Append time to global features
-        t = noisy_data["t"]
-        extra_y = torch.cat((extra_features.y, t), dim=1)
-
-        # Molecular domain features (charge/valency into X, weight into y)
+        # Molecular domain features (charge/valency into X, weight into y).
+        # IMPORTANT: molecular weight must be appended BEFORE the time column.
+        # The transformer treats the LAST column of y as the flow-time t
+        # (transformer.py: `time = y[:, -1:]`), matching src's contract
+        # (graph_discrete_flow_model.py: extra_y = cat(..., weight); cat(extra_y, t)).
+        # If molecular weight were appended after t it would displace t from the
+        # last position, so the sinusoidal time embedding would be fed the noisy
+        # graph's molecular weight instead of the flow-time -> a time-blind
+        # denoiser (this exact bug drove validity to 0%).
         if self.mol_features is not None:
             mol_X, mol_y = self.mol_features(noisy_data)
             extra_X = torch.cat((extra_X, mol_X), dim=-1)
             extra_y = torch.cat((extra_y, mol_y), dim=1)
+
+        # Append time LAST so the transformer's y[:, -1] time read gets true t.
+        t = noisy_data["t"]
+        extra_y = torch.cat((extra_y, t), dim=1)
 
         return PlaceHolder(X=extra_X, E=extra_features.E, y=extra_y)
 
