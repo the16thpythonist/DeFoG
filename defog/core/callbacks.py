@@ -766,9 +766,29 @@ class TrainingMonitorCallback(pl.Callback):
                 ["validity", "uniqueness", "novelty"],
                 "Generation Metrics",
             )
+            # Overlay the composite NUV = Valid x Unique x Novel (dashed).
+            self._plot_nuv(axes[5, 3])
 
         fig.tight_layout()
         return fig
+
+    def _plot_nuv(self, ax):
+        """Overlay NUV = Valid x Unique x Novel (dashed) on a metrics panel.
+
+        Per probe, NUV = validity * uniqueness * novelty -- the fraction of ALL
+        generated graphs that are simultaneously valid, unique, and novel.
+        """
+        gen_epochs = self.history.get("gen_epochs", [])
+        v = self.history.get("gen_validity", [])
+        u = self.history.get("gen_uniqueness", [])
+        n = self.history.get("gen_novelty", [])
+        m = min(len(gen_epochs), len(v), len(u), len(n))
+        if m == 0:
+            return
+        nuv = [v[i] * u[i] * n[i] for i in range(m)]
+        ax.plot(gen_epochs[:m], nuv, marker="o", markersize=3, linestyle="--",
+                color="black", label="NUV")
+        ax.legend(fontsize="small")
 
     def _plot_gen_metric(self, ax, keys, labels, title):
         """Plot generation metrics against the epochs at which they were sampled."""

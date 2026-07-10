@@ -93,6 +93,12 @@ NUM_EVAL_SAMPLES: int = 1000
 EVAL_CHUNK: int = 32
 SAMPLE_VIS_EVERY_K: int = 25
 
+# --- Reproducibility ---
+# :param SEED:
+#     Global random seed (data split, weight init, DataLoader shuffling). Fixed so
+#     runs are reproducible and an LR sweep isolates the LR effect from seed noise.
+SEED: int = 42
+
 # --- Special ---
 __DEBUG__: bool = True
 __TESTING__: bool = False
@@ -116,6 +122,8 @@ def derive_atom_types(smiles_list) -> list:
 )
 def experiment(e: Experiment) -> None:
     e.log("AqSolDB UNCONDITIONAL training (control run)")
+    pl.seed_everything(e.SEED, workers=True)
+    e.log(f"global seed set to {e.SEED} (reproducible init / split / shuffling)")
 
     # -- Data ---------------------------------------------------------------
     df = pd.read_csv(e.CSV_PATH)
