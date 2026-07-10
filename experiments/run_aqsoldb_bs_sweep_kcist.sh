@@ -1,27 +1,24 @@
 #!/bin/bash
-# Unconditional AqSolDB training -- 4-way BATCH-SIZE sweep on ONE JUPITER node.
-# JUPITER (JSC) "booster" partition = 4x GH200 (H100 96GB) per node, ARM aarch64,
-# whole-node exclusive. Runs all 4 trainings in parallel, one per GPU, each a
-# different --BATCH_SIZE, with LR fixed at 4e-4 and seed 42, non-debug.
+# Unconditional AqSolDB training -- 4-way BATCH-SIZE sweep on ONE KCIST node.
+# partition "small" = 4x RTX 4090 per node. Runs all 4 trainings in parallel, one
+# per GPU, each a different --BATCH_SIZE, with LR fixed at 4e-4 (the winning value),
+# seed 42, non-debug.
 #
-#   sbatch experiments/run_aqsoldb_bs_sweep_jupiter.sh
+#   sbatch experiments/run_aqsoldb_bs_sweep_kcist.sh
 #
 #SBATCH --job-name=aqsoldb_bs_sweep
-#SBATCH --account=aimatchem
-#SBATCH --partition=booster
+#SBATCH --partition=small
 #SBATCH --nodes=1
-#SBATCH --gpus=4
-#SBATCH --time=04:00:00
+#SBATCH --gres=gpu:4
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
+#SBATCH --time=06:00:00
 #SBATCH --output=aqsoldb_bs_sweep_%j.out
 #SBATCH --error=aqsoldb_bs_sweep_%j.out
 
 cd "$HOME/Programming/DeFoG" || exit 1
-
-# aarch64 environment: JSC module-provided PyTorch + a venv for the remaining deps.
-module load Stages/2026 GCCcore/14.3.0 PyTorch/2.9.1
-source .venv_jupiter/bin/activate
-# APPEND, never overwrite -- the PyTorch module puts torch/numpy on PYTHONPATH,
-# and we also need the repo root so `import experiments` / `import defog` resolve.
+source .venv/bin/activate
 export PYTHONPATH="$PWD:$PYTHONPATH"
 export PYTHONUNBUFFERED=1
 
@@ -39,7 +36,6 @@ for i in 0 1 2 3; do
     pids+=($!)
 done
 
-# Wait for all four; report each arm's exit status without aborting the others.
 status=0
 for idx in 0 1 2 3; do
     if wait "${pids[$idx]}"; then
