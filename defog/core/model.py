@@ -374,7 +374,11 @@ class DeFoGModel(pl.LightningModule):
             node_mask=node_mask,
         )
 
-        self.log("train/loss", loss, prog_bar=True)
+        # Log both the per-step loss (handy in the progress bar) and the
+        # epoch-aggregated mean. Monitoring/plotting should use the epoch mean:
+        # a single training step is a high-variance estimate because each graph
+        # draws its own random flow-matching time t.
+        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         return {
             "loss": loss,
             "_pred_X": pred.X.detach(),
@@ -382,6 +386,7 @@ class DeFoGModel(pl.LightningModule):
             "_true_X": X.detach(),
             "_true_E": E.detach(),
             "_node_mask": node_mask.detach(),
+            "_t": noisy_data["t"].detach(),
         }
 
     def validation_step(self, batch: Batch, batch_idx: int) -> Dict[str, torch.Tensor]:

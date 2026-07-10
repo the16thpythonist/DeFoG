@@ -53,6 +53,9 @@ dependencies = [
     # Chemistry
     "rdkit>=2023.3",
 
+    # Image handling (rasterizing RDKit molecule depictions for visualization)
+    "pillow>=9",
+
     # Experiment management
     "pycomex>=0.13",
 ]

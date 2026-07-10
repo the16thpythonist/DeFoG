@@ -21,6 +21,7 @@ Example:
 """
 
 import os
+import math
 import time
 import threading
 import warnings
@@ -35,6 +36,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+from .domain import GraphDomain, GenericGraphDomain
 
 
 # Module groups on the GraphTransformer (accessed via pl_module.model)
@@ -164,10 +167,10 @@ class TrainingMonitorCallback(pl.Callback):
     at every validation epoch.
 
     The figure tracks:
-      Row 1 - Loss: train/val (linear & log), ratio, epoch time
+      Row 1 - Loss: train/val + LR overlay, train/val (log), ratio, loss by time band
       Row 2 - Gradients: total and per module group
       Row 3 - Weights: total and per module group parameter deltas
-      Row 4 - Predictions: entropy and per-class accuracy for nodes/edges
+      Row 4 - Predictions: entropy (all t) and per-class accuracy (high-t band)
       Row 5 - Hardware: GPU util/mem, CPU util, RAM
 
     Args:
@@ -183,6 +186,15 @@ class TrainingMonitorCallback(pl.Callback):
         gen_num_samples: Number of graphs to sample for the metrics.
         gen_sample_steps: Denoising steps for the metric sampling (defaults to
             the model's configured ``sample_steps``).
+        time_loss_bins: List of (lo, hi) time ranges for the per-band training
+            loss panel (row 1, col 4). Defaults to
+            ``[(0.0, 0.5), (0.5, 0.8), (0.8, 1.0)]`` -- non-linear, with finer
+            resolution toward the low-noise (t->1) end where the reducible
+            learning signal lives.
+        acc_time_band: (lo, hi) time range the per-class accuracy panels are
+            restricted to (default (0.7, 1.0)) -- the low-noise regime where
+            reconstruction accuracy is actually achievable and informative,
+            rather than being pinned by the near-noise floor at low t.
     """
 
     def __init__(
@@ -196,6 +208,8 @@ class TrainingMonitorCallback(pl.Callback):
         gen_sample_steps: Optional[int] = None,
         gen_eta: Optional[float] = None,
         checkpoint_dir: Optional[str] = None,
+        time_loss_bins: Optional[List[tuple]] = None,
+        acc_time_band: tuple = (0.7, 1.0),
     ):
         super().__init__()
         self.smoothing_window = smoothing_window
@@ -210,6 +224,23 @@ class TrainingMonitorCallback(pl.Callback):
         # <checkpoint_dir>/best_model whenever validity reaches a new maximum.
         self.checkpoint_dir = checkpoint_dir
         self.best_validity = -1.0
+
+        # Time-band configuration. ``time_loss_bins`` splits the flow-matching
+        # time t into (non-linear) ranges for the per-band loss panel;
+        # ``acc_time_band`` restricts the per-class accuracy panels to the
+        # low-noise regime where correct reconstruction is achievable.
+        self.time_loss_bins = (
+            time_loss_bins if time_loss_bins is not None
+            else [(0.0, 0.5), (0.5, 0.8), (0.8, 1.0)]
+        )
+        self.acc_time_band = acc_time_band
+        nbins = len(self.time_loss_bins)
+        self._tbin_sum = [0.0] * nbins
+        self._tbin_sumsq = [0.0] * nbins
+        self._tbin_count = [0] * nbins
+        # Context-free Bayes-optimal oracle loss, accumulated per band.
+        self._tbin_orc_sum = [0.0] * nbins
+        self._tbin_orc_count = [0] * nbins
 
         # Per-epoch history (appended at each validation epoch end)
         self.history: Dict[str, List] = defaultdict(list)
@@ -246,6 +277,12 @@ class TrainingMonitorCallback(pl.Callback):
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         self._epoch_accum = defaultdict(list)
         self._epoch_pred_accum = defaultdict(list)
+        nbins = len(self.time_loss_bins)
+        self._tbin_sum = [0.0] * nbins
+        self._tbin_sumsq = [0.0] * nbins
+        self._tbin_count = [0] * nbins
+        self._tbin_orc_sum = [0.0] * nbins
+        self._tbin_orc_count = [0] * nbins
         self._epoch_start_time = time.time()
 
     # ------------------------------------------------------------------
@@ -288,9 +325,18 @@ class TrainingMonitorCallback(pl.Callback):
         true_X = outputs.get("_true_X")
         true_E = outputs.get("_true_E")
         node_mask = outputs.get("_node_mask")
+        t = outputs.get("_t")
 
         if pred_X is not None and true_X is not None and node_mask is not None:
-            self._collect_prediction_stats(pred_X, pred_E, true_X, true_E, node_mask)
+            self._collect_prediction_stats(pred_X, pred_E, true_X, true_E, node_mask, t)
+            lambda_edge = getattr(getattr(pl_module, "train_loss", None), "lambda_edge", 1.0)
+            ld = getattr(pl_module, "limit_dist", None)
+            marg_X = getattr(ld, "X", None) if ld is not None else None
+            marg_E = getattr(ld, "E", None) if ld is not None else None
+            self._collect_time_binned_loss(
+                pred_X, pred_E, true_X, true_E, node_mask, t, lambda_edge,
+                node_marginals=marg_X, edge_marginals=marg_E,
+            )
 
     def _collect_prediction_stats(
         self,
@@ -299,75 +345,213 @@ class TrainingMonitorCallback(pl.Callback):
         true_X: torch.Tensor,
         true_E: torch.Tensor,
         node_mask: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
     ):
-        """Compute per-batch prediction entropy and per-class accuracy."""
-        # Node entropy
+        """Compute per-batch prediction entropy and per-class accuracy.
+
+        Entropy is measured over all noise levels, but per-class accuracy is
+        restricted to graphs whose (random) training time falls in
+        ``self.acc_time_band`` -- the low-noise regime where correct
+        reconstruction is actually achievable and therefore informative. At low
+        t the input is essentially pure noise, so accuracy there is capped by
+        the marginal and only drags the average toward an uninformative floor.
+        """
+        bs, n = node_mask.shape
+
+        # Node entropy (all t)
         probs_X = F.softmax(pred_X, dim=-1)
         ent_X = -(probs_X * torch.log(probs_X + 1e-8)).sum(dim=-1)
         if node_mask.any():
             self._epoch_accum["entropy_X"].append(ent_X[node_mask].mean().item())
 
-        # Edge entropy (upper triangle only, masked)
-        if pred_E is not None and true_E is not None:
-            bs, n = node_mask.shape
-            edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
-            # Upper triangle
-            triu = torch.triu(torch.ones(n, n, dtype=torch.bool, device=pred_E.device), diagonal=1)
-            edge_mask = edge_mask & triu.unsqueeze(0)
+        # Edge mask (upper triangle only)
+        triu = torch.triu(
+            torch.ones(n, n, dtype=torch.bool, device=pred_X.device), diagonal=1
+        )
+        edge_mask_full = (node_mask.unsqueeze(2) & node_mask.unsqueeze(1)) & triu.unsqueeze(0)
 
+        # Edge entropy (all t)
+        if pred_E is not None and true_E is not None:
             probs_E = F.softmax(pred_E, dim=-1)
             ent_E = -(probs_E * torch.log(probs_E + 1e-8)).sum(dim=-1)
-            if edge_mask.any():
-                self._epoch_accum["entropy_E"].append(ent_E[edge_mask].mean().item())
+            if edge_mask_full.any():
+                self._epoch_accum["entropy_E"].append(ent_E[edge_mask_full].mean().item())
 
-        # Per-class accuracy (nodes)
+        # Restrict accuracy to the high-t (low-noise) band
+        lo, hi = self.acc_time_band
+        if t is not None:
+            in_band = (t.view(bs) >= lo) & (t.view(bs) <= hi)  # (bs,)
+        else:
+            in_band = torch.ones(bs, dtype=torch.bool, device=node_mask.device)
+        acc_node_mask = node_mask & in_band.view(bs, 1)
+        acc_edge_mask = edge_mask_full & in_band.view(bs, 1, 1)
+
+        # Per-class accuracy (nodes), band-restricted
         pred_classes_X = pred_X.argmax(dim=-1)
         true_classes_X = true_X.argmax(dim=-1)
         num_node_classes = pred_X.shape[-1]
         acc_X = {}
         for c in range(num_node_classes):
-            mask_c = (true_classes_X == c) & node_mask
+            mask_c = (true_classes_X == c) & acc_node_mask
             if mask_c.any():
                 acc_X[c] = (pred_classes_X[mask_c] == c).float().mean().item()
         if acc_X:
             self._epoch_pred_accum["acc_X_per_class"].append(acc_X)
 
-        # Per-class accuracy (edges)
+        # Per-class accuracy (edges), band-restricted
         if pred_E is not None and true_E is not None:
-            bs, n = node_mask.shape
-            edge_mask_full = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
-            triu = torch.triu(torch.ones(n, n, dtype=torch.bool, device=pred_E.device), diagonal=1)
-            edge_mask_full = edge_mask_full & triu.unsqueeze(0)
-
             pred_classes_E = pred_E.argmax(dim=-1)
             true_classes_E = true_E.argmax(dim=-1)
             num_edge_classes = pred_E.shape[-1]
             acc_E = {}
             for c in range(num_edge_classes):
-                mask_c = (true_classes_E == c) & edge_mask_full
+                mask_c = (true_classes_E == c) & acc_edge_mask
                 if mask_c.any():
                     acc_E[c] = (pred_classes_E[mask_c] == c).float().mean().item()
             if acc_E:
                 self._epoch_pred_accum["acc_E_per_class"].append(acc_E)
+
+    def _collect_time_binned_loss(
+        self,
+        pred_X: torch.Tensor,
+        pred_E: torch.Tensor,
+        true_X: torch.Tensor,
+        true_E: torch.Tensor,
+        node_mask: torch.Tensor,
+        t: Optional[torch.Tensor],
+        lambda_edge: float,
+        node_marginals: Optional[torch.Tensor] = None,
+        edge_marginals: Optional[torch.Tensor] = None,
+    ):
+        """Accumulate the per-graph training loss split by time band.
+
+        Reconstructs the same ``node CE + lambda_edge * edge CE`` used by
+        ``TrainLoss``, but per graph, then bins each graph by its (random)
+        training time so we can watch the loss evolve separately in the
+        high-noise, mid, and low-noise regimes instead of only in aggregate.
+        Running sum / sum-of-squares / count per bin give the epoch mean and
+        std cheaply (O(1) memory).
+
+        When node/edge marginals are supplied, also accumulate the context-free
+        Bayes-optimal oracle loss per band (see ``_oracle_ce``): the expected CE
+        of the best predictor that sees only the noised token and the marginals,
+        with no graph structure. Exact for marginal/uniform noise. The gap
+        between the model curve and this oracle is what graph context buys and
+        how far a "flat" band still is from what is achievable.
+        """
+        if t is None:
+            return
+        bs, n = node_mask.shape
+
+        # Per-graph node CE (mean over valid nodes)
+        logp_X = F.log_softmax(pred_X, dim=-1)
+        ce_X = -(true_X * logp_X).sum(dim=-1)  # (bs, n)
+        nm = node_mask.float()
+        node_cnt = nm.sum(dim=1).clamp(min=1.0)
+        node_loss_g = (ce_X * nm).sum(dim=1) / node_cnt  # (bs,)
+
+        # Per-graph edge CE (upper triangle, mean over valid edges)
+        em = None
+        edge_cnt = None
+        if pred_E is not None and true_E is not None:
+            triu = torch.triu(
+                torch.ones(n, n, dtype=torch.bool, device=pred_E.device), diagonal=1
+            )
+            edge_mask = (node_mask.unsqueeze(2) & node_mask.unsqueeze(1)) & triu.unsqueeze(0)
+            em = edge_mask.float()
+            logp_E = F.log_softmax(pred_E, dim=-1)
+            ce_E = -(true_E * logp_E).sum(dim=-1)  # (bs, n, n)
+            edge_cnt = em.sum(dim=(1, 2)).clamp(min=1.0)
+            edge_loss_g = (ce_E * em).sum(dim=(1, 2)) / edge_cnt  # (bs,)
+        else:
+            edge_loss_g = torch.zeros(bs, device=pred_X.device)
+
+        loss_g = (node_loss_g + lambda_edge * edge_loss_g).detach().cpu()
+        t_cpu = t.view(bs).detach().cpu()
+
+        # --- Context-free Bayes-optimal oracle per graph (if marginals fit) ---
+        orc_g = None
+        if node_marginals is not None and node_marginals.shape[-1] == true_X.shape[-1]:
+            mX = node_marginals.to(true_X.device).float().clamp_min(1e-8)
+            mcX = mX[true_X.argmax(dim=-1)]  # (bs, n)
+            orc_node_g = (self._oracle_ce(t.view(bs, 1), mcX) * nm).sum(dim=1) / node_cnt
+            if (em is not None and edge_marginals is not None
+                    and edge_marginals.shape[-1] == true_E.shape[-1]):
+                mE = edge_marginals.to(true_E.device).float().clamp_min(1e-8)
+                mcE = mE[true_E.argmax(dim=-1)]  # (bs, n, n)
+                orc_edge_g = (self._oracle_ce(t.view(bs, 1, 1), mcE) * em).sum(dim=(1, 2)) / edge_cnt
+            else:
+                orc_edge_g = torch.zeros(bs, device=pred_X.device)
+            orc_g = (orc_node_g + lambda_edge * orc_edge_g).detach().cpu()
+
+        for i, (lo, hi) in enumerate(self.time_loss_bins):
+            if i == len(self.time_loss_bins) - 1:
+                in_bin = (t_cpu >= lo) & (t_cpu <= hi)  # last bin includes hi
+            else:
+                in_bin = (t_cpu >= lo) & (t_cpu < hi)
+            if in_bin.any():
+                vals = loss_g[in_bin]
+                self._tbin_sum[i] += float(vals.sum())
+                self._tbin_sumsq[i] += float((vals * vals).sum())
+                self._tbin_count[i] += int(in_bin.sum())
+                if orc_g is not None:
+                    ovals = orc_g[in_bin]
+                    self._tbin_orc_sum[i] += float(ovals.sum())
+                    self._tbin_orc_count[i] += int(in_bin.sum())
+
+    @staticmethod
+    def _oracle_ce(t: torch.Tensor, mc: torch.Tensor) -> torch.Tensor:
+        """Expected CE of the context-free Bayes-optimal denoiser.
+
+        For DeFoG's linear (marginal/uniform) forward process the optimal
+        predictor seeing only the noised token x_t and the limit marginals is
+        ``q(x_1 = c | x_t) = t*delta(c, x_t) + (1 - t)*m_c``. Its cross-entropy,
+        in expectation over the forward noising, for a token whose true clean
+        class has marginal probability ``mc`` at time ``t``, is::
+
+            L*(mc, t) = -(t + (1-t)mc) log(t + (1-t)mc)
+                        - (1-t)(1-mc) log((1-t)mc)
+
+        which runs from H(marginal) at t=0 to 0 at t=1. ``t`` (per graph) and
+        ``mc`` (per token) broadcast.
+        """
+        one_mt = 1.0 - t
+        a = (t + one_mt * mc).clamp_min(1e-8)
+        b = (one_mt * mc).clamp_min(1e-8)
+        return -a * torch.log(a) - one_mt * (1.0 - mc) * torch.log(b)
 
     # ------------------------------------------------------------------
     # Epoch-level aggregation
     # ------------------------------------------------------------------
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        # Skip Lightning's pre-training sanity-check validation so the recorded
+        # history counts real epochs only: curves start at epoch 1 and the
+        # generation probe fires on round epochs (10, 20, 30, ...).
+        if trainer.sanity_checking:
+            return
+
         epoch_time = time.time() - self._epoch_start_time
         self.history["epoch_time"].append(epoch_time)
 
         # --- Loss ---
         # Retrieve logged scalars from trainer's callback_metrics
         metrics = trainer.callback_metrics
-        if "train/loss" in metrics:
-            self.history["train_loss"].append(metrics["train/loss"].item())
-        elif "train/loss_epoch" in metrics:
+        # Prefer the epoch-aggregated mean (low variance); fall back to the
+        # last per-step value only if epoch logging is unavailable.
+        if "train/loss_epoch" in metrics:
             self.history["train_loss"].append(metrics["train/loss_epoch"].item())
+        elif "train/loss" in metrics:
+            self.history["train_loss"].append(metrics["train/loss"].item())
 
         if "val/loss" in metrics:
             self.history["val_loss"].append(metrics["val/loss"].item())
+
+        # --- Learning rate (confirms the LR schedule is actually stepping) ---
+        try:
+            self.history["lr"].append(float(trainer.optimizers[0].param_groups[0]["lr"]))
+        except Exception:
+            self.history["lr"].append(float("nan"))
 
         # --- Gradient norms (epoch averages) ---
         for key in ["grad_norm_total"] + [f"grad_norm_{g}" for g in _MODULE_GROUPS]:
@@ -417,6 +601,22 @@ class TrainingMonitorCallback(pl.Callback):
             else:
                 self.history[key].append({})
 
+        # --- Time-binned training loss (epoch mean / std per band) + oracle ---
+        for i in range(len(self.time_loss_bins)):
+            c = self._tbin_count[i]
+            if c > 0:
+                mean = self._tbin_sum[i] / c
+                var = max(self._tbin_sumsq[i] / c - mean * mean, 0.0)
+                std = float(np.sqrt(var))
+            else:
+                mean, std = float("nan"), float("nan")
+            self.history[f"tbin_loss_mean_{i}"].append(mean)
+            self.history[f"tbin_loss_std_{i}"].append(std)
+            oc = self._tbin_orc_count[i]
+            self.history[f"tbin_oracle_{i}"].append(
+                self._tbin_orc_sum[i] / oc if oc > 0 else float("nan")
+            )
+
         # --- Hardware ---
         if self._hw_monitor is not None:
             hw = self._hw_monitor.get_and_reset()
@@ -439,8 +639,10 @@ class TrainingMonitorCallback(pl.Callback):
 
         if self.figure_callback is not None:
             self.figure_callback(fig)
-        else:
-            plt.close(fig)
+        # Always close the figure — even after handing it to figure_callback,
+        # which (via pycomex track()) has already saved it. Leaving it open pins
+        # it in pyplot's global registry every epoch -> monotonic RAM growth.
+        plt.close(fig)
 
     def _collect_generation_metrics(self, pl_module: pl.LightningModule, epoch_idx: int):
         """Sample the model unconditionally and record validity/uniqueness/novelty."""
@@ -461,6 +663,12 @@ class TrainingMonitorCallback(pl.Callback):
         finally:
             if was_training:
                 pl_module.train()
+            # Return the transient probe allocations (large draw: gen_num_samples
+            # graphs x gen_sample_steps, plus full (bs,n,n,de) rate-matrix tensors)
+            # to the driver. Without this the caching allocator keeps them as
+            # reserved memory, ratcheting the GPU high-water mark up every probe.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         self.history["gen_epochs"].append(epoch_idx)
         for key in ("validity", "uniqueness", "novelty"):
@@ -494,7 +702,7 @@ class TrainingMonitorCallback(pl.Callback):
         self._plot_loss_linear(axes[0, 0], epochs, sw)
         self._plot_loss_log(axes[0, 1], epochs, sw)
         self._plot_loss_ratio(axes[0, 2], epochs, sw)
-        self._plot_epoch_time(axes[0, 3], epochs, sw)
+        self._plot_time_binned_loss(axes[0, 3], epochs, sw)
 
         # ===== Row 2: Gradients =====
         self._plot_single_metric(axes[1, 0], epochs, "grad_norm_total", "Total Gradient Norm", sw)
@@ -531,8 +739,15 @@ class TrainingMonitorCallback(pl.Callback):
         # ===== Row 4: Predictions =====
         self._plot_single_metric(axes[3, 0], epochs, "entropy_X", "Node Prediction Entropy", sw)
         self._plot_single_metric(axes[3, 1], epochs, "entropy_E", "Edge Prediction Entropy", sw)
-        self._plot_per_class_accuracy(axes[3, 2], epochs, "acc_X_per_class", "Node Accuracy (per class)", sw)
-        self._plot_per_class_accuracy(axes[3, 3], epochs, "acc_E_per_class", "Edge Accuracy (per class)", sw)
+        _lo, _hi = self.acc_time_band
+        self._plot_per_class_accuracy(
+            axes[3, 2], epochs, "acc_X_per_class",
+            f"Node Accuracy per class (t∈[{_lo:g},{_hi:g}])", sw,
+        )
+        self._plot_per_class_accuracy(
+            axes[3, 3], epochs, "acc_E_per_class",
+            f"Edge Accuracy per class (t∈[{_lo:g},{_hi:g}])", sw,
+        )
 
         # ===== Row 5: Hardware =====
         self._plot_single_metric(axes[4, 0], epochs, "gpu_util", "GPU Utilization (%)", sw, ylabel="%")
@@ -575,7 +790,7 @@ class TrainingMonitorCallback(pl.Callback):
     # ------ individual subplot helpers ------
 
     def _plot_loss_linear(self, ax: plt.Axes, epochs: List[int], sw: int):
-        ax.set_title("Train + Val Loss")
+        ax.set_title("Train + Val Loss  (+ LR)")
         train = self.history.get("train_loss", [])
         val = self.history.get("val_loss", [])
         if train:
@@ -588,7 +803,18 @@ class TrainingMonitorCallback(pl.Callback):
             ax.plot(e, _smooth(val, sw), color="C1", label="val")
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Loss")
-        ax.legend(fontsize="small")
+        ax.legend(fontsize="small", loc="upper right")
+
+        # Overlay the learning rate on a secondary axis so the schedule is
+        # visibly live (a back-loaded cosine barely moves early on).
+        lr = self.history.get("lr", [])
+        if any(not (isinstance(v, float) and np.isnan(v)) for v in lr):
+            ax2 = ax.twinx()
+            e = epochs[: len(lr)]
+            ax2.plot(e, lr, color="C4", linestyle="--", linewidth=1.3, label="lr")
+            ax2.set_ylabel("learning rate", color="C4", fontsize="small")
+            ax2.tick_params(axis="y", labelcolor="C4", labelsize=8)
+            ax2.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
 
     def _plot_loss_log(self, ax: plt.Axes, epochs: List[int], sw: int):
         ax.set_title("Train + Val Loss (log)")
@@ -621,15 +847,60 @@ class TrainingMonitorCallback(pl.Callback):
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Ratio")
 
-    def _plot_epoch_time(self, ax: plt.Axes, epochs: List[int], sw: int):
-        ax.set_title("Epoch Wall-Clock Time")
-        vals = self.history.get("epoch_time", [])
-        if vals:
-            e = epochs[: len(vals)]
-            ax.plot(e, vals, alpha=0.3, color="C3")
-            ax.plot(e, _smooth(vals, sw), color="C3")
+    def _plot_time_binned_loss(self, ax: plt.Axes, epochs: List[int], sw: int):
+        """Train loss split into time bands: mean line + ±1 std funnel, with a
+        dotted per-band Bayes-oracle reference.
+
+        Each band is a range of the flow-matching time t. Low-t bands sit near
+        the irreducible-noise floor (high, flat); high-t bands are where the
+        reducible learning signal lives, so a still-improving model shows up as
+        those curves continuing to drift down after the aggregate has gone flat.
+        The dotted line is the context-free Bayes-optimal oracle for that band:
+        the gap between the solid model curve and its dotted oracle is what the
+        model still stands to gain (and how much graph context is buying).
+        """
+        ax.set_title("Train Loss by Time Band")
+        plotted = False
+        have_oracle = False
+        for i, (lo, hi) in enumerate(self.time_loss_bins):
+            means = self.history.get(f"tbin_loss_mean_{i}", [])
+            stds = self.history.get(f"tbin_loss_std_{i}", [])
+            valid = [v for v in means if not (isinstance(v, float) and np.isnan(v))]
+            if not valid:
+                continue
+            plotted = True
+            e = epochs[: len(means)]
+            color = f"C{i}"
+            raw = np.array(means, dtype=np.float64)
+            smooth = _smooth(means, sw)
+            rb = "]" if i == len(self.time_loss_bins) - 1 else ")"
+            ax.plot(e, raw, alpha=0.25, color=color)
+            ax.plot(e, smooth, color=color, label=f"t∈[{lo:g},{hi:g}{rb}")
+            if len(stds) >= len(means):
+                sd = np.array(stds[: len(means)], dtype=np.float64)
+                lower = np.clip(smooth - sd, 0.0, None)
+                upper = smooth + sd
+                ax.fill_between(e, lower, upper, color=color, alpha=0.12, linewidth=0)
+            # Context-free Bayes-optimal oracle reference for this band
+            orc = self.history.get(f"tbin_oracle_{i}", [])
+            if any(not (isinstance(v, float) and np.isnan(v)) for v in orc):
+                eo = epochs[: len(orc)]
+                ax.plot(eo, orc, color=color, linestyle=":", linewidth=1.3, alpha=0.85)
+                have_oracle = True
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("Seconds")
+        ax.set_ylabel("Loss")
+        if plotted:
+            handles, labels = ax.get_legend_handles_labels()
+            if have_oracle:
+                from matplotlib.lines import Line2D
+                handles.append(Line2D([0], [0], color="0.5", linestyle=":", linewidth=1.3))
+                labels.append("Bayes oracle")
+            ax.legend(handles, labels, fontsize="small", title="time band")
+        else:
+            ax.text(
+                0.5, 0.5, "N/A", transform=ax.transAxes,
+                ha="center", va="center", fontsize=16, color="gray",
+            )
 
     def _plot_single_metric(
         self,
@@ -790,6 +1061,21 @@ def _default_render_graph(ax: plt.Axes, data) -> None:
 # SampleVisualizationCallback
 # ======================================================================
 
+class _RenderFnDomain(GenericGraphDomain):
+    """Adapter so a legacy ``render_fn(ax, data)`` callable behaves as a domain.
+
+    Keeps the generic node/edge summary and no captions, but delegates the
+    actual drawing to the supplied callable.
+    """
+
+    def __init__(self, render_fn: Callable):
+        super().__init__()
+        self._render_fn = render_fn
+
+    def render(self, ax, data) -> None:
+        self._render_fn(ax, data)
+
+
 class SampleVisualizationCallback(pl.Callback):
     """
     Periodically samples graphs from the model during training and
@@ -808,9 +1094,13 @@ class SampleVisualizationCallback(pl.Callback):
         eta: Override stochasticity parameter.
         omega: Override target guidance strength.
         time_distortion: Override time distortion type.
-        render_fn: Callable ``(ax, data) -> None`` that draws a single PyG
-            Data object onto a matplotlib Axes. If *None*, uses a default
-            networkx spring-layout renderer with node-class coloring.
+        domain: A :class:`~defog.core.domain.GraphDomain` that drives rendering,
+            per-sample captions, and the batch summary line. Defaults to
+            :class:`~defog.core.domain.GenericGraphDomain` (node-link plots).
+            Pass e.g. a ``MoleculeDomain`` for RDKit molecule depictions.
+        render_fn: Deprecated. Callable ``(ax, data) -> None`` that draws a
+            single PyG Data object onto a matplotlib Axes. Kept for backward
+            compatibility; ``domain`` takes precedence when both are given.
         figure_callback: Optional ``callable(fig)`` invoked with the figure.
         show_progress: Show tqdm progress bar during sampling.
 
@@ -835,6 +1125,7 @@ class SampleVisualizationCallback(pl.Callback):
         render_fn: Optional[Callable] = None,
         figure_callback: Optional[Callable] = None,
         show_progress: bool = False,
+        domain: Optional[GraphDomain] = None,
     ):
         super().__init__()
         self.num_samples = num_samples
@@ -843,7 +1134,16 @@ class SampleVisualizationCallback(pl.Callback):
         self.eta = eta
         self.omega = omega
         self.time_distortion = time_distortion
-        self.render_fn = render_fn if render_fn is not None else _default_render_graph
+        # A GraphDomain owns rendering / captions / batch summary. `render_fn` is
+        # kept for backward compatibility: a bare callable is wrapped in a domain
+        # that retains the generic node/edge summary.
+        if domain is not None:
+            self.domain = domain
+        elif render_fn is not None:
+            self.domain = _RenderFnDomain(render_fn)
+        else:
+            self.domain = GenericGraphDomain()
+        self.render_fn = render_fn  # retained for introspection / back-compat
         self.figure_callback = figure_callback
         self.show_progress = show_progress
 
@@ -853,6 +1153,11 @@ class SampleVisualizationCallback(pl.Callback):
     def on_validation_epoch_end(
         self, trainer: pl.Trainer, pl_module: pl.LightningModule
     ):
+        # Skip Lightning's pre-training sanity-check validation so previews land
+        # on round epochs (every_k_epochs then counts real epochs only).
+        if trainer.sanity_checking:
+            return
+
         self._val_epoch_count += 1
         if self._val_epoch_count % self.every_k_epochs != 0:
             return
@@ -878,40 +1183,45 @@ class SampleVisualizationCallback(pl.Callback):
             samples = pl_module.sample(**sample_kwargs)
         if was_training:
             pl_module.train()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # release the sampling reserved pool (see gen probe)
 
-        # Compute summary stats
-        total_nodes = 0
-        total_edges = 0
-        for s in samples:
-            total_nodes += s.x.shape[0] if s.x is not None else 0
-            total_edges += s.edge_index.shape[1] // 2 if (s.edge_index is not None and s.edge_index.numel() > 0) else 0
-        avg_nodes = total_nodes / len(samples) if samples else 0
-        avg_edges = total_edges / len(samples) if samples else 0
+        # Domain-specific batch summary (node/edge counts, molecule validity, ...)
+        summary = self.domain.summarize(samples)
 
-        # Build figure: single row
+        # Build figure: grid with up to 4 columns.
         n = len(samples)
-        fig_width = max(3 * n, 6)
-        fig, axes = plt.subplots(1, n, figsize=(fig_width, 3.5))
-        if n == 1:
-            axes = [axes]
-
-        for ax, data in zip(axes, samples):
-            self.render_fn(ax, data)
-
-        current_epoch = trainer.current_epoch
-        fig.suptitle(
-            f"Epoch {current_epoch}  |  "
-            f"avg nodes: {avg_nodes:.1f}  |  avg edges: {avg_edges:.1f}",
-            fontsize=12,
+        ncols = min(4, n) if n > 0 else 1
+        nrows = max(1, math.ceil(n / ncols))
+        fig, axes = plt.subplots(
+            nrows, ncols, figsize=(3.2 * ncols, 3.6 * nrows), squeeze=False
         )
-        fig.tight_layout(rect=[0, 0, 1, 0.92])
+        flat_axes = axes.flatten()
+
+        for idx, ax in enumerate(flat_axes):
+            if idx < n:
+                data = samples[idx]
+                self.domain.render(ax, data)
+                caption = self.domain.caption(data)
+                if caption:
+                    # set_title (not set_xlabel) so it stays visible even when a
+                    # domain turns the axis off (e.g. RDKit image cells).
+                    ax.set_title(caption, fontsize=7)
+            else:
+                ax.axis("off")  # blank trailing cells
+
+        # current_epoch is 0-indexed and not yet incremented at validation end;
+        # +1 makes previews read as human epoch numbers (25, 50, 75, ...).
+        fig.suptitle(f"Epoch {trainer.current_epoch + 1}  |  {summary}", fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
 
         self.last_figure = fig
 
         if self.figure_callback is not None:
             self.figure_callback(fig)
-        else:
-            plt.close(fig)
+        # Always close (see TrainingMonitorCallback): track() has already saved
+        # the figure; leaving it open leaks it into pyplot's global registry.
+        plt.close(fig)
 
 
 class EMACallback(pl.Callback):

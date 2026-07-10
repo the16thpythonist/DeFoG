@@ -37,6 +37,7 @@ Utility Functions:
 
 from .model import DeFoGModel
 from .callbacks import TrainingMonitorCallback, SampleVisualizationCallback, EMACallback
+from .domain import GraphDomain, GenericGraphDomain, generation_metrics
 from .data import (
     PlaceHolder,
     to_dense,
@@ -74,6 +75,10 @@ __all__ = [
     "TrainingMonitorCallback",
     "SampleVisualizationCallback",
     "EMACallback",
+    # Graph-domain adapters (decode / visualize / evaluate)
+    "GraphDomain",
+    "GenericGraphDomain",
+    "generation_metrics",
     # Data utilities
     "PlaceHolder",
     "to_dense",

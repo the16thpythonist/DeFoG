@@ -30,6 +30,7 @@ from experiments.utils import (
 from defog.core import (
     DeFoGModel, TrainingMonitorCallback, SampleVisualizationCallback, EMACallback
 )
+from defog.domains import MoleculeDomain
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -62,7 +63,7 @@ LR_MIN: float = 1e-6
 WEIGHT_DECAY: float = 1e-5
 LAMBDA_EDGE: float = 5.0          # edge loss weighted 5x node loss (DeFoG default)
 TRAIN_TIME_DISTORTION: str = "polydec"
-EMA_DECAY: float = 0.0           # EMA disabled (matches src; per user request)
+EMA_DECAY: float = 0.9999        # EMA of weights (~18-epoch trailing avg here); val/eval/best-ckpt sample from EMA
 TRAIN_SPLIT: float = 0.9
 
 # :param MOLECULAR_FEATURES:
@@ -180,8 +181,12 @@ def experiment(e: Experiment) -> None:
         generation_metrics_fn=gen_metrics_fn, gen_every_k=10, gen_num_samples=64,
         gen_sample_steps=e.GEN_SAMPLE_STEPS, gen_eta=e.GEN_ETA, checkpoint_dir=e.path,
     )
+    # RDKit-backed molecule depictions for the in-training sample previews
+    # (validity/SMILES captions). The metrics path stays independent (above).
+    mol_domain = MoleculeDomain(atom_decoder, bond_decoder, reference_smiles=train_smiles)
     sampler = SampleVisualizationCallback(
         num_samples=8, every_k_epochs=e.SAMPLE_VIS_EVERY_K, sample_steps=e.SAMPLE_STEPS,
+        domain=mol_domain,
         figure_callback=lambda fig: e.track("samples", fig),
     )
     # EMA first in the list so its weight-swap wraps validation sampling/metrics.
