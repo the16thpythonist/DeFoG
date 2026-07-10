@@ -125,6 +125,7 @@ class DeFoGModel(pl.LightningModule):
         atom_valencies: Optional[list] = None,
         atom_weights: Optional[list] = None,
         max_atom_weight: float = 350.0,
+        max_atom_valency: float = 12.0,
         # Training
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
@@ -211,7 +212,8 @@ class DeFoGModel(pl.LightningModule):
         mol_dims = {"X": 0, "E": 0, "y": 0}
         if molecular_features and atom_valencies is not None and atom_weights is not None:
             self.mol_features = MolecularFeatures(
-                valencies=atom_valencies, atom_weights=atom_weights, max_weight=max_atom_weight
+                valencies=atom_valencies, atom_weights=atom_weights,
+                max_weight=max_atom_weight, max_valency=max_atom_valency,
             )
             mol_dims = self.mol_features.output_dims()
 
@@ -838,9 +840,16 @@ class DeFoGModel(pl.LightningModule):
         # Compute step probabilities
         prob_X, prob_E = self._compute_step_probs(R_t_X, R_t_E, X_t, E_t, dt)
 
-        # At final step, use predicted marginals directly
+        # At the final step, decode the network's clean-graph prediction
+        # deterministically (argmax) instead of sampling from the marginals.
+        # Multinomial sampling at t~1 is a major source of spurious extra edges
+        # (each near-zero no-edge probability still flips a fraction of edges),
+        # which snowballs graph density and destroys validity. The reference
+        # implementation collapses to the MAP graph at the last step, so we match
+        # that: take the most-likely atom / bond type per node / edge.
         if s[0].item() >= 1.0 - 1e-6:
-            prob_X, prob_E = pred_X, pred_E
+            prob_X = F.one_hot(pred_X.argmax(dim=-1), num_classes=pred_X.shape[-1]).float()
+            prob_E = F.one_hot(pred_E.argmax(dim=-1), num_classes=pred_E.shape[-1]).float()
 
         # Sample next state
         sampled_s = sample_from_probs(prob_X, prob_E, node_mask)

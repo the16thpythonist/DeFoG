@@ -358,10 +358,19 @@ class MolecularFeatures:
     atom encoder order.
     """
 
-    def __init__(self, valencies, atom_weights, max_weight: float = 350.0):
+    def __init__(self, valencies, atom_weights, max_weight: float = 350.0,
+                 max_valency: float = 12.0):
         self.valencies = list(valencies)
         self.atom_weights = list(atom_weights)
         self.max_weight = float(max_weight)
+        # Cap the bonded-valency feature at a value well above any physically
+        # sensible atom (max nominal valency in the table is 4). During sampling
+        # the intermediate noisy graph can transiently become very dense, which
+        # otherwise pushes current_valency (and hence charge = nominal - current)
+        # far off the training manifold and feeds an amplifying signal back into
+        # the network -> edge-density runaway. This clamp is a no-op inside the
+        # training distribution and only caps off-manifold sampling excursions.
+        self.max_valency = float(max_valency)
 
     def __call__(self, noisy_data: Dict[str, torch.Tensor]):
         X_t = noisy_data["X_t"]  # (bs, n, dx) one-hot
@@ -374,6 +383,8 @@ class MolecularFeatures:
 
         weighted_E = E_t * bond_orders
         current_valencies = weighted_E.argmax(dim=-1).sum(dim=-1)  # (bs, n)
+        # Cap off-manifold densification during sampling (no-op in training range).
+        current_valencies = current_valencies.clamp(max=self.max_valency)
 
         valencies = torch.tensor(self.valencies, device=X_t.device).reshape(1, 1, -1)
         Xv = X_t * valencies
