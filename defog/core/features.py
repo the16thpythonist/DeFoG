@@ -381,22 +381,36 @@ class MolecularFeatures:
         else:
             bond_orders = torch.tensor([0, 1, 2, 3], device=E_t.device).reshape(1, 1, 1, -1)
 
+        # Per-atom bonded valency = sum of bond ORDERS over neighbours. E_t is
+        # one-hot, so (E_t * bond_orders).sum(-1) recovers each edge's bond order
+        # value; summing over neighbours gives the atom's total valency. (Using
+        # argmax here would return the class INDEX, which only coincidentally
+        # equals the order for classes 0-3 and is wrong for aromatic=1.5.)
         weighted_E = E_t * bond_orders
-        current_valencies = weighted_E.argmax(dim=-1).sum(dim=-1)  # (bs, n)
+        current_valencies = weighted_E.sum(dim=-1).sum(dim=-1)  # (bs, n)
         # Cap off-manifold densification during sampling (no-op in training range).
         current_valencies = current_valencies.clamp(max=self.max_valency)
 
+        # Nominal valency = the valency VALUE at the atom's class. X_t is one-hot,
+        # so (X_t * valencies).sum(-1) recovers it (argmax would return the index).
         valencies = torch.tensor(self.valencies, device=X_t.device).reshape(1, 1, -1)
-        Xv = X_t * valencies
-        normal_valencies = torch.argmax(Xv, dim=-1)  # (bs, n)
+        normal_valencies = (X_t * valencies).sum(dim=-1)  # (bs, n)
 
         charge = (normal_valencies - current_valencies).type_as(X_t).unsqueeze(-1)   # (bs, n, 1)
         valency = current_valencies.type_as(X_t).unsqueeze(-1)                        # (bs, n, 1)
         X_extra = torch.cat((charge, valency), dim=-1)  # (bs, n, 2)
 
+        # Global molecular weight. Mask padding nodes before summing: padded rows
+        # of X_t are all-zero, so argmax(X_t) would pick class 0 (usually carbon)
+        # and inject a phantom atom's weight per padding slot, corrupting this
+        # global conditioning signal by a batch-composition-dependent offset.
         atom_w = torch.tensor(self.atom_weights, device=X_t.device).type_as(X_t)
         X_idx = torch.argmax(X_t, dim=-1)  # (bs, n)
-        weight = atom_w[X_idx].sum(dim=-1).unsqueeze(-1) / self.max_weight  # (bs, 1)
+        per_atom_w = atom_w[X_idx]  # (bs, n)
+        node_mask = noisy_data.get("node_mask", None)
+        if node_mask is not None:
+            per_atom_w = per_atom_w * node_mask.type_as(per_atom_w)
+        weight = per_atom_w.sum(dim=-1).unsqueeze(-1) / self.max_weight  # (bs, 1)
 
         return X_extra, weight
 

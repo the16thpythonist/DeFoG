@@ -175,6 +175,13 @@ def pyg_data_to_mol(
         # Suppress RDKit warnings during reconstruction
         RDLogger.DisableLog("rdApp.*")
 
+        # RDKit reconstruction is CPU/numpy-only. Move every tensor to CPU up
+        # front so a GPU-sampled graph decodes correctly: otherwise the CPU-built
+        # adjacency matrix below is indexed by a CUDA edge_index, which raises a
+        # device-mismatch error that the broad except would silently turn into
+        # "invalid molecule" -> 0% validity for every GPU sample.
+        data = data.cpu()
+
         # Get atom types from one-hot node features
         if data.x.dim() == 2:
             atom_types = torch.argmax(data.x, dim=-1)
@@ -232,7 +239,17 @@ def pyg_data_to_mol(
 
         return mol
 
-    except Exception:
+    except (ValueError, RuntimeError, Chem.rdchem.AtomValenceException,
+            Chem.rdchem.KekulizeException, Chem.rdchem.MolSanitizeException):
+        # Genuine "this graph is not a valid molecule" outcomes from RDKit.
+        return None
+    except Exception as exc:
+        # Anything else (device mismatch, shape/type bugs, ...) is a programming
+        # error, NOT an invalid molecule. Surface it as a warning instead of
+        # silently counting it as invalid -- a broad `except: return None` here
+        # hid a CUDA/CPU device-mismatch bug that pinned validity at 0%.
+        import warnings
+        warnings.warn(f"pyg_data_to_mol: unexpected {type(exc).__name__}: {exc}")
         return None
 
     finally:

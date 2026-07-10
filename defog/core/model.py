@@ -530,6 +530,12 @@ class DeFoGModel(pl.LightningModule):
             - edge_index: Edge indices (2, num_edges)
             - edge_attr: Edge features (num_edges, num_edge_classes) one-hot
         """
+        # Force eval mode so dropout is inert during denoising, regardless of the
+        # caller's state; restore the prior mode on exit. Sampling in train mode
+        # would feed dropout noise into every rate-matrix forward pass.
+        was_training = self.training
+        self.eval()
+
         # Use defaults if not specified
         eta = eta if eta is not None else self.eta
         omega = omega if omega is not None else self.omega
@@ -611,6 +617,8 @@ class DeFoGModel(pl.LightningModule):
         # embedding) so downstream consumers see the original condition values.
         samples = dense_to_pyg(X, E, y_raw, node_mask, n_nodes)
 
+        if was_training:
+            self.train()
         return samples
 
     def _embed_condition(
