@@ -162,3 +162,37 @@ def make_generation_metrics_fn(atom_decoder, bond_decoder, train_smiles):
         }
 
     return metrics_fn
+
+
+def tag_generated_smiles(samples, atom_decoder, bond_decoder, train_smiles=None):
+    """
+    Decode generated graphs to canonical SMILES and tag every sample.
+
+    Persists ALL generated samples (not just valid/unique ones) so the run's
+    output can be recovered/re-analyzed without re-sampling. Returns one record
+    per sample:
+        {"index": i,
+         "smiles": <canonical SMILES> | None (None if invalid),
+         "valid":  bool,
+         "unique": bool,   # first occurrence of this canonical SMILES among valid
+         "novel":  bool | None}   # valid & not in train_smiles (None if no ref)
+
+    Because ``unique`` flags the first occurrence, ``sum(r["unique"])`` equals the
+    number of distinct molecules. Commit the result via ``e.commit_json(...)``.
+    Callers may add extra per-sample fields (e.g. conditioning target) afterwards.
+    """
+    ref = set(train_smiles) if train_smiles is not None else None
+    seen = set()
+    records = []
+    for i, s in enumerate(samples):
+        mol = pyg_data_to_mol(s, atom_decoder, bond_decoder)
+        smi = mol_to_smiles(mol) if mol is not None else None
+        valid = smi is not None and Chem.MolFromSmiles(smi) is not None
+        rec = {"index": i, "smiles": smi if valid else None, "valid": valid,
+               "unique": False, "novel": None}
+        if valid:
+            rec["unique"] = smi not in seen
+            seen.add(smi)
+            rec["novel"] = (smi not in ref) if ref is not None else None
+        records.append(rec)
+    return records

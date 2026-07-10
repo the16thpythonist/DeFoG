@@ -43,6 +43,7 @@ from experiments.utils import (
     pyg_data_to_mol,
     mol_to_smiles,
     make_generation_metrics_fn,
+    tag_generated_smiles,
 )
 from experiments.conditional_generation import (
     build_normalization_stats,
@@ -55,6 +56,7 @@ from defog.core import (
     EMACallback,
     ConditionalSizeDistribution,
 )
+from defog.domains import MoleculeDomain
 
 # RDKit Contrib synthetic-accessibility scorer.
 sys.path.append(os.path.join(RDConfig.RDContribDir, "SA_Score"))
@@ -102,29 +104,43 @@ NOISE_TYPE: str = "marginal"
 EXTRA_FEATURES_TYPE: str = "rrwp"
 RRWP_STEPS: int = 20
 
+# :param MOLECULAR_FEATURES:
+#     Per-atom charge/valency + molecular-weight features (matches the uncond run / src).
+MOLECULAR_FEATURES: bool = True
+ATOM_VALENCY: dict = {
+    "C": 4, "N": 3, "O": 2, "F": 1, "S": 2, "Cl": 1, "Br": 1, "P": 3,
+    "I": 1, "Na": 1, "Si": 4, "B": 3,
+}
+ATOM_WEIGHT_TABLE: dict = {
+    "C": 12.011, "N": 14.007, "O": 15.999, "F": 18.998, "S": 32.06, "Cl": 35.45,
+    "Br": 79.904, "P": 30.974, "I": 126.904, "Na": 22.99, "Si": 28.085, "B": 10.81,
+}
+MAX_ATOM_WEIGHT: float = 350.0
+
 # --- Conditioning ---
 COND_DROP_PROB: float = 0.1
 GUIDANCE_SCALE: float = 2.0
 
 # --- Training (matched to authors' AqSolDB recipe, stabilized) ---
 EPOCHS: int = 250
-BATCH_SIZE: int = 128            # larger batch -> less gradient noise (stability)
+BATCH_SIZE: int = 16             # matches the uncond recipe; fits the local 6GB GPU
 LEARNING_RATE: float = 1.5e-4    # decreased from 2e-4 for stability
 LR_SCHEDULER: str = "cosine"     # decay LR to settle late-training generation
 LR_MIN: float = 1e-6
 WEIGHT_DECAY: float = 1e-5
 LAMBDA_EDGE: float = 5.0          # edge loss weighted 5x node loss (DeFoG default)
 TRAIN_TIME_DISTORTION: str = "polydec"
-EMA_DECAY: float = 0.999         # EMA of weights (0 = off); sampled/eval'd from EMA
+EMA_DECAY: float = 0.9999        # EMA of weights (matches uncond); sampled/eval'd from EMA
 TRAIN_SPLIT: float = 0.9
 
 # --- Sampling / evaluation ---
 SAMPLE_STEPS: int = 100          # model default (general sampling)
 EVAL_SAMPLE_STEPS: int = 1000    # definitive end-of-run target-grid eval
 GEN_SAMPLE_STEPS: int = 500      # in-training validation-epoch metric sampling
+GEN_ETA: float = 5.0             # low eta for the in-training probe (matches uncond)
 EVAL_CHUNK: int = 32             # chunk size for eval sampling (avoids giant batches)
-ETA: float = 10.0                # error-correction stochasticity (authors use 100)
-OMEGA: float = 0.0
+ETA: float = 100.0               # error-correction stochasticity (authors' AqSolDB value; matches uncond)
+OMEGA: float = 0.3               # target guidance (matches uncond)
 SAMPLE_TIME_DISTORTION: str = "polydec"   # sampling schedule
 
 # :param SIZE_DIST_METHOD:
@@ -144,6 +160,11 @@ NUM_EVAL_SAMPLES: int = 500
 
 # :param SAMPLE_VIS_EVERY_K:
 SAMPLE_VIS_EVERY_K: int = 25
+
+# --- Reproducibility ---
+# :param SEED:
+#     Global random seed (data split, weight init, shuffling) -- matches uncond.
+SEED: int = 42
 
 # --- Special ---
 __DEBUG__: bool = True
@@ -214,6 +235,8 @@ def plot_target(dataset_df, generated, targets, property_names, title):
 )
 def experiment(e: Experiment) -> None:
     e.log("AqSolDB conditional generation (logP + SAS)")
+    pl.seed_everything(e.SEED, workers=True)
+    e.log(f"global seed set to {e.SEED} (reproducible init / split / shuffling)")
 
     # -- Data ---------------------------------------------------------------
     df = pd.read_csv(e.CSV_PATH)
@@ -258,12 +281,16 @@ def experiment(e: Experiment) -> None:
     e.log(f"Train: {len(train_set)}  Val: {len(val_set)}")
 
     # -- Model --------------------------------------------------------------
+    atom_valencies = [e.ATOM_VALENCY[a] for a in atom_types]
+    atom_weights_list = [e.ATOM_WEIGHT_TABLE[a] for a in atom_types]
     cond_dim = len(property_names)  # both regression -> one dim each
     model = DeFoGModel.from_dataloader(
         train_loader,
         n_layers=e.N_LAYERS, hidden_dim=e.HIDDEN_DIM, hidden_mlp_dim=e.HIDDEN_MLP_DIM,
         n_heads=e.N_HEADS, dropout=e.DROPOUT, noise_type=e.NOISE_TYPE,
         extra_features_type=e.EXTRA_FEATURES_TYPE, rrwp_steps=e.RRWP_STEPS,
+        molecular_features=e.MOLECULAR_FEATURES, atom_valencies=atom_valencies,
+        atom_weights=atom_weights_list, max_atom_weight=e.MAX_ATOM_WEIGHT,
         lr=e.LEARNING_RATE, weight_decay=e.WEIGHT_DECAY,
         lambda_edge=e.LAMBDA_EDGE, train_time_distortion=e.TRAIN_TIME_DISTORTION,
         lr_scheduler=e.LR_SCHEDULER, lr_min=e.LR_MIN,
@@ -277,13 +304,19 @@ def experiment(e: Experiment) -> None:
 
     # -- Train --------------------------------------------------------------
     gen_metrics_fn = make_generation_metrics_fn(atom_decoder, bond_decoder, train_smiles)
+    # Shared probe/preview sampling so the molecule previews reflect the reported metrics.
+    PROBE_SAMPLE_STEPS = e.GEN_SAMPLE_STEPS
+    PROBE_ETA = e.GEN_ETA
     monitor = TrainingMonitorCallback(
         smoothing_window=5, figure_callback=lambda fig: e.track("training_progress", fig),
         generation_metrics_fn=gen_metrics_fn, gen_every_k=10, gen_num_samples=64,
-        gen_sample_steps=e.GEN_SAMPLE_STEPS, checkpoint_dir=e.path,
+        gen_sample_steps=PROBE_SAMPLE_STEPS, gen_eta=PROBE_ETA, checkpoint_dir=e.path,
     )
+    mol_domain = MoleculeDomain(atom_decoder, bond_decoder, reference_smiles=train_smiles)
     sampler = SampleVisualizationCallback(
-        num_samples=8, every_k_epochs=e.SAMPLE_VIS_EVERY_K, sample_steps=e.SAMPLE_STEPS,
+        num_samples=8, every_k_epochs=e.SAMPLE_VIS_EVERY_K,
+        sample_steps=PROBE_SAMPLE_STEPS, eta=PROBE_ETA,
+        domain=mol_domain,
         figure_callback=lambda fig: e.track("samples", fig),
     )
     # EMA first in the list so its weight-swap wraps validation sampling/metrics.
@@ -332,6 +365,7 @@ def experiment(e: Experiment) -> None:
     e.log(f"Target levels: {e['eval/levels']}")
 
     grid_metrics = []
+    all_generated = []
     for lvl_a in e.LEVEL_NAMES:      # logp level
         for lvl_b in e.LEVEL_NAMES:  # sas level
             targets = {
@@ -353,6 +387,15 @@ def experiment(e: Experiment) -> None:
                     size_dist=size_dist, device=device, show_progress=False,
                 )
                 remaining -= cur
+
+            # Persist all generated molecules for this target (tagged + target info).
+            recs = tag_generated_smiles(samples, atom_decoder, bond_decoder, train_smiles)
+            for r in recs:
+                r["target_logp"] = targets["logp"]
+                r["target_sas"] = targets["sas"]
+                r["level_logp"] = lvl_a
+                r["level_sas"] = lvl_b
+            all_generated.extend(recs)
 
             generated = {name: [] for name in property_names}
             n_valid = 0
@@ -392,6 +435,8 @@ def experiment(e: Experiment) -> None:
                               for n in property_names))
 
     e.commit_json("grid_metrics.json", grid_metrics)
+    e.commit_json("generated_smiles.json", all_generated)
+    e.log(f"saved {len(all_generated)} generated molecules -> generated_smiles.json")
     e.log("Evaluation complete.")
 
 

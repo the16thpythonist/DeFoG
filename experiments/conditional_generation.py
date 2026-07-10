@@ -29,6 +29,7 @@ from experiments.utils import (
     smiles_to_pyg_data,
     pyg_data_to_mol,
     mol_to_smiles,
+    tag_generated_smiles,
 )
 from defog.core import DeFoGModel, TrainingMonitorCallback, SampleVisualizationCallback
 from defog.core import ConditionalSizeDistribution
@@ -548,7 +549,8 @@ def experiment(e: Experiment) -> None:
 
     # Save artifacts
     e.commit_json("eval_metrics.json", metrics)
-    e.commit_json("generated_smiles.json", list(unique_smiles))
+    # All generated samples tagged valid/unique/novel (persist the full output).
+    e.commit_json("generated_smiles.json", tag_generated_smiles(samples, atom_decoder, bond_decoder))
     e.commit_json("eval_results.json", all_results)
 
     e["eval/validity_rate"] = validity_rate

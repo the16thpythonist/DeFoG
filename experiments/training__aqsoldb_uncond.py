@@ -26,6 +26,7 @@ from experiments.utils import (
     pyg_data_to_mol,
     mol_to_smiles,
     make_generation_metrics_fn,
+    tag_generated_smiles,
 )
 from defog.core import (
     DeFoGModel, TrainingMonitorCallback, SampleVisualizationCallback, EMACallback
@@ -267,6 +268,12 @@ def experiment(e: Experiment) -> None:
                    "num_unique": n_unique, "uniqueness": uniqueness})
     e.log(f"validity:   {n_valid}/{n} = {validity:.1%}")
     e.log(f"uniqueness: {n_unique}/{n_valid} = {uniqueness:.1%} (of valid)")
+
+    # Persist ALL generated molecules (tagged valid/unique/novel) so the run's
+    # output is a saved asset -- no re-sampling needed for later analysis/viz.
+    records = tag_generated_smiles(samples, atom_decoder, bond_decoder, train_smiles)
+    e.commit_json("generated_smiles.json", records)
+    e.log(f"saved {len(records)} generated molecules -> generated_smiles.json")
 
 
 @experiment.testing
