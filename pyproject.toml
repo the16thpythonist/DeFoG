@@ -87,6 +87,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v"
+markers = [
+    "slow: marks tests that train a small model (deselect with '-m \"not slow\"')",
+]
 
 [tool.black]
 line-length = 100

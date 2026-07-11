@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch_geometric.data import Data, Batch
 from tqdm import tqdm
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from .data import PlaceHolder, to_dense, dense_to_pyg, DistributionNodes
 from .size_distribution import (
@@ -488,6 +488,59 @@ class DeFoGModel(pl.LightningModule):
             return FixedSizeDistribution(num_nodes)
         return ExplicitSizeDistribution(num_nodes)
 
+    def _prepare_generation(
+        self,
+        num_samples: int,
+        num_nodes: Optional[Union[int, torch.Tensor]],
+        size_dist: Optional[SizeDistribution],
+        condition: Optional[torch.Tensor],
+        guidance_scale: float,
+        device: torch.device,
+    ):
+        """
+        Resolve graph sizes, build the node mask, sample the initial noise, and
+        build the conditioning embedding for one generation run.
+
+        Extracted verbatim from sample() so external orchestrators (Sampler and
+        the inpainting sampler) share the exact same initialization instead of
+        duplicating it.
+
+        Returns:
+            (node_mask, n_nodes, X, E, y, y_raw, use_cfg)
+        """
+        # Resolve graph sizes -> node mask.
+        size_dist = self._resolve_size_dist(size_dist, num_nodes)
+        n_nodes = size_dist.sample(num_samples, condition=condition, device=device)
+        n_nodes = n_nodes.clamp(1, self.max_nodes).long()
+        n_max = int(n_nodes.max().item())
+
+        arange = torch.arange(n_max, device=device).unsqueeze(0).expand(num_samples, -1)
+        node_mask = arange < n_nodes.unsqueeze(1)
+
+        # Initial noise from the limit distribution.
+        z_T = sample_noise(self.limit_dist, node_mask)
+        X, E = z_T.X, z_T.E
+
+        # Conditioning embedding (y is threaded through the network; y_raw is the
+        # original condition attached to the output graphs).
+        use_cfg = False
+        y_raw = None
+        if self.cond_dim > 0:
+            if condition is not None:
+                cond_raw = condition.to(device).float()
+                if cond_raw.dim() == 1:
+                    cond_raw = cond_raw.unsqueeze(-1)
+                cond_raw = cond_raw[:, :self.cond_dim]
+                y_raw = cond_raw
+                y = self._embed_condition(cond_raw)
+                use_cfg = (guidance_scale != 1.0)
+            else:
+                y = self._embed_condition(None, bs=num_samples, device=device)
+        else:
+            y = torch.zeros(num_samples, 0, device=device)
+
+        return node_mask, n_nodes, X, E, y, y_raw, use_cfg
+
     @torch.no_grad()
     def sample(
         self,
@@ -502,6 +555,7 @@ class DeFoGModel(pl.LightningModule):
         condition: Optional[torch.Tensor] = None,
         guidance_scale: Optional[float] = None,
         size_dist: Optional[SizeDistribution] = None,
+        posterior_transform: Optional[Callable] = None,
     ) -> List[Data]:
         """
         Generate graph samples.
@@ -535,96 +589,32 @@ class DeFoGModel(pl.LightningModule):
             - edge_index: Edge indices (2, num_edges)
             - edge_attr: Edge features (num_edges, num_edge_classes) one-hot
         """
-        # Force eval mode so dropout is inert during denoising, regardless of the
-        # caller's state; restore the prior mode on exit. Sampling in train mode
-        # would feed dropout noise into every rate-matrix forward pass.
-        was_training = self.training
-        self.eval()
+        # Generation orchestration lives in Sampler (single source of truth for
+        # the denoising loop). This method is a thin, behavior-preserving facade:
+        # it builds a default Sampler with the per-call sampling policy resolved
+        # against the model's own defaults (mirroring the old inline defaulting),
+        # then delegates. Kept because many callers (training callback, eval
+        # scripts) rely on model.sample(...). Local import avoids any module
+        # import-order coupling between model.py and sampler.py.
+        from .sampler import Sampler
 
-        # Use defaults if not specified
-        eta = eta if eta is not None else self.eta
-        omega = omega if omega is not None else self.omega
-        sample_steps = sample_steps if sample_steps is not None else self.sample_steps
-        time_distortion = time_distortion if time_distortion is not None else self.sample_time_distortion
-        device = device if device is not None else self.device
-        guidance_scale = guidance_scale if guidance_scale is not None else self.guidance_scale
-
-        # Update rate matrix designer parameters
-        self.rate_matrix_designer.eta = eta
-        self.rate_matrix_designer.omega = omega
-
-        # Sample number of nodes via the resolved size distribution. Explicit
-        # size_dist wins over num_nodes; num_nodes is turned into an ad-hoc
-        # distribution so there is a single code path. Condition-aware
-        # distributions receive the same condition as the model.
-        size_dist = self._resolve_size_dist(size_dist, num_nodes)
-        n_nodes = size_dist.sample(num_samples, condition=condition, device=device)
-        n_nodes = n_nodes.clamp(1, self.max_nodes).long()
-        n_max = int(n_nodes.max().item())
-
-        # Build node mask
-        arange = torch.arange(n_max, device=device).unsqueeze(0).expand(num_samples, -1)
-        node_mask = arange < n_nodes.unsqueeze(1)
-
-        # Sample initial noise
-        z_T = sample_noise(self.limit_dist, node_mask)
-        X, E = z_T.X, z_T.E
-
-        # Build conditioning embedding. y is the embedding threaded through the
-        # network; y_raw is the original condition attached to the output graphs.
-        use_cfg = False
-        y_raw = None
-        if self.cond_dim > 0:
-            if condition is not None:
-                cond_raw = condition.to(device).float()
-                if cond_raw.dim() == 1:
-                    cond_raw = cond_raw.unsqueeze(-1)
-                cond_raw = cond_raw[:, :self.cond_dim]
-                y_raw = cond_raw
-                y = self._embed_condition(cond_raw)
-                use_cfg = (guidance_scale != 1.0)
-            else:
-                # No condition provided: fully unconditional (null, no CFG)
-                y = self._embed_condition(None, bs=num_samples, device=device)
-        else:
-            y = torch.zeros(num_samples, 0, device=device)
-
-        # Sampling loop
-        iterator = range(sample_steps)
-        if show_progress:
-            iterator = tqdm(iterator, desc="Sampling")
-
-        for t_int in iterator:
-            # Current and next time
-            t_array = t_int * torch.ones((num_samples, 1), device=device)
-            t_norm = t_array / sample_steps
-            s_array = t_array + 1
-            s_norm = s_array / sample_steps
-
-            # Handle absorbing transition edge case
-            if self.limit_dist.noise_type == "absorbing" and t_int == 0:
-                t_norm = t_norm + 1e-6
-
-            # Apply time distortion
-            t_norm = self.time_distorter.sample_ft(t_norm, time_distortion)
-            s_norm = self.time_distorter.sample_ft(s_norm, time_distortion)
-
-            # Sample next state
-            X, E, y = self._sample_step(
-                t_norm, s_norm, X, E, y, node_mask,
-                guidance_scale=guidance_scale if use_cfg else None,
-            )
-
-        # Final cleanup: remove virtual classes if absorbing
-        X, E, _ = self.limit_dist.ignore_virtual_classes(X, E)
-
-        # Convert to PyG Data objects. Attach the raw condition (not the internal
-        # embedding) so downstream consumers see the original condition values.
-        samples = dense_to_pyg(X, E, y_raw, node_mask, n_nodes)
-
-        if was_training:
-            self.train()
-        return samples
+        sampler = Sampler(
+            self,
+            eta=eta,
+            omega=omega,
+            sample_steps=sample_steps,
+            time_distortion=time_distortion,
+            guidance_scale=guidance_scale,
+            posterior_transform=posterior_transform,
+        )
+        return sampler.sample(
+            num_samples,
+            num_nodes=num_nodes,
+            size_dist=size_dist,
+            condition=condition,
+            device=device,
+            show_progress=show_progress,
+        )
 
     def _embed_condition(
         self,
@@ -764,7 +754,7 @@ class DeFoGModel(pl.LightningModule):
 
         return prob_X.clamp(min=0.0, max=1.0), prob_E.clamp(min=0.0, max=1.0)
 
-    def _sample_step(
+    def denoise_step(
         self,
         t: torch.Tensor,
         s: torch.Tensor,
@@ -773,9 +763,19 @@ class DeFoGModel(pl.LightningModule):
         y_t: torch.Tensor,
         node_mask: torch.Tensor,
         guidance_scale: Optional[float] = None,
+        eta: Optional[float] = None,
+        omega: Optional[float] = None,
+        posterior_transform: Optional[Callable] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Sample z_s given z_t (one CTMC step).
+        Sample z_s given z_t (one CTMC denoising step) -- the learned dynamics.
+
+        This is the public per-step primitive an external Sampler drives in a
+        loop. It is fully self-sufficient: the stochasticity/target-guidance
+        strengths eta/omega are accepted as explicit arguments and written onto
+        the RateMatrixDesigner here, so a caller never has to remember to mutate
+        model state beforehand (and interleaved samplers can't clobber each other
+        via stale designer attributes).
 
         Args:
             t: Current time (bs, 1)
@@ -786,6 +786,16 @@ class DeFoGModel(pl.LightningModule):
             node_mask: Boolean mask (bs, n)
             guidance_scale: If not None, apply CFG with this scale by running
                 a dual forward pass and blending rate matrices geometrically.
+            eta: Stochasticity strength for this step. If None, the designer's
+                current value is left untouched.
+            omega: Target-guidance strength for this step. If None, the designer's
+                current value is left untouched.
+            posterior_transform: Optional callable
+                ``(pred_X, pred_E, noisy_data, node_mask) -> (pred_X, pred_E)``
+                applied to the predicted clean-graph marginals *before* the rate
+                matrix is built. This is the generic extension point external
+                guidance rides on (e.g. exact posterior-based discrete guidance):
+                the model itself stays guidance-agnostic. ``None`` is a no-op.
 
         Returns:
             Tuple of (X_s, E_s, y_s) for next state
@@ -794,6 +804,15 @@ class DeFoGModel(pl.LightningModule):
         de = E_t.shape[-1]
         dt = (s - t)[0]
         device = X_t.device
+
+        # eta/omega are sampling policy, not weights: RateMatrixDesigner reads
+        # them as mutable attributes. Set them explicitly per call so this
+        # primitive is self-sufficient and does not depend on a prior caller
+        # having mutated the designer.
+        if eta is not None:
+            self.rate_matrix_designer.eta = eta
+        if omega is not None:
+            self.rate_matrix_designer.omega = omega
 
         # Create noisy data dict
         noisy_data = {
@@ -811,6 +830,12 @@ class DeFoGModel(pl.LightningModule):
         # Normalize predictions
         pred_X = F.softmax(pred.X, dim=-1)
         pred_E = F.softmax(pred.E, dim=-1)
+
+        # Guidance hook: rectify the predicted clean-graph marginals before they
+        # drive the CTMC. Reassigning pred_X/pred_E in place means both the rate
+        # matrix below AND the final-step MAP decode use the rectified marginals.
+        if posterior_transform is not None:
+            pred_X, pred_E = posterior_transform(pred_X, pred_E, noisy_data, node_mask)
 
         # Compute conditional rate matrices
         R_t_X, R_t_E = self.rate_matrix_designer.compute_rate_matrices(
@@ -834,6 +859,15 @@ class DeFoGModel(pl.LightningModule):
 
             pred_X_uncond = F.softmax(pred_uncond.X, dim=-1)
             pred_E_uncond = F.softmax(pred_uncond.E, dim=-1)
+
+            # Apply the same guidance rectification to the unconditional branch so
+            # both rate matrices are built from consistently tilted posteriors.
+            # (Stacking exact guidance on top of CFG is a heuristic, not covered
+            # by the guidance theorem's exactness -- matching CFG's own status.)
+            if posterior_transform is not None:
+                pred_X_uncond, pred_E_uncond = posterior_transform(
+                    pred_X_uncond, pred_E_uncond, noisy_data_uncond, node_mask
+                )
 
             R_t_X_uncond, R_t_E_uncond = self.rate_matrix_designer.compute_rate_matrices(
                 t, node_mask, X_t, E_t, pred_X_uncond, pred_E_uncond
@@ -877,6 +911,9 @@ class DeFoGModel(pl.LightningModule):
         # contaminate the next step's RRWP features (train/inference parity).
         masked = PlaceHolder(X=X_s, E=E_s, y=y_t).mask(node_mask)
         return masked.X, masked.E, y_t
+
+    # Backwards-compatible alias for the pre-refactor private name.
+    _sample_step = denoise_step
 
     def _compute_step_probs(
         self,

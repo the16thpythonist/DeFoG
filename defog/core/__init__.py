@@ -62,6 +62,21 @@ from .size_distribution import (
     ConditionalSizeDistribution,
 )
 from .rate_matrix import RateMatrixDesigner
+from .sampler import Sampler, InpaintingSampler, GuidedSampler
+from .constraint import Constraint, SubgraphConstraint
+from .guidance import (
+    DensityRatio,
+    EnergyRatio,
+    ClassifierRatio,
+    RewardRatio,
+    MoleculePropertyEnergy,
+    build_guidance_network,
+    bregman_loss,
+    ExactGuidance,
+    GuidanceModule,
+    AmortizedPropertyGuidanceModule,
+)
+from .feynman_kac import FeynmanKacSampler, predict_clean
 from .time_distortion import TimeDistorter
 from .transformer import GraphTransformer
 from .features import ExtraFeatures, RRWPFeatures
@@ -101,6 +116,26 @@ __all__ = [
     "sample_from_probs",
     # Rate matrix
     "RateMatrixDesigner",
+    # Sampling orchestration
+    "Sampler",
+    "InpaintingSampler",
+    "GuidedSampler",
+    # Constraints (inpainting)
+    "Constraint",
+    "SubgraphConstraint",
+    # Exact discrete guidance (arXiv:2509.21912)
+    "DensityRatio",
+    "EnergyRatio",
+    "ClassifierRatio",
+    "RewardRatio",
+    "MoleculePropertyEnergy",
+    "build_guidance_network",
+    "bregman_loss",
+    "ExactGuidance",
+    "GuidanceModule",
+    "AmortizedPropertyGuidanceModule",
+    "FeynmanKacSampler",
+    "predict_clean",
     # Time distortion
     "TimeDistorter",
     # Neural network

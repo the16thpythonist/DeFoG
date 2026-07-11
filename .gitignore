@@ -167,3 +167,14 @@ experiments/results/
 # Local smoke-test artifact
 experiments/_aqsoldb_smoke.csv
 experiments/_aqsoldb_uncond_smoke.csv
+
+# --- exact-guidance / FK-SMC session artifacts (do not commit) ---
+experiments/_guided_logp_*/
+experiments/_guided_logp_*.log
+experiments/_diag_size.log
+2509.21912v2.pdf
+2601.10403_discrete_feynman_kac.pdf
+paper.pdf
+inpaint_ab_TT.png
+inpaint_ab_noTT.png
+inpaint_benzene_grid.png
