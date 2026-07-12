@@ -82,13 +82,20 @@ class FeynmanKacSampler(Sampler):
                  resample_interval: Optional[int] = None, warmup_frac: float = 0.7,
                  proposal_transform: Optional[Callable] = None,
                  ess_frac: Optional[float] = None, rejuvenate: bool = False,
-                 jump_length: Optional[int] = None, **kwargs):
+                 jump_length: Optional[int] = None, constraint=None,
+                 n_free: Optional[int] = None, **kwargs):
         super().__init__(model, posterior_transform=proposal_transform, **kwargs)
         self.energy_fn = energy_fn
         self.beta = float(beta)
         self.resample_interval = resample_interval
         self.warmup_frac = warmup_frac
         self.ess_frac = ess_frac
+        # Optional inpainting: freeze a Constraint's core and grow ``n_free`` new
+        # nodes around it while FK-steering the whole molecule. The core is
+        # re-projected before every step and installed exactly at the end; the FK
+        # reward is evaluated on the whole (core + grown) molecule.
+        self.constraint = constraint
+        self.n_free = n_free
         # resample-move: after resampling, jump back `jump_length` steps and
         # re-noise/re-denoise so cloned (duplicated) particles diverge again --
         # the standard SMC remedy for particle impoverishment / diversity collapse.
@@ -110,7 +117,20 @@ class FeynmanKacSampler(Sampler):
 
     def _desc(self) -> str:
         tag = "+guided" if self.posterior_transform is not None else ""
-        return "FK-SMC" + tag + ("+rejuv" if self.rejuvenate else "")
+        return "FK-SMC" + tag + ("+rejuv" if self.rejuvenate else "") + \
+            ("+inpaint" if self.constraint is not None else "")
+
+    # inpainting hooks (no-ops when no constraint): project the frozen core each
+    # step (at the current noise level) and install the exact core at the end.
+    def _pre_step(self, X, E, t_norm, node_mask):
+        if self.constraint is not None:
+            return self.constraint.project(X, E, t_norm, node_mask, self.model.limit_dist)
+        return X, E
+
+    def _post_loop(self, X, E, node_mask):
+        if self.constraint is not None:
+            return self.constraint.project(X, E, 1.0, node_mask, self.model.limit_dist)
+        return X, E
 
     def _jump_back_time(self, t_back_int):
         """Distorted normalized time (scalar) for integer step ``t_back_int``."""
@@ -162,6 +182,15 @@ class FeynmanKacSampler(Sampler):
         was_training = model.training
         model.eval()
         device = device if device is not None else model.device
+
+        # inpainting fixes the graph size to core_size + n_free (overrides size_dist)
+        if self.constraint is not None:
+            total = self.constraint.k + int(self.n_free)
+            if total > model.max_nodes:
+                raise ValueError(f"core k={self.constraint.k} + n_free={self.n_free} = "
+                                 f"{total} exceeds max_nodes={model.max_nodes}")
+            num_nodes = torch.full((num_samples,), total, dtype=torch.long)
+            size_dist = None
 
         node_mask, n_nodes, X, E, y, y_raw, use_cfg = model._prepare_generation(
             num_samples, num_nodes, size_dist, condition, self.guidance_scale, device
@@ -215,6 +244,9 @@ class FeynmanKacSampler(Sampler):
                     # particles changed -> refresh the telescoping reference
                     t_now = ((t_int + 1) / self.sample_steps) * torch.ones(K, 1, device=device)
                     prev_phi = self._potential(X, E, y, t_now, node_mask)
+
+        # install the exact core (inpainting) after the loop; no-op otherwise
+        X, E = self._post_loop(X, E, node_mask)
 
         X, E, _ = model.limit_dist.ignore_virtual_classes(X, E)
         n_final = node_mask.sum(-1)
