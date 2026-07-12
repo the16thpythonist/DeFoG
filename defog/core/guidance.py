@@ -120,6 +120,46 @@ class MoleculePropertyEnergy:
         return out
 
 
+class MultiPropertyEnergy:
+    """Joint energy over several molecular properties, for the FK reward.
+
+    Decodes each dense one-hot graph ONCE and sums per-property normalized squared
+    errors:  E(x1) = sum_i weight_i * ((prop_i(mol) - target_i) / scale_i)^2.
+    Normalizing by ``scale_i`` (e.g. each property's dataset std) lets properties on
+    very different ranges (logP ~ O(1), TPSA ~ O(100)) combine fairly. Invalid /
+    undecodable graphs get ``invalid_energy`` (so their FK weight -> 0).
+
+    Decoupled from the guidance networks: it is just a reward, passed to
+    :class:`~defog.core.feynman_kac.JointGuidanceSampler` as ``energy_fn``.
+
+    Args:
+        domain: object with ``.decode(pyg_data) -> Optional[Mol]``.
+        specs: list of ``(callback, target, scale, weight)`` tuples, one per property.
+    """
+
+    def __init__(self, domain, specs, invalid_energy: float = 1e3):
+        self.domain = domain
+        self.specs = [tuple(s) for s in specs]
+        self.invalid = invalid_energy
+
+    def __call__(self, X1, E1, node_mask):
+        n = node_mask.sum(-1)
+        datas = dense_to_pyg(X1, E1, None, node_mask, n)
+        out = X1.new_full((len(datas),), float(self.invalid))
+        for i, d in enumerate(datas):
+            mol = self.domain.decode(d)
+            if mol is None:
+                continue
+            try:
+                e = 0.0
+                for cb, tgt, scale, w in self.specs:
+                    e += float(w) * ((float(cb(mol)) - float(tgt)) / float(scale)) ** 2
+                out[i] = e
+            except Exception:
+                pass
+        return out
+
+
 # ===========================================================================
 # Helpers
 # ===========================================================================
@@ -278,6 +318,54 @@ class ExactGuidance:
                    prop_mean=prop_mean, prop_std=prop_std)
 
 
+class CompositeGuidance:
+    """Combine several :class:`ExactGuidance` objects into one posterior_transform
+    (product-of-experts stacking).
+
+    Each guidance's log-ratio ``g_i`` (from its own network, at its own target set
+    via ``set_target``) is summed (weighted) and the pretrained posterior is
+    reweighted once::
+
+        q  ∝  softmax( Σ_i w_i * g_i  +  log p )        # mode="product"
+        q  ∝  softmax( mean_i(w_i * g_i)  +  log p )     # mode="mean"
+
+    ``mode="none"`` is a sentinel meaning "do not stack in the proposal" (callers
+    should then pass ``proposal_transform=None`` / let the joint energy steer alone).
+
+    Args:
+        guidances: list of ExactGuidance (each with its target already set).
+        mode: "product" (sum) | "mean" (average) | "none".
+        weights: per-guidance strengths; default = each guidance's own ``.weight``.
+    """
+
+    def __init__(self, guidances, mode: str = "product", weights=None):
+        assert mode in ("product", "mean", "none"), f"unknown mode {mode!r}"
+        self.guidances = list(guidances)
+        self.mode = mode
+        self.weights = list(weights) if weights is not None else [g.weight for g in self.guidances]
+        assert len(self.weights) == len(self.guidances)
+
+    @torch.no_grad()
+    def reweight(self, pred_X, pred_E, noisy_data, node_mask, eps: float = 1e-8):
+        gX_tot = gE_tot = None
+        for w, g in zip(self.weights, self.guidances):
+            gX, gE = g._g(noisy_data, node_mask)      # raw log-ratio from each expert
+            gX_tot = w * gX if gX_tot is None else gX_tot + w * gX
+            gE_tot = w * gE if gE_tot is None else gE_tot + w * gE
+        if self.mode == "mean":
+            k = max(1, len(self.guidances))
+            gX_tot, gE_tot = gX_tot / k, gE_tot / k
+        q_X = F.softmax(gX_tot + torch.log(pred_X.clamp_min(eps)), dim=-1)
+        q_E = F.softmax(gE_tot + torch.log(pred_E.clamp_min(eps)), dim=-1)
+        return q_X, q_E
+
+    def set_targets(self, targets):
+        """Convenience: set each guidance's target from a list (same order)."""
+        for g, t in zip(self.guidances, targets):
+            g.set_target(t)
+        return self
+
+
 # ===========================================================================
 # Training modules (Bregman objective)
 # ===========================================================================
@@ -372,7 +460,7 @@ class AmortizedPropertyGuidanceModule(_GuidanceModuleBase):
     """
 
     def __init__(self, base: DeFoGModel, prop_values, prop_mean: float, prop_std: float,
-                 gamma: float = 4.0, prop_attr: str = "prop_val",
+                 gamma: float = 4.0, prop_attr: str = "prop_val", prop_scale: float = 1.0,
                  h_model: Optional[DeFoGModel] = None, lr: float = 2e-4,
                  lambda_edge: Optional[float] = None, g_clamp: float = 20.0,
                  **h_overrides):
@@ -381,7 +469,9 @@ class AmortizedPropertyGuidanceModule(_GuidanceModuleBase):
         self.h = h_model if h_model is not None else build_guidance_network(base, cond_dim=1, **h_overrides)
         self.register_buffer("prop_values", torch.as_tensor(prop_values, dtype=torch.float32))
         self.prop_mean, self.prop_std = float(prop_mean), float(prop_std)
-        self.gamma, self.prop_attr = float(gamma), prop_attr
+        # energy r = exp(-gamma * ((prop - c)/prop_scale)^2); prop_scale (e.g. the
+        # property's std) makes gamma property-agnostic across very different ranges.
+        self.gamma, self.prop_attr, self.prop_scale = float(gamma), prop_attr, float(prop_scale)
         self.lr, self.g_clamp = lr, g_clamp
         self.lambda_edge = lambda_edge if lambda_edge is not None else base.train_loss.lambda_edge
 
@@ -394,7 +484,7 @@ class AmortizedPropertyGuidanceModule(_GuidanceModuleBase):
         prop_x1 = getattr(batch, self.prop_attr).to(device).reshape(bs).float()
         idx = torch.randint(0, self.prop_values.numel(), (bs,), device=device)
         c = self.prop_values[idx]
-        r = torch.exp(-self.gamma * (prop_x1 - c) ** 2).detach()
+        r = torch.exp(-self.gamma * ((prop_x1 - c) / self.prop_scale) ** 2).detach()
 
         t = torch.rand(bs, 1, device=device)  # Eq. 11: t ~ U[0, 1]
         y0 = torch.zeros(bs, 0, device=device)

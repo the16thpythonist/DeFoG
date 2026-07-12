@@ -26,7 +26,8 @@ from defog.core import (
 from defog.domains import MoleculeDomain
 from defog.domains.molecule import build_encoders, pyg_data_to_mol, mol_to_smiles
 from experiments.guided_logp_demo import (
-    derive_atom_types, build_dataset, save_grid, plot_distributions, BOND_TYPES, LEVELS,
+    derive_atom_types, build_dataset, save_grid, plot_distributions,
+    save_generated_json, plot_size_distributions, BOND_TYPES, LEVELS,
 )
 
 RDLogger.DisableLog("rdApp.*")
@@ -75,7 +76,9 @@ def main():
     ap.add_argument("--weight", type=float, default=2.0)
     ap.add_argument("--beta", type=float, default=1.0)
     ap.add_argument("--resample-interval", type=int, default=25)
-    ap.add_argument("--ess-frac", type=float, default=0.5)
+    ap.add_argument("--warmup-frac", type=float, default=0.7,
+                    help="fraction of steps before first resample; resample LATE to avoid size collapse")
+    ap.add_argument("--ess-frac", type=float, default=None)
     ap.add_argument("--size-bandwidth", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -102,7 +105,7 @@ def main():
     print(f"[restart] target={args.target}/level K={args.particles} beta={args.beta} "
           f"ess_frac={args.ess_frac} steps={args.sample_steps} max_runs={args.max_runs}", flush=True)
 
-    metrics, per_target = {}, {}
+    metrics, per_target, per_target_mols = {}, {}, {}
     for lvl in LEVELS:
         tgt = float(targets[lvl])
         energy_fn = MoleculePropertyEnergy(domain, Crippen.MolLogP, tgt)
@@ -111,12 +114,13 @@ def main():
         fk = FeynmanKacSampler(
             base, energy_fn, proposal_transform=guidance.reweight, beta=args.beta,
             resample_interval=args.resample_interval, ess_frac=args.ess_frac,
-            eta=args.eta, omega=args.omega, sample_steps=args.sample_steps,
-            time_distortion="polydec",
+            warmup_frac=args.warmup_frac, eta=args.eta, omega=args.omega,
+            sample_steps=args.sample_steps, time_distortion="polydec",
         )
         mols, logps, runs = sample_until(fk, args.target, args.particles, size_dist,
                                          tgt, device, ad, bd, args.max_runs, lvl)
         per_target[lvl] = logps
+        per_target_mols[lvl] = mols
         n = len(logps)
         n_atoms = np.array([m.GetNumHeavyAtoms() for m in mols]) if mols else np.array([])
         metrics[lvl] = {
@@ -136,6 +140,13 @@ def main():
 
     plot_distributions(logp_all, per_target, targets,
                        os.path.join(args.outdir, "guided_logp_distributions.png"))
+    # persist the actual SMILES (+ logP + size) and the size distributions
+    save_generated_json(os.path.join(args.outdir, "generated_smiles.json"),
+                        per_target_mols, per_target, targets)
+    proposed = {lvl: size_dist.sample(4000, condition=torch.full((4000, 1), float(targets[lvl]))).cpu().numpy()
+                for lvl in LEVELS}
+    plot_size_distributions(per_target_mols, targets,
+                            os.path.join(args.outdir, "size_distributions.png"), proposed=proposed)
     with open(os.path.join(args.outdir, "guided_logp_metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     print(f"[restart] DONE -> {args.outdir}", flush=True)

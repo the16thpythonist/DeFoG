@@ -64,8 +64,13 @@ class FeynmanKacSampler(Sampler):
             culled). The FK potential is ``phi = -beta * energy``.
         beta:    tilt strength (inverse temperature of the reward).
         resample_interval: resample every this many steps (default ~steps/8).
-        warmup_frac: fraction of steps to run before the first resample (early
-            predictions of the clean graph are unreliable at high noise).
+        warmup_frac: fraction of steps to run before the FIRST resample. This
+            matters a lot: early in denoising the predicted clean graph is
+            unreliable AND size-biased -- large graphs are transiently invalid or
+            overshoot the target, so early resampling culls them prematurely and
+            collapses the sizes toward small "reliable" molecules. Resample only
+            LATE (default 0.7; 0.8+ is tighter), once predictions are valid and
+            shaped, so selection reflects final quality, not transient states.
         proposal_transform: optional ``posterior_transform`` (e.g. a trained
             ``ExactGuidance.reweight``) to use guided dynamics as the proposal.
         ess_frac: if set, only resample when the effective sample size drops below
@@ -74,18 +79,75 @@ class FeynmanKacSampler(Sampler):
     """
 
     def __init__(self, model, energy_fn: Callable, *, beta: float = 1.0,
-                 resample_interval: Optional[int] = None, warmup_frac: float = 0.15,
+                 resample_interval: Optional[int] = None, warmup_frac: float = 0.7,
                  proposal_transform: Optional[Callable] = None,
-                 ess_frac: Optional[float] = None, **kwargs):
+                 ess_frac: Optional[float] = None, rejuvenate: bool = False,
+                 jump_length: Optional[int] = None, **kwargs):
         super().__init__(model, posterior_transform=proposal_transform, **kwargs)
         self.energy_fn = energy_fn
         self.beta = float(beta)
         self.resample_interval = resample_interval
         self.warmup_frac = warmup_frac
         self.ess_frac = ess_frac
+        # resample-move: after resampling, jump back `jump_length` steps and
+        # re-noise/re-denoise so cloned (duplicated) particles diverge again --
+        # the standard SMC remedy for particle impoverishment / diversity collapse.
+        # IMPORTANT: the re-denoise re-steers only through the proposal, so
+        # rejuvenation must be paired with a GUIDED proposal (proposal_transform);
+        # on a bare base proposal it re-noises toward the base and washes out the
+        # reward tilt. Keep `jump_length` small (a few % of steps); too large a
+        # jump re-collapses under a strong proposal.
+        self.rejuvenate = rejuvenate
+        self.jump_length = jump_length
+        if rejuvenate and proposal_transform is None:
+            import warnings
+            warnings.warn(
+                "FeynmanKacSampler(rejuvenate=True) without a guided proposal_transform "
+                "will wash out the reward tilt (the re-denoise re-steers only via the "
+                "proposal). Pass proposal_transform=guidance.reweight.",
+                RuntimeWarning,
+            )
 
     def _desc(self) -> str:
-        return "FK-SMC" + ("+guided" if self.posterior_transform is not None else "")
+        tag = "+guided" if self.posterior_transform is not None else ""
+        return "FK-SMC" + tag + ("+rejuv" if self.rejuvenate else "")
+
+    def _jump_back_time(self, t_back_int):
+        """Distorted normalized time (scalar) for integer step ``t_back_int``."""
+        model = self.model
+        t_norm = t_back_int / self.sample_steps
+        if model.limit_dist.noise_type == "absorbing" and t_back_int == 0:
+            t_norm = t_norm + 1e-6
+        t_norm = model.time_distorter.sample_ft(
+            torch.tensor([[t_norm]], dtype=torch.float32), self.time_distortion
+        )
+        return float(t_norm.reshape(-1)[0].item())
+
+    @torch.no_grad()
+    def _renoise_toward_current(self, X, E, tau, node_mask):
+        """Re-noise the whole graph toward its own current one-hot at level tau:
+        sample from tau*onehot(current) + (1-tau)*limit, INDEPENDENTLY per particle,
+        so cloned particles split. Edges sampled upper-triangular then mirrored."""
+        bs, n, dx = X.shape
+        de = E.shape[-1]
+        device = X.device
+        limX = self.model.limit_dist.X.to(device).float()
+        limE = self.model.limit_dist.E.to(device).float()
+
+        probX = tau * X + (1.0 - tau) * limX.view(1, 1, dx)
+        idxX = probX.clamp_min(0).reshape(bs * n, dx).multinomial(1).reshape(bs, n)
+        Xn = F.one_hot(idxX, dx).float()
+
+        probE = tau * E + (1.0 - tau) * limE.view(1, 1, 1, de)
+        idxE = probE.clamp_min(0).reshape(bs * n * n, de).multinomial(1).reshape(bs, n, n)
+        iu = torch.triu(torch.ones(n, n, device=device), diagonal=1).bool()
+        idxE_sym = torch.zeros(bs, n, n, dtype=idxE.dtype, device=device)
+        idxE_sym[:, iu] = idxE[:, iu]
+        idxE_sym = idxE_sym + idxE_sym.transpose(1, 2)
+        En = F.one_hot(idxE_sym.long(), de).float()
+
+        masked = PlaceHolder(X=Xn, E=En, y=None).mask(node_mask)
+        return masked.X, masked.E
 
     @torch.no_grad()
     def _potential(self, X, E, y, t_norm, node_mask):
@@ -141,6 +203,19 @@ class FeynmanKacSampler(Sampler):
                     y_raw = y_raw[idx]
                 logw = torch.zeros(K, device=device)
 
+                # resample-move: split cloned particles by jumping back and
+                # re-noising/re-denoising, so the ensemble regains diversity.
+                if self.rejuvenate:
+                    j = self.jump_length or max(1, self.sample_steps // 25)
+                    t_back = max(0, t_int + 1 - j)
+                    tau = self._jump_back_time(t_back)
+                    X, E = self._renoise_toward_current(X, E, tau, node_mask)
+                    for tt in range(t_back, t_int + 1):
+                        X, E, y = self._advance(tt, X, E, y, node_mask, use_cfg)
+                    # particles changed -> refresh the telescoping reference
+                    t_now = ((t_int + 1) / self.sample_steps) * torch.ones(K, 1, device=device)
+                    prev_phi = self._potential(X, E, y, t_now, node_mask)
+
         X, E, _ = model.limit_dist.ignore_virtual_classes(X, E)
         n_final = node_mask.sum(-1)
         samples = dense_to_pyg(X, E, y_raw, node_mask, n_final)
@@ -148,3 +223,38 @@ class FeynmanKacSampler(Sampler):
         if was_training:
             model.train()
         return samples
+
+
+class JointGuidanceSampler(FeynmanKacSampler):
+    """FK-SMC steering toward MULTIPLE properties at once.
+
+    Constructed from a list of trained :class:`~defog.core.guidance.ExactGuidance`
+    modules plus a joint ``energy_fn`` (e.g.
+    :class:`~defog.core.guidance.MultiPropertyEnergy`), and the usual FK
+    hyperparameters (``beta``, ``warmup_frac``, ``resample_interval``, ``ess_frac``,
+    ``eta``, ``omega``, ``sample_steps``, ...).
+
+    The guidance modules are combined in the PROPOSAL via
+    :class:`~defog.core.guidance.CompositeGuidance` (``mode`` = "product" | "mean" |
+    "none"); the joint ``energy_fn`` is the FK reward and is fully decoupled from the
+    guidance list. Set each guidance's target (``set_target``) before sampling, or
+    use ``self.composite.set_targets([...])``.
+
+    Args:
+        guidances: list of ExactGuidance (each amortized on its own property).
+        energy_fn: joint reward (lower = better), evaluated on the predicted clean graph.
+        mode: proposal composition, "product" (default) | "mean" | "none".
+        guidance_weights: per-guidance strengths (default = each guidance's ``.weight``).
+    """
+
+    def __init__(self, model, guidances, energy_fn, *, mode: str = "product",
+                 guidance_weights=None, **fk_kwargs):
+        from .guidance import CompositeGuidance
+        self.composite = CompositeGuidance(guidances, mode=mode, weights=guidance_weights)
+        proposal = self.composite.reweight if mode != "none" else None
+        super().__init__(model, energy_fn, proposal_transform=proposal, **fk_kwargs)
+        self.guidances = list(guidances)
+        self.mode = mode
+
+    def _desc(self) -> str:
+        return f"JointFK[{len(self.guidances)}x,{self.mode}]"

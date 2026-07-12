@@ -178,3 +178,9 @@ paper.pdf
 inpaint_ab_TT.png
 inpaint_ab_noTT.png
 inpaint_benzene_grid.png
+experiments/_fk_sweep_report/
+.aslurm/
+slurm-*.out
+experiments/_tpsa_guidance/
+experiments/_joint_logp_tpsa/
+experiments/_joint_smoke/

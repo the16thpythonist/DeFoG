@@ -70,13 +70,15 @@ from .guidance import (
     ClassifierRatio,
     RewardRatio,
     MoleculePropertyEnergy,
+    MultiPropertyEnergy,
     build_guidance_network,
     bregman_loss,
     ExactGuidance,
+    CompositeGuidance,
     GuidanceModule,
     AmortizedPropertyGuidanceModule,
 )
-from .feynman_kac import FeynmanKacSampler, predict_clean
+from .feynman_kac import FeynmanKacSampler, JointGuidanceSampler, predict_clean
 from .time_distortion import TimeDistorter
 from .transformer import GraphTransformer
 from .features import ExtraFeatures, RRWPFeatures
@@ -132,9 +134,12 @@ __all__ = [
     "build_guidance_network",
     "bregman_loss",
     "ExactGuidance",
+    "CompositeGuidance",
+    "MultiPropertyEnergy",
     "GuidanceModule",
     "AmortizedPropertyGuidanceModule",
     "FeynmanKacSampler",
+    "JointGuidanceSampler",
     "predict_clean",
     # Time distortion
     "TimeDistorter",

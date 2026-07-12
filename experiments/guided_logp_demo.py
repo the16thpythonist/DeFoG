@@ -152,6 +152,54 @@ def plot_distributions(dataset_logp, per_target, targets, path):
     plt.close(fig)
 
 
+def save_generated_json(path, per_target_mols, per_target_logps, targets):
+    """Persist the generated molecules per target: SMILES + logP + heavy-atom count."""
+    data = {}
+    for lvl, mols in per_target_mols.items():
+        logps = per_target_logps.get(lvl, [])
+        rows = [{"smiles": mol_to_smiles(m), "logp": float(lp), "n_atoms": int(m.GetNumHeavyAtoms())}
+                for m, lp in zip(mols, logps)]
+        sizes = [r["n_atoms"] for r in rows]
+        data[lvl] = {
+            "target": float(targets[lvl]), "n": len(rows),
+            "logp_mean": float(np.mean([r["logp"] for r in rows])) if rows else None,
+            "size_mean": float(np.mean(sizes)) if sizes else None,
+            "size_std": float(np.std(sizes)) if sizes else None,
+            "molecules": rows,
+        }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def plot_size_distributions(per_target_mols, targets, path, proposed=None):
+    """Generated-molecule size distributions per target (solid), optionally over the
+    conditional size-prior the sampler was given (dashed) so mismatches are visible."""
+    colors = {"low": "#2c7fb8", "med": "#31a354", "high": "#d95f0e"}
+    all_sizes = [m.GetNumHeavyAtoms() for mm in per_target_mols.values() for m in mm]
+    smax = max(all_sizes) if all_sizes else 30
+    xs = np.arange(1, smax + 1)
+    fig, ax = plt.subplots(figsize=(9, 5.2))
+    for lvl in LEVELS:
+        c = colors.get(lvl, "purple")
+        sz = np.array([m.GetNumHeavyAtoms() for m in per_target_mols.get(lvl, [])])
+        if len(sz):
+            pmf = np.bincount(sz, minlength=smax + 1)[1:smax + 1] / len(sz)
+            ax.plot(xs, pmf, marker="o", ms=3, lw=2, color=c,
+                    label=f"generated {lvl} (mean {sz.mean():.1f})")
+        if proposed is not None and lvl in proposed and len(proposed[lvl]):
+            psz = np.asarray(proposed[lvl])
+            ppmf = np.bincount(psz, minlength=smax + 1)[1:smax + 1] / len(psz)
+            ax.plot(xs, ppmf, ls="--", lw=1.2, color=c, alpha=0.55,
+                    label=f"size prior {lvl} (mean {psz.mean():.1f})")
+    ax.set_xlabel("graph size (heavy atoms)")
+    ax.set_ylabel("probability")
+    ax.set_title("Generated molecule sizes (solid) vs conditional size prior (dashed)")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=os.path.expanduser("~/Downloads/aqsoldb_4e-4_best_model.ckpt"))
