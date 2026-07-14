@@ -107,13 +107,20 @@ class Sampler:
         )
         return X, E, y
 
-    def _run_loop(self, X, E, y, node_mask, use_cfg, show_progress):
-        """Monotone denoising loop t=0..sample_steps-1. Returns (X, E, y)."""
+    def _run_loop(self, X, E, y, node_mask, use_cfg, show_progress, on_step=None):
+        """Monotone denoising loop t=0..sample_steps-1. Returns (X, E, y).
+
+        ``on_step(step, total, phase)`` (optional) is invoked once per OUTER step
+        with a 1-based, monotonic step index — added for external progress
+        reporting; no behavior change when ``on_step`` is None.
+        """
         iterator = range(self.sample_steps)
         if show_progress:
             iterator = tqdm(iterator, desc=self._desc())
         for t_int in iterator:
             X, E, y = self._advance(t_int, X, E, y, node_mask, use_cfg)
+            if on_step is not None:
+                on_step(t_int + 1, self.sample_steps, "sampling")
         return X, E, y
 
     # ----------------------------------------------------------------- sample
@@ -126,6 +133,7 @@ class Sampler:
         condition: Optional[torch.Tensor] = None,
         device: Optional[torch.device] = None,
         show_progress: bool = True,
+        on_step: Optional[Callable] = None,
     ):
         """
         Generate graph samples. Returns a list of PyG ``Data`` objects.
@@ -146,7 +154,7 @@ class Sampler:
             num_samples, num_nodes, size_dist, condition, self.guidance_scale, device
         )
 
-        X, E, y = self._run_loop(X, E, y, node_mask, use_cfg, show_progress)
+        X, E, y = self._run_loop(X, E, y, node_mask, use_cfg, show_progress, on_step=on_step)
 
         # Hook: constrained samplers install the exact target here (e.g. tau=1
         # core), after the model's own final-step MAP decode inside denoise_step.
@@ -249,9 +257,9 @@ class InpaintingSampler(Sampler):
         )
         return float(t_norm.reshape(-1)[0].item())
 
-    def _run_loop(self, X, E, y, node_mask, use_cfg, show_progress):
+    def _run_loop(self, X, E, y, node_mask, use_cfg, show_progress, on_step=None):
         if not self.resample:
-            return super()._run_loop(X, E, y, node_mask, use_cfg, show_progress)
+            return super()._run_loop(X, E, y, node_mask, use_cfg, show_progress, on_step=on_step)
 
         model = self.model
         N = self.sample_steps
@@ -265,6 +273,8 @@ class InpaintingSampler(Sampler):
             t_int += 1
             if pbar is not None:
                 pbar.update(1)
+            if on_step is not None:
+                on_step(t_int, N, "inpaint")
 
             # Time-travel: at each jump point, re-noise back j steps and
             # re-denoise, n_resample times, harmonizing the core<->free boundary.
@@ -280,6 +290,8 @@ class InpaintingSampler(Sampler):
                     )
                     for tt in range(t_back, t_int):
                         X, E, y = self._advance(tt, X, E, y, node_mask, use_cfg)
+                        if on_step is not None:
+                            on_step(t_int, N, "inpaint")
         if pbar is not None:
             pbar.close()
         return X, E, y
@@ -293,6 +305,7 @@ class InpaintingSampler(Sampler):
         condition: Optional[torch.Tensor] = None,
         device: Optional[torch.device] = None,
         show_progress: bool = True,
+        on_step: Optional[Callable] = None,
     ):
         """
         Generate ``num_samples`` completions, each with ``core_size + n_free``
@@ -312,6 +325,7 @@ class InpaintingSampler(Sampler):
             condition=condition,
             device=device,
             show_progress=show_progress,
+            on_step=on_step,
         )
 
 

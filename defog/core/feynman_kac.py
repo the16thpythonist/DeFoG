@@ -177,7 +177,7 @@ class FeynmanKacSampler(Sampler):
 
     @torch.no_grad()
     def sample(self, num_samples, num_nodes=None, size_dist=None, condition=None,
-               device=None, show_progress=True):
+               device=None, show_progress=True, on_step=None):
         model = self.model
         was_training = model.training
         model.eval()
@@ -207,6 +207,9 @@ class FeynmanKacSampler(Sampler):
 
         for t_int in iterator:
             X, E, y = self._advance(t_int, X, E, y, node_mask, use_cfg)
+            if on_step is not None:
+                on_step(t_int + 1, self.sample_steps,
+                        "fk_warmup" if t_int < warmup else "sampling")
 
             is_checkpoint = (
                 t_int >= warmup
@@ -231,6 +234,8 @@ class FeynmanKacSampler(Sampler):
                 if y_raw is not None:
                     y_raw = y_raw[idx]
                 logw = torch.zeros(K, device=device)
+                if on_step is not None:
+                    on_step(t_int + 1, self.sample_steps, "fk_resample")
 
                 # resample-move: split cloned particles by jumping back and
                 # re-noising/re-denoising, so the ensemble regains diversity.
@@ -241,6 +246,8 @@ class FeynmanKacSampler(Sampler):
                     X, E = self._renoise_toward_current(X, E, tau, node_mask)
                     for tt in range(t_back, t_int + 1):
                         X, E, y = self._advance(tt, X, E, y, node_mask, use_cfg)
+                        if on_step is not None:
+                            on_step(t_int + 1, self.sample_steps, "fk_rejuvenate")
                     # particles changed -> refresh the telescoping reference
                     t_now = ((t_int + 1) / self.sample_steps) * torch.ones(K, 1, device=device)
                     prev_phi = self._potential(X, E, y, t_now, node_mask)

@@ -26,11 +26,18 @@ from experiments.guided_logp_demo import derive_atom_types, BOND_TYPES
 
 RDLogger.DisableLog("rdApp.*")
 
+# SA score (synthetic accessibility) ships in RDKit's Contrib dir — add to path.
+import sys
+from rdkit.Chem import RDConfig
+sys.path.append(os.path.join(RDConfig.RDContribDir, "SA_Score"))
+import sascorer  # noqa: E402
+
 PROP_FNS = {
     "logp": Crippen.MolLogP,
     "tpsa": Descriptors.TPSA,
     "mw": Descriptors.MolWt,
     "nhoh": Descriptors.NHOHCount,
+    "sascore": sascorer.calculateScore,
 }
 
 
@@ -74,6 +81,10 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--atom-decoder", default=None,
+                    help="comma-separated atom order matching the BASE MODEL's node classes "
+                         "(e.g. ZINC: C,N,O,F,P,S,Cl,Br,I). Overrides the data-derived "
+                         "frequency order, which need not match the checkpoint.")
     args = ap.parse_args()
 
     outdir = args.outdir or f"experiments/_{args.property}_guidance"
@@ -82,7 +93,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     df = pd.read_csv(args.data)
-    atom_types = derive_atom_types(df["smiles"])
+    atom_types = (
+        [s.strip() for s in args.atom_decoder.split(",")]
+        if args.atom_decoder
+        else derive_atom_types(df["smiles"])
+    )
+    print(f"[train] atom vocab ({len(atom_types)}): {atom_types}", flush=True)
     atom_encoder, atom_decoder, bond_encoder, bond_decoder = build_encoders(atom_types, BOND_TYPES)
     prop_fn = PROP_FNS[args.property]
 
