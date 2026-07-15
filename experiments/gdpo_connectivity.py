@@ -97,13 +97,25 @@ KL_TARGET: float = None
 EMA_DECAY: float = 0.9
 
 # --- evaluation / checkpointing ---
-# :param EVAL_SAMPLES / EVAL_STEPS: fresh molecules for the BEFORE / final measurement.
+# :param EVAL_SAMPLES / EVAL_STEPS: fresh molecules for the COMPARED BEFORE/AFTER
+#     measurement. 500 steps is the default deploy point -- the fine-tuned models
+#     produce meaningfully fewer disconnected fragments with more denoising steps.
 EVAL_SAMPLES: int = 2048
-EVAL_STEPS: int = 100
+EVAL_STEPS: int = 500
 # :param ROUND_EVAL_SAMPLES: cheaper eval after each intermediate round (the ratchet).
 ROUND_EVAL_SAMPLES: int = 512
+# :param SELECT_EVAL_STEPS: cheap step count for RANKING snapshots (relative ordering
+#     holds); the chosen winner is re-evaluated at the full EVAL_STEPS.
+SELECT_EVAL_STEPS: int = 100
 # :param CKPT_EVERY: save a pre-collapse policy snapshot every N iters (0=off).
 CKPT_EVERY: int = 20
+# :param SELECT_BEST: after training, evaluate every snapshot + the final weights and
+#     keep the one with the LOWEST disconnected fraction whose validity did not drop
+#     (the true trough, not the possibly-overshot final). Requires CKPT_EVERY>0.
+SELECT_BEST: bool = False
+# :param SELECT_EVAL_SAMPLES: samples per snapshot during best-snapshot ranking (cheaper
+#     than the full final eval).
+SELECT_EVAL_SAMPLES: int = 1024
 
 # NOTE: __DEBUG__ must be False when submitting a sweep -- debug mode writes to a
 # single overwriteable folder, so parallel runs would clobber each other.
@@ -293,6 +305,44 @@ def experiment(e: Experiment) -> None:
               f"valid={rev['valid_frac']:.1%} unique={rev['unique_frac_of_valid']:.1%} (n={n_eval})")
 
     after = round_results[-1]
+
+    # Best-snapshot selection: the disconnection trough is often mid-run (before any
+    # late drift), so the final EMA can overshoot it. Rank every saved snapshot + the
+    # final by disconnected fraction (validity-gated), keep the true minimum.
+    best_snapshot = None
+    if e.SELECT_BEST and e.CKPT_EVERY > 0:
+        import glob
+        val_floor = before["valid_frac"] - 0.02  # reject any validity collapse
+        cands = sorted(glob.glob(os.path.join(ckpt_dir, "*.ckpt")))
+        e.log(f"best-snapshot: ranking {len(cands)} snapshots + final at {e.SELECT_EVAL_STEPS} steps "
+              f"(val_floor={val_floor:.1%})")
+
+        def rank_eval(m):
+            r, _, _ = evaluate(m, domain, e.SELECT_EVAL_SAMPLES, e.SELECT_EVAL_STEPS,
+                               size_dist, device, seed=e.SEED + 200, **eval_kw)
+            return r
+
+        # rank ALL candidates (final included) at the SAME cheap step count for fairness
+        fin = rank_eval(model)
+        e.log(f"  final: disc(of valid)={fin['disconnected_frac_of_valid']:.1%} valid={fin['valid_frac']:.1%}")
+        best = (fin["disconnected_frac_of_valid"], fin["valid_frac"], None)
+        for sp in cands:
+            cm = DeFoGModel.load(sp, device="cpu").to(device)
+            rev = rank_eval(cm)
+            e.log(f"  {os.path.basename(sp)}: disc(of valid)={rev['disconnected_frac_of_valid']:.1%} "
+                  f"valid={rev['valid_frac']:.1%}")
+            if rev["valid_frac"] >= val_floor and rev["disconnected_frac_of_valid"] < best[0]:
+                best = (rev["disconnected_frac_of_valid"], rev["valid_frac"], sp)
+            del cm
+            torch.cuda.empty_cache()
+        best_snapshot = os.path.basename(best[2]) if best[2] else "final"
+        e.log(f"best-snapshot: WINNER = {best_snapshot} (rank disc {best[0]:.1%}, valid {best[1]:.1%})")
+        if best[2] is not None:  # a snapshot beat the final -> load it as the output
+            model = DeFoGModel.load(best[2], device="cpu").to(device)
+        # the COMPARED after: the chosen weights re-evaluated at the full EVAL_STEPS
+        after, mols_a, smis_a = evaluate(model, domain, e.EVAL_SAMPLES, e.EVAL_STEPS,
+                                         size_dist, device, seed=e.SEED + 1, **eval_kw)
+
     e["results/after"] = after
     save_grid(mols_a, smis_a, os.path.join(e.path, "grid_after.png"))
     save_curves(history, before["disconnected_frac_all"], os.path.join(e.path, "reward_curve.png"))
@@ -303,7 +353,8 @@ def experiment(e: Experiment) -> None:
         "valid_before": before["valid_frac"], "valid_after": after["valid_frac"],
         "unique_after": after["unique_frac_of_valid"],
         "ratchet": [round(rr["disconnected_frac_of_valid"], 4) for rr in round_results],
-        "ROUNDS": e.ROUNDS, "ITERATIONS": e.ITERATIONS, "KL_COEF": e.KL_COEF,
+        "best_snapshot": best_snapshot,
+        "ROUNDS": e.ROUNDS, "ITERATIONS": e.ITERATIONS, "KL_COEF": e.KL_COEF, "EVAL_STEPS": e.EVAL_STEPS,
         "POSITIVE_ONLY": e.POSITIVE_ONLY, "ADVANTAGE_MODE": e.ADVANTAGE_MODE, "ROLLOUT_SIZE": e.ROLLOUT_SIZE,
     }
     e["results/summary"] = summary
@@ -311,22 +362,25 @@ def experiment(e: Experiment) -> None:
     e.commit_json("history.json", history)
     model.save(os.path.join(e.path, "gdpo_connected.ckpt"))
     e.log(f"SUMMARY disc(of valid) {summary['disc_of_valid_before']:.1%} -> "
-          f"{summary['disc_of_valid_after']:.1%} | ratchet={summary['ratchet']} | "
+          f"{summary['disc_of_valid_after']:.1%} (best={summary['best_snapshot']}) | ratchet={summary['ratchet']} | "
           f"valid {summary['valid_before']:.1%} -> {summary['valid_after']:.1%} | unique {summary['unique_after']:.1%}")
 
 
 @experiment.testing
 def testing(e: Experiment) -> None:
-    e.ROUNDS = 2
-    e.ITERATIONS = 3
+    e.ROUNDS = 1
+    e.ITERATIONS = 4
     e.ROLLOUT_SIZE = 8
     e.SAMPLE_STEPS = 20
     e.SUBSAMPLE_STEPS = 2
     e.MINIBATCH_SIZE = 4
+    e.CKPT_EVERY = 2
+    e.SELECT_BEST = True
+    e.SELECT_EVAL_SAMPLES = 16
     e.EVAL_SAMPLES = 16
     e.ROUND_EVAL_SAMPLES = 16
     e.EVAL_STEPS = 20
-    e.CKPT_EVERY = 0
+    e.SELECT_EVAL_STEPS = 20
 
 
 experiment.run_if_main()
