@@ -81,6 +81,10 @@ REDUCTION: str = "sum"
 ADVANTAGE_MODE: str = "grpo"
 # :param POSITIVE_ONLY: RAFT-style -- clamp advantage>=0, never push down bad endpoints.
 POSITIVE_ONLY: bool = False
+# :param LAMBDA_EDGE: weight of the edge (bond) term in the eager log-prob vs the node
+#     (atom-type) term. Connectivity is a pure bond property, so >1 focuses the gradient
+#     on bonds -- at the risk of valence errors (watch validity).
+LAMBDA_EDGE: float = 1.0
 # :param LR: AdamW learning rate.
 LR: float = 2e-5
 
@@ -269,7 +273,8 @@ def experiment(e: Experiment) -> None:
             model, reward, rollout_size=e.ROLLOUT_SIZE, sample_steps=e.SAMPLE_STEPS,
             subsample_steps=e.SUBSAMPLE_STEPS, minibatch_size=e.MINIBATCH_SIZE,
             eta=e.ETA, omega=e.OMEGA, time_distortion=e.TIME_DISTORTION, size_dist=size_dist,
-            advantage_mode=e.ADVANTAGE_MODE, reduction=e.REDUCTION, positive_only=e.POSITIVE_ONLY,
+            advantage_mode=e.ADVANTAGE_MODE, reduction=e.REDUCTION, lambda_edge=e.LAMBDA_EDGE,
+            positive_only=e.POSITIVE_ONLY,
             kl_coef=e.KL_COEF, kl_anchor=e.KL_ANCHOR, anchor_decay=e.ANCHOR_DECAY, kl_target=e.KL_TARGET,
             lr=e.LR, ema_decay=e.EMA_DECAY, device=device, seed=e.SEED + r,
         )
