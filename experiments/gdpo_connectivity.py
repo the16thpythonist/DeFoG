@@ -51,7 +51,15 @@ CKPT_PATH: str = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_best_model.ckp
 SEED: int = 0
 
 # --- training budget / rollout policy ---
-# :param ITERATIONS: number of GDPO updates.
+# :param ROUNDS: re-anchoring rounds. Each round fine-tunes ITERATIONS updates with a
+#     FIXED strong anchor to the round's starting weights, then the (EMA) result
+#     becomes the next round's base AND anchor. A fixed anchor per round prevents
+#     collapse; ratcheting it between rounds relaxes the floor -- the stable way to
+#     push below it (a continuous moving anchor collapses instead). ROUNDS=1 = a
+#     plain single fine-tune.
+ROUNDS: int = 1
+# :param ITERATIONS: GDPO updates PER round (keep short enough to stop before the
+#     over-optimization cliff, ~60-80 for kl_coef=0.3).
 ITERATIONS: int = 100
 # :param ROLLOUT_SIZE: K rollout molecules per iteration (bigger = smoother gradient).
 ROLLOUT_SIZE: int = 128
@@ -89,9 +97,11 @@ KL_TARGET: float = None
 EMA_DECAY: float = 0.9
 
 # --- evaluation / checkpointing ---
-# :param EVAL_SAMPLES / EVAL_STEPS: fresh molecules for the BEFORE/AFTER measurement.
+# :param EVAL_SAMPLES / EVAL_STEPS: fresh molecules for the BEFORE / final measurement.
 EVAL_SAMPLES: int = 2048
 EVAL_STEPS: int = 100
+# :param ROUND_EVAL_SAMPLES: cheaper eval after each intermediate round (the ratchet).
+ROUND_EVAL_SAMPLES: int = 512
 # :param CKPT_EVERY: save a pre-collapse policy snapshot every N iters (0=off).
 CKPT_EVERY: int = 20
 
@@ -230,44 +240,60 @@ def experiment(e: Experiment) -> None:
     save_grid(mols_b, smis_b, os.path.join(e.path, "grid_before.png"))
 
     reward = ConnectivityReward(domain)
-    trainer = GDPOTrainer(
-        model, reward, rollout_size=e.ROLLOUT_SIZE, sample_steps=e.SAMPLE_STEPS,
-        subsample_steps=e.SUBSAMPLE_STEPS, minibatch_size=e.MINIBATCH_SIZE,
-        eta=e.ETA, omega=e.OMEGA, time_distortion=e.TIME_DISTORTION, size_dist=size_dist,
-        advantage_mode=e.ADVANTAGE_MODE, reduction=e.REDUCTION, positive_only=e.POSITIVE_ONLY,
-        kl_coef=e.KL_COEF, kl_anchor=e.KL_ANCHOR, anchor_decay=e.ANCHOR_DECAY, kl_target=e.KL_TARGET,
-        lr=e.LR, ema_decay=e.EMA_DECAY, device=device, seed=e.SEED,
-    )
-
     ckpt_dir = os.path.join(e.path, "ckpts")
     if e.CKPT_EVERY > 0:
         os.makedirs(ckpt_dir, exist_ok=True)
     history = []
+    round_results = []
+    mols_a, smis_a = mols_b, smis_b
 
-    def on_iter(it, m):
-        m = {**m, "iter": it, **reward.last}
-        history.append(m)
-        for key in ("reward_mean", "connected_frac", "disconnected_frac", "invalid_frac",
-                    "kl", "kl_coef", "grad_norm"):
-            if key in m:
-                e.track(key, float(m[key]))
-        if it % 5 == 0 or it == e.ITERATIONS - 1:
-            e.log(f"  iter {it:3d} reward={m['reward_mean']:+.3f} conn={m.get('connected_frac',0):.2f} "
-                  f"disc={m.get('disconnected_frac',0):.2f} inval={m.get('invalid_frac',0):.2f} "
-                  f"gnorm={m['grad_norm']:.1f} klc={m.get('kl_coef',0):.3f}")
-        if e.CKPT_EVERY > 0 and (it + 1) % e.CKPT_EVERY == 0:
-            trainer.save(os.path.join(ckpt_dir, f"iter{it + 1:04d}.ckpt"))
-            e.commit_json("history.json", history)
+    for r in range(e.ROUNDS):
+        # Fresh trainer each round: its KL reference is a frozen copy of the CURRENT
+        # weights, so round r is anchored to round (r-1)'s result. A fixed strong
+        # anchor per round keeps it stable; ratcheting the anchor between rounds
+        # relaxes the floor -- the stable way down (a continuous moving anchor
+        # collapses). Fresh optimizer + EMA per round; the old trainer is GC'd.
+        trainer = GDPOTrainer(
+            model, reward, rollout_size=e.ROLLOUT_SIZE, sample_steps=e.SAMPLE_STEPS,
+            subsample_steps=e.SUBSAMPLE_STEPS, minibatch_size=e.MINIBATCH_SIZE,
+            eta=e.ETA, omega=e.OMEGA, time_distortion=e.TIME_DISTORTION, size_dist=size_dist,
+            advantage_mode=e.ADVANTAGE_MODE, reduction=e.REDUCTION, positive_only=e.POSITIVE_ONLY,
+            kl_coef=e.KL_COEF, kl_anchor=e.KL_ANCHOR, anchor_decay=e.ANCHOR_DECAY, kl_target=e.KL_TARGET,
+            lr=e.LR, ema_decay=e.EMA_DECAY, device=device, seed=e.SEED + r,
+        )
 
-    trainer.fit(e.ITERATIONS, on_iter=on_iter)
+        def on_iter(it, m, _r=r, _tr=trainer):
+            m = {**m, "round": _r, "iter": it, **reward.last}
+            history.append(m)
+            for key in ("reward_mean", "connected_frac", "disconnected_frac", "invalid_frac",
+                        "kl", "kl_coef", "grad_norm"):
+                if key in m:
+                    e.track(key, float(m[key]))
+            if it % 5 == 0 or it == e.ITERATIONS - 1:
+                e.log(f"  r{_r} iter {it:3d} reward={m['reward_mean']:+.3f} conn={m.get('connected_frac',0):.2f} "
+                      f"disc={m.get('disconnected_frac',0):.2f} inval={m.get('invalid_frac',0):.2f} "
+                      f"gnorm={m['grad_norm']:.1f} klc={m.get('kl_coef',0):.3f}")
+            if e.CKPT_EVERY > 0 and (it + 1) % e.CKPT_EVERY == 0:
+                _tr.save(os.path.join(ckpt_dir, f"round{_r}_iter{it + 1:04d}.ckpt"))
+                e.commit_json("history.json", history)
 
-    if trainer.ema is not None:
-        trainer.ema.copy_to(model)
-    after, mols_a, smis_a = evaluate(model, domain, e.EVAL_SAMPLES, e.EVAL_STEPS,
-                                     size_dist, device, seed=e.SEED + 1, **eval_kw)
+        trainer.fit(e.ITERATIONS, on_iter=on_iter)
+        if trainer.ema is not None:
+            trainer.ema.copy_to(model)  # model = round output -> next round's base + anchor
+
+        last = (r == e.ROUNDS - 1)
+        n_eval = e.EVAL_SAMPLES if last else e.ROUND_EVAL_SAMPLES
+        rev, mols_a, smis_a = evaluate(model, domain, n_eval, e.EVAL_STEPS,
+                                       size_dist, device, seed=e.SEED + 100 + r, **eval_kw)
+        round_results.append(rev)
+        e[f"results/round_{r}"] = rev
+        e.track("round_disc_of_valid", float(rev["disconnected_frac_of_valid"]))
+        e.track("round_valid", float(rev["valid_frac"]))
+        e.log(f"ROUND {r}: disc(of valid)={rev['disconnected_frac_of_valid']:.1%} "
+              f"valid={rev['valid_frac']:.1%} unique={rev['unique_frac_of_valid']:.1%} (n={n_eval})")
+
+    after = round_results[-1]
     e["results/after"] = after
-    e.log(f"AFTER:  valid={after['valid_frac']:.1%} disc(all)={after['disconnected_frac_all']:.1%} "
-          f"disc(of valid)={after['disconnected_frac_of_valid']:.1%} unique={after['unique_frac_of_valid']:.1%}")
     save_grid(mols_a, smis_a, os.path.join(e.path, "grid_after.png"))
     save_curves(history, before["disconnected_frac_all"], os.path.join(e.path, "reward_curve.png"))
 
@@ -276,26 +302,29 @@ def experiment(e: Experiment) -> None:
         "disc_of_valid_after": after["disconnected_frac_of_valid"],
         "valid_before": before["valid_frac"], "valid_after": after["valid_frac"],
         "unique_after": after["unique_frac_of_valid"],
-        "KL_COEF": e.KL_COEF, "POSITIVE_ONLY": e.POSITIVE_ONLY, "KL_ANCHOR": e.KL_ANCHOR,
-        "ADVANTAGE_MODE": e.ADVANTAGE_MODE, "ROLLOUT_SIZE": e.ROLLOUT_SIZE,
+        "ratchet": [round(rr["disconnected_frac_of_valid"], 4) for rr in round_results],
+        "ROUNDS": e.ROUNDS, "ITERATIONS": e.ITERATIONS, "KL_COEF": e.KL_COEF,
+        "POSITIVE_ONLY": e.POSITIVE_ONLY, "ADVANTAGE_MODE": e.ADVANTAGE_MODE, "ROLLOUT_SIZE": e.ROLLOUT_SIZE,
     }
     e["results/summary"] = summary
     e.commit_json("summary.json", summary)
     e.commit_json("history.json", history)
-    trainer.save(os.path.join(e.path, "gdpo_connected.ckpt"))
+    model.save(os.path.join(e.path, "gdpo_connected.ckpt"))
     e.log(f"SUMMARY disc(of valid) {summary['disc_of_valid_before']:.1%} -> "
-          f"{summary['disc_of_valid_after']:.1%} | valid {summary['valid_before']:.1%} -> "
-          f"{summary['valid_after']:.1%} | unique {summary['unique_after']:.1%}")
+          f"{summary['disc_of_valid_after']:.1%} | ratchet={summary['ratchet']} | "
+          f"valid {summary['valid_before']:.1%} -> {summary['valid_after']:.1%} | unique {summary['unique_after']:.1%}")
 
 
 @experiment.testing
 def testing(e: Experiment) -> None:
+    e.ROUNDS = 2
     e.ITERATIONS = 3
     e.ROLLOUT_SIZE = 8
     e.SAMPLE_STEPS = 20
     e.SUBSAMPLE_STEPS = 2
     e.MINIBATCH_SIZE = 4
     e.EVAL_SAMPLES = 16
+    e.ROUND_EVAL_SAMPLES = 16
     e.EVAL_STEPS = 20
     e.CKPT_EVERY = 0
 
