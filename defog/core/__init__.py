@@ -79,6 +79,17 @@ from .guidance import (
     AmortizedPropertyGuidanceModule,
 )
 from .feynman_kac import FeynmanKacSampler, JointGuidanceSampler, predict_clean
+from .rl import (
+    GDPOTrainer,
+    RolloutSampler,
+    RolloutBuffer,
+    Reward,
+    reward_from_energy,
+    eager_logprob,
+    kl_clean,
+    group_advantage,
+    EMA,
+)
 from .time_distortion import TimeDistorter
 from .transformer import GraphTransformer
 from .features import ExtraFeatures, RRWPFeatures
@@ -141,6 +152,16 @@ __all__ = [
     "FeynmanKacSampler",
     "JointGuidanceSampler",
     "predict_clean",
+    # GDPO reinforcement-learning fine-tuning (arXiv:2402.16302)
+    "GDPOTrainer",
+    "RolloutSampler",
+    "RolloutBuffer",
+    "Reward",
+    "reward_from_energy",
+    "eager_logprob",
+    "kl_clean",
+    "group_advantage",
+    "EMA",
     # Time distortion
     "TimeDistorter",
     # Neural network

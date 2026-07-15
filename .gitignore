@@ -189,3 +189,5 @@ experiments/_joint_logp_tpsa/
 experiments/_joint_smoke/
 experiments/_inpaint_logp/
 experiments/_inpaint_smoke/
+experiments/_gdpo_*/
+experiments/_gdpo_*.log

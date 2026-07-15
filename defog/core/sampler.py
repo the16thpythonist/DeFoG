@@ -78,16 +78,16 @@ class Sampler:
         return "Sampling"
 
     # ------------------------------------------------------------- step / loop
-    def _advance(self, t_int, X, E, y, node_mask, use_cfg):
-        """One CTMC step from time t_int -> t_int+1 (normalized, distorted).
+    def _step_times(self, t_int, bs, device):
+        """Distorted normalized ``(t_norm, s_norm)`` for outer step ``t_int``.
 
-        Includes the ``_pre_step`` hook and the absorbing-noise t=0 nudge, so it
-        reproduces the original monotone loop body exactly.
+        Single source of truth for the sampling-time schedule: a behavior-
+        preserving extraction of the former inline body of ``_advance`` so that
+        callers which need to reproduce the exact per-step time (e.g. the RL
+        rollout recorder in ``defog.core.rl``) share this schedule verbatim
+        instead of duplicating it.
         """
         model = self.model
-        bs = X.shape[0]
-        device = X.device
-
         t_array = t_int * torch.ones((bs, 1), device=device)
         t_norm = t_array / self.sample_steps
         s_norm = (t_array + 1) / self.sample_steps
@@ -97,6 +97,16 @@ class Sampler:
 
         t_norm = model.time_distorter.sample_ft(t_norm, self.time_distortion)
         s_norm = model.time_distorter.sample_ft(s_norm, self.time_distortion)
+        return t_norm, s_norm
+
+    def _advance(self, t_int, X, E, y, node_mask, use_cfg):
+        """One CTMC step from time t_int -> t_int+1 (normalized, distorted).
+
+        Includes the ``_pre_step`` hook and the absorbing-noise t=0 nudge, so it
+        reproduces the original monotone loop body exactly.
+        """
+        model = self.model
+        t_norm, s_norm = self._step_times(t_int, X.shape[0], X.device)
 
         X, E = self._pre_step(X, E, t_norm, node_mask)
         X, E, y = model.denoise_step(
