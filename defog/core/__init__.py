@@ -62,7 +62,7 @@ from .size_distribution import (
     ConditionalSizeDistribution,
 )
 from .rate_matrix import RateMatrixDesigner
-from .sampler import Sampler, InpaintingSampler, GuidedSampler
+from .sampler import Sampler, InpaintingSampler, GuidedSampler, RefinementSampler
 from .constraint import Constraint, SubgraphConstraint
 from .guidance import (
     DensityRatio,
@@ -133,6 +133,7 @@ __all__ = [
     "Sampler",
     "InpaintingSampler",
     "GuidedSampler",
+    "RefinementSampler",
     # Constraints (inpainting)
     "Constraint",
     "SubgraphConstraint",

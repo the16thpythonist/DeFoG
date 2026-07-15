@@ -21,7 +21,9 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from .data import PlaceHolder, dense_to_pyg
+from torch_geometric.data import Batch
+
+from .data import PlaceHolder, dense_to_pyg, to_dense
 
 
 class Sampler:
@@ -64,6 +66,11 @@ class Sampler:
         # Generic per-step rectifier of the predicted marginals (external guidance
         # rides on this; None -> unmodified, behavior-preserving for all callers).
         self.posterior_transform = posterior_transform
+        # Schedule offset: the denoising loop runs steps ``start_step..sample_steps``.
+        # 0 (the default) is full generation from noise; a refinement sampler that
+        # seeds from a partially-noised guess sets this > 0 to skip the early,
+        # high-noise steps. Behavior-preserving for every existing caller.
+        self.start_step = 0
 
     # ------------------------------------------------------------------ hooks
     def _pre_step(self, X, E, t_norm, node_mask):
@@ -118,13 +125,15 @@ class Sampler:
         return X, E, y
 
     def _run_loop(self, X, E, y, node_mask, use_cfg, show_progress, on_step=None):
-        """Monotone denoising loop t=0..sample_steps-1. Returns (X, E, y).
+        """Monotone denoising loop t=start_step..sample_steps-1. Returns (X, E, y).
 
         ``on_step(step, total, phase)`` (optional) is invoked once per OUTER step
         with a 1-based, monotonic step index — added for external progress
-        reporting; no behavior change when ``on_step`` is None.
+        reporting; no behavior change when ``on_step`` is None. ``start_step`` is 0
+        for full generation; a refinement sampler sets it > 0 to denoise only the
+        tail of the schedule from a partially-noised guess.
         """
-        iterator = range(self.sample_steps)
+        iterator = range(self.start_step, self.sample_steps)
         if show_progress:
             iterator = tqdm(iterator, desc=self._desc())
         for t_int in iterator:
@@ -132,6 +141,51 @@ class Sampler:
             if on_step is not None:
                 on_step(t_int + 1, self.sample_steps, "sampling")
         return X, E, y
+
+    # ------------------------------------------------- re-noising / time utils
+    def _renoise_toward_current(self, X, E, tau, node_mask, limit_dist):
+        """Re-noise the whole graph toward its own current one-hot at level tau:
+        sample from ``tau*onehot(current) + (1-tau)*limit``. Edges sampled on the
+        upper triangle then mirrored; padding re-masked.
+
+        This is DeFoG's own forward interpolation ``p(x_tau | x_1=current)``. It is
+        the shared primitive behind both RePaint-style time-travel (re-noise the
+        running estimate mid-loop) and SDEdit-style refinement (re-noise a guess
+        graph once, before denoising its tail), so it lives on the base sampler.
+        """
+        bs, n, dx = X.shape
+        de = E.shape[-1]
+        device = X.device
+        limX = limit_dist.X.to(device).float()
+        limE = limit_dist.E.to(device).float()
+
+        probX = tau * X + (1.0 - tau) * limX.view(1, 1, dx)
+        idxX = probX.clamp_min(0).reshape(bs * n, dx).multinomial(1).reshape(bs, n)
+        Xn = F.one_hot(idxX, dx).float()
+
+        probE = tau * E + (1.0 - tau) * limE.view(1, 1, 1, de)
+        idxE = probE.clamp_min(0).reshape(bs * n * n, de).multinomial(1).reshape(bs, n, n)
+        iu = torch.triu(torch.ones(n, n, device=device), diagonal=1).bool()
+        idxE_sym = torch.zeros(bs, n, n, dtype=idxE.dtype, device=device)
+        idxE_sym[:, iu] = idxE[:, iu]
+        idxE_sym = idxE_sym + idxE_sym.transpose(1, 2)
+        En = F.one_hot(idxE_sym.long(), de).float()
+
+        masked = PlaceHolder(X=Xn, E=En, y=None).mask(node_mask)
+        return masked.X, masked.E
+
+    def _distorted_time(self, t_int):
+        """Distorted normalized time (scalar float) for integer step ``t_int`` --
+        the noise level the loop assumes the running state sits at when it enters
+        step ``t_int``. Shared by time-travel jumps and refinement seeding."""
+        model = self.model
+        t_norm = t_int / self.sample_steps
+        if model.limit_dist.noise_type == "absorbing" and t_int == 0:
+            t_norm = t_norm + 1e-6
+        t_norm = model.time_distorter.sample_ft(
+            torch.tensor([[t_norm]], dtype=torch.float32), self.time_distortion
+        )
+        return float(t_norm.reshape(-1)[0].item())
 
     # ----------------------------------------------------------------- sample
     @torch.no_grad()
@@ -231,42 +285,6 @@ class InpaintingSampler(Sampler):
         return self.constraint.project(X, E, 1.0, node_mask, self.model.limit_dist)
 
     # ------------------------------------------------------- time-travel loop
-    def _renoise_toward_current(self, X, E, tau, node_mask, limit_dist):
-        """Re-noise the whole graph toward its own current one-hot at level tau:
-        sample from tau*onehot(current) + (1-tau)*limit. Edges sampled on the
-        upper triangle then mirrored; padding re-masked."""
-        bs, n, dx = X.shape
-        de = E.shape[-1]
-        device = X.device
-        limX = limit_dist.X.to(device).float()
-        limE = limit_dist.E.to(device).float()
-
-        probX = tau * X + (1.0 - tau) * limX.view(1, 1, dx)
-        idxX = probX.clamp_min(0).reshape(bs * n, dx).multinomial(1).reshape(bs, n)
-        Xn = F.one_hot(idxX, dx).float()
-
-        probE = tau * E + (1.0 - tau) * limE.view(1, 1, 1, de)
-        idxE = probE.clamp_min(0).reshape(bs * n * n, de).multinomial(1).reshape(bs, n, n)
-        iu = torch.triu(torch.ones(n, n, device=device), diagonal=1).bool()
-        idxE_sym = torch.zeros(bs, n, n, dtype=idxE.dtype, device=device)
-        idxE_sym[:, iu] = idxE[:, iu]
-        idxE_sym = idxE_sym + idxE_sym.transpose(1, 2)
-        En = F.one_hot(idxE_sym.long(), de).float()
-
-        masked = PlaceHolder(X=Xn, E=En, y=None).mask(node_mask)
-        return masked.X, masked.E
-
-    def _jump_back_time(self, t_back_int):
-        """Distorted normalized time for integer step t_back_int (scalar tau)."""
-        model = self.model
-        t_norm = t_back_int / self.sample_steps
-        if model.limit_dist.noise_type == "absorbing" and t_back_int == 0:
-            t_norm = t_norm + 1e-6
-        t_norm = model.time_distorter.sample_ft(
-            torch.tensor([[t_norm]], dtype=torch.float32), self.time_distortion
-        )
-        return float(t_norm.reshape(-1)[0].item())
-
     def _run_loop(self, X, E, y, node_mask, use_cfg, show_progress, on_step=None):
         if not self.resample:
             return super()._run_loop(X, E, y, node_mask, use_cfg, show_progress, on_step=on_step)
@@ -291,7 +309,7 @@ class InpaintingSampler(Sampler):
             if (t_int % self.jump_interval == 0) and (t_int < N):
                 t_back = max(0, t_int - j)
                 for _ in range(self.n_resample):
-                    tau = self._jump_back_time(t_back)
+                    tau = self._distorted_time(t_back)
                     X, E = self._renoise_toward_current(X, E, tau, node_mask, limit)
                     # re-pin the core at the jumped-back noise level
                     X, E = self.constraint.project(
@@ -359,3 +377,132 @@ class GuidedSampler(Sampler):
 
     def _desc(self) -> str:
         return "Guided sampling"
+
+
+class RefinementSampler(Sampler):
+    """
+    SDEdit-style refinement: seed the denoiser with a *guess* graph instead of
+    pure noise, so the model only walks it the last few steps onto its learned
+    (valid) data manifold -- "the last few meters toward validity".
+
+    Given rough guess graphs (e.g. from a deterministic first-guess algorithm),
+    each guess is treated as a clean graph ``x_1``, partially re-noised to level
+    ``t_start`` via the model's own forward interpolation ``p(x_tau | x_1=guess)``
+    (the SAME primitive RePaint time-travel uses -- ``_renoise_toward_current``),
+    then denoised over only the *tail* of the schedule (steps
+    ``start_step .. sample_steps-1``, where ``start_step = round(t_start *
+    sample_steps)``).
+
+    ``t_start`` in (0, 1) is the faithfulness<->validity knob (SDEdit's noise
+    ratio):
+
+    - near 1  -> inject little noise -> few steps -> stay close to the guess
+                 (light polish, keeps its structure and its remaining flaws);
+    - lower   -> inject more noise -> more steps -> more freedom to restructure
+                 (heavier repair, drifts further from the guess);
+    - -> 0    -> discards the guess; ~equivalent to full generation from noise.
+
+    The node *count* of each guess is preserved (this is refinement, not the
+    node-growing inpainting -- use :class:`InpaintingSampler` to add nodes around
+    a frozen core). Node types and edges are both free to change.
+
+    Because the reverse process is a stochastic CTMC, each call refines the same
+    guess differently -- draw several and keep the best under your own validity
+    check (a cheap ensemble of repairs). Composes with target guidance (``omega``),
+    stochasticity (``eta``), and per-step guidance (``posterior_transform``) as
+    usual; all inherited.
+
+    Guess format: a list of PyG ``Data`` with one-hot ``x`` of width
+    ``num_node_classes`` and one-hot ``edge_attr`` of width ``num_edge_classes``
+    (exactly what the model emits and what ``dense_to_pyg`` produces), undirected
+    (both directions in ``edge_index``). Each guess must have <= ``max_nodes``.
+    """
+
+    def __init__(self, model, *, t_start: float = 0.7, **kwargs):
+        super().__init__(model, **kwargs)
+        if not (0.0 < t_start < 1.0):
+            raise ValueError(f"t_start must be in (0, 1); got {t_start}")
+        self.t_start = float(t_start)
+        # High trust -> start late in the schedule -> denoise few steps. Clamp to
+        # [1, sample_steps-1]: always run >=1 step, and never step 0 (whose t=0
+        # absorbing-noise nudge would desync from the seeded noise level).
+        k = round(self.t_start * self.sample_steps)
+        self.start_step = int(min(max(k, 1), self.sample_steps - 1))
+
+    def _desc(self) -> str:
+        return "Refining"
+
+    def _encode_guesses(self, guesses, device):
+        """List of PyG ``Data`` guesses -> dense one-hot ``(X, E, node_mask,
+        n_nodes)`` in the model's class space. Validates class widths and sizes."""
+        if not isinstance(guesses, (list, tuple)) or len(guesses) == 0:
+            raise TypeError("guesses must be a non-empty list of PyG Data objects")
+        batch = Batch.from_data_list(list(guesses)).to(device)
+        dense, node_mask = to_dense(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+        X, E = dense.X.float(), dense.E.float()
+
+        dx, de = self.model.num_node_classes, self.model.num_edge_classes
+        if X.shape[-1] != dx:
+            raise ValueError(
+                f"guess node features have {X.shape[-1]} classes but the model "
+                f"expects num_node_classes={dx} (one-hot). Encode guesses in the "
+                f"model's class space."
+            )
+        if E.shape[-1] != de:
+            raise ValueError(
+                f"guess edge features have {E.shape[-1]} classes but the model "
+                f"expects num_edge_classes={de} (one-hot, incl. the no-edge class)."
+            )
+        n_nodes = node_mask.sum(-1).long()
+        if int(n_nodes.max().item()) > self.model.max_nodes:
+            raise ValueError(
+                f"a guess has {int(n_nodes.max().item())} nodes, exceeding the "
+                f"model's max_nodes={self.model.max_nodes}."
+            )
+        return X, E, node_mask, n_nodes
+
+    @torch.no_grad()
+    def refine(
+        self,
+        guesses,
+        condition: Optional[torch.Tensor] = None,
+        device: Optional[torch.device] = None,
+        show_progress: bool = True,
+        on_step: Optional[Callable] = None,
+    ):
+        """Refine ``guesses`` (list of PyG ``Data``) toward the model's manifold.
+
+        Returns a list of refined PyG ``Data``, one per guess, each with the same
+        node count as its guess. ``condition`` (shape ``(len(guesses), cond_dim)``)
+        is used for conditional models exactly as in ``model.sample``.
+        """
+        model = self.model
+
+        # Force eval mode so dropout is inert during denoising; restore on exit.
+        was_training = model.training
+        model.eval()
+        device = device if device is not None else model.device
+
+        # Guess graphs -> dense one-hot seed state.
+        X1, E1, node_mask, n_nodes = self._encode_guesses(guesses, device)
+        bs = X1.shape[0]
+
+        # Partially re-noise the guess to the start-step noise level:
+        # p(x_tau | x_1 = guess). tau matches what step `start_step` assumes.
+        tau = self._distorted_time(self.start_step)
+        X, E = self._renoise_toward_current(X1, E1, tau, node_mask, model.limit_dist)
+
+        # Conditioning (shared with the noise-seeded generation path).
+        y, y_raw, use_cfg = model._prepare_condition(
+            bs, condition, self.guidance_scale, device
+        )
+
+        X, E, y = self._run_loop(X, E, y, node_mask, use_cfg, show_progress, on_step=on_step)
+        X, E = self._post_loop(X, E, node_mask)
+
+        X, E, _ = model.limit_dist.ignore_virtual_classes(X, E)
+        samples = dense_to_pyg(X, E, y_raw, node_mask, n_nodes)
+
+        if was_training:
+            model.train()
+        return samples

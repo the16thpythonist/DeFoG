@@ -523,6 +523,30 @@ class DeFoGModel(pl.LightningModule):
 
         # Conditioning embedding (y is threaded through the network; y_raw is the
         # original condition attached to the output graphs).
+        y, y_raw, use_cfg = self._prepare_condition(
+            num_samples, condition, guidance_scale, device
+        )
+
+        return node_mask, n_nodes, X, E, y, y_raw, use_cfg
+
+    def _prepare_condition(
+        self,
+        num_samples: int,
+        condition: Optional[torch.Tensor],
+        guidance_scale: float,
+        device: torch.device,
+    ):
+        """Build the conditioning embedding for one generation run.
+
+        Returns ``(y, y_raw, use_cfg)``: ``y`` is the network-threaded embedding,
+        ``y_raw`` the original condition attached to output graphs (``None`` when
+        unconditional), and ``use_cfg`` whether classifier-free guidance is active.
+
+        Factored out of :meth:`_prepare_generation` so orchestrators that build
+        their own initial state (e.g. the refinement sampler, which seeds from a
+        guess graph instead of fresh noise) reuse the exact same conditioning
+        logic instead of duplicating it.
+        """
         use_cfg = False
         y_raw = None
         if self.cond_dim > 0:
@@ -538,8 +562,7 @@ class DeFoGModel(pl.LightningModule):
                 y = self._embed_condition(None, bs=num_samples, device=device)
         else:
             y = torch.zeros(num_samples, 0, device=device)
-
-        return node_mask, n_nodes, X, E, y, y_raw, use_cfg
+        return y, y_raw, use_cfg
 
     @torch.no_grad()
     def sample(
