@@ -319,6 +319,87 @@ def test_repeated_updates_raise_objective_on_frozen_rollout(small_model):
 # ======================================================================
 # reward_from_energy adapter
 # ======================================================================
+def test_optional_features_default_to_noop(small_model):
+    # all new features off by default -> behavior identical to before
+    t = GDPOTrainer(small_model, edge_count_reward, kl_coef=0.0, ema_decay=None)
+    assert t.positive_only is False
+    assert t.kl_anchor == "fixed"
+    assert t.kl_target is None
+    assert t._anchor is None
+
+
+def test_positive_only_clamps_and_still_learns(small_model):
+    torch.manual_seed(20)
+    model = small_model
+    trainer = GDPOTrainer(
+        model, edge_count_reward, rollout_size=32, sample_steps=5,
+        subsample_steps=None, eta=0.0, time_distortion="identity",
+        advantage_mode="grpo", positive_only=True, kl_coef=0.0,
+        lr=3e-3, ema_decay=None, seed=20,
+    )
+    buf = trainer.rollout()
+    # GRPO produces negatives; positive-only must clamp them out of the loss
+    assert (buf.advantage < 0).any()
+    assert (buf.advantage.clamp_min(0.0) >= 0).all()
+
+    @torch.no_grad()
+    def eval_reward():
+        s = RolloutSampler(model, sample_steps=5)
+        s.sample(64, device=torch.device("cpu"), show_progress=False)
+        return float(edge_count_reward(s.endpoint[0], s.endpoint[1], s.end_node_mask).mean())
+
+    before = eval_reward()
+    trainer.fit(30)
+    after = eval_reward()
+    # positive-only still increases the toy reward (only pushes good endpoints up)
+    assert after > before, f"positive-only did not learn: {before:.2f} -> {after:.2f}"
+
+
+def test_moving_anchor_follows_policy_fixed_stays_frozen(small_model):
+    torch.manual_seed(21)
+    model = small_model
+    init = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    def max_dev(sd):
+        return max(float((sd[k] - init[k]).abs().max())
+                   for k in init if sd[k].dtype.is_floating_point)
+
+    # moving anchor: the reference should drift toward the (changing) policy
+    mov = GDPOTrainer(model, edge_count_reward, rollout_size=16, sample_steps=5,
+                      subsample_steps=None, eta=0.0, time_distortion="identity",
+                      kl_coef=0.1, kl_anchor="moving", anchor_decay=0.5,
+                      lr=5e-3, ema_decay=None, seed=21)
+    assert mov._anchor is not None
+    mov.fit(6)
+    assert max_dev(mov.ref.state_dict()) > 1e-5  # ref moved away from init
+
+
+def test_fixed_anchor_reference_is_frozen(small_model):
+    torch.manual_seed(22)
+    model = small_model
+    fix = GDPOTrainer(model, edge_count_reward, rollout_size=16, sample_steps=5,
+                      subsample_steps=None, eta=0.0, time_distortion="identity",
+                      kl_coef=0.1, kl_anchor="fixed", lr=5e-3, ema_decay=None, seed=22)
+    assert fix._anchor is None
+    ref0 = {k: v.detach().clone() for k, v in fix.ref.state_dict().items()}
+    fix.fit(6)
+    ref1 = fix.ref.state_dict()
+    # a fixed anchor never updates the reference
+    assert all(torch.equal(ref0[k], ref1[k]) for k in ref0)
+    assert all(not p.requires_grad for p in fix.ref.parameters())
+
+
+def test_adaptive_kl_moves_coef(small_model):
+    torch.manual_seed(23)
+    model = small_model
+    t = GDPOTrainer(model, edge_count_reward, rollout_size=16, sample_steps=5,
+                    subsample_steps=None, eta=0.0, time_distortion="identity",
+                    kl_coef=0.5, kl_target=0.01, lr=3e-3, ema_decay=None, seed=23)
+    t.fit(5)
+    # the controller nudges kl_coef away from its initial value toward the target
+    assert abs(t.kl_coef - 0.5) > 1e-4
+
+
 def test_reward_from_energy_floors_invalid():
     class FakeEnergy:
         invalid = 1e3

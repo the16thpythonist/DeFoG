@@ -339,9 +339,21 @@ class GDPOTrainer:
         advantage_mode: str = "grpo",
         advantage_clip: Optional[float] = 5.0,
         advantage_eps: float = 1e-4,
+        # positive-only / RAFT: clamp the advantage to >=0 so the loss NEVER pushes
+        # down low-reward endpoints (no unlikelihood term -> no atom-soup collapse).
+        # For a binary reward this is exactly reward-ranked filtered fine-tuning; it
+        # also makes the gradient fade as the reward saturates. Optional, off by default.
+        positive_only: bool = False,
         # KL to reference
         kl_coef: float = 0.0,
         ref_model=None,
+        # KL anchor: "fixed" = frozen initial weights (a floor pinned to pretrained);
+        # "moving" = a slow EMA of the policy (a trust region that FOLLOWS the policy),
+        # letting it drift far from pretrained without collapsing. Optional.
+        kl_anchor: str = "fixed",
+        anchor_decay: float = 0.99,
+        # adaptive KL: if set, nudge kl_coef each step toward this target KL. Optional.
+        kl_target: Optional[float] = None,
         # optim
         lr: float = 1e-5,
         weight_decay: float = 1e-5,
@@ -368,7 +380,11 @@ class GDPOTrainer:
         self.advantage_mode = advantage_mode
         self.advantage_clip = advantage_clip
         self.advantage_eps = advantage_eps
+        self.positive_only = bool(positive_only)
         self.kl_coef = float(kl_coef)
+        self.kl_anchor = kl_anchor
+        self.anchor_decay = anchor_decay
+        self.kl_target = kl_target
         self.grad_clip = grad_clip
         self.device = device if device is not None else model.device
         self.seed = seed
@@ -376,12 +392,17 @@ class GDPOTrainer:
         self.opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         self.ema = EMA(model, ema_decay) if ema_decay else None
 
-        # Frozen reference for the KL term: rebuild from hyperparameters and copy
-        # weights (NOT copy.deepcopy -- avoids duplicating a live LightningModule
-        # with a stale trainer/logger). Only allocated when the KL is on.
+        # Reference for the KL term. Built from hyperparameters + weight copy (NOT
+        # copy.deepcopy -- avoids duplicating a live LightningModule). Only when KL
+        # is on. For a MOVING anchor, an extra EMA of the policy is tracked and its
+        # weights are synced into the reference each step (trust region that follows
+        # the policy), so the reference is not frozen at the initial weights.
         self.ref = None
+        self._anchor = None
         if self.kl_coef > 0:
             self.ref = ref_model if ref_model is not None else self._frozen_reference()
+            if self.kl_anchor == "moving":
+                self._anchor = EMA(model, self.anchor_decay)
 
     def _frozen_reference(self):
         cls = type(self.model)
@@ -458,7 +479,10 @@ class GDPOTrainer:
         # policy gradient biased (behavior != scored != deployed policy).
         model.eval()
 
-        A = buf.advantage
+        # positive-only / RAFT: drop the negative-advantage (unlikelihood) half of
+        # the gradient, so we only ever push UP good endpoints, never push mass into
+        # invalid space. No-op when off.
+        A = buf.advantage.clamp_min(0.0) if self.positive_only else buf.advantage
         K = A.shape[0]
         n_states = max(1, len(buf.states))
         mb = self.minibatch_size or K
@@ -499,11 +523,25 @@ class GDPOTrainer:
         self._iter = getattr(self, "_iter", 0)
         buf = self.rollout()
         metrics = self.update(buf)
+
+        # moving anchor: advance the EMA trust region and sync it into the KL
+        # reference, so subsequent KLs are measured against a recent version of the
+        # policy rather than the frozen initial weights.
+        if self._anchor is not None:
+            self._anchor.update(self.model)
+            self.ref.load_state_dict(self._anchor.state_dict())
+        # adaptive KL controller: multiplicatively nudge kl_coef toward kl_target.
+        if self.kl_target is not None and self.kl_coef > 0:
+            err = metrics.get("kl", 0.0) / max(self.kl_target, 1e-8)
+            self.kl_coef = float(min(max(self.kl_coef * (1.0 + 0.1 * (err - 1.0)), 1e-4), 1e3))
+
         r = buf.reward
         metrics.update({
             "reward_mean": float(r.mean()), "reward_std": float(r.std()),
             "reward_min": float(r.min()), "reward_max": float(r.max()),
             "adv_std": float(buf.advantage.std()),
+            "pos_frac": float((buf.advantage > 0).float().mean()),
+            "kl_coef": self.kl_coef,
         })
         self._iter += 1
         return metrics
