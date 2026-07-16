@@ -120,6 +120,10 @@ SELECT_BEST: bool = False
 # :param SELECT_EVAL_SAMPLES: samples per snapshot during best-snapshot ranking (cheaper
 #     than the full final eval).
 SELECT_EVAL_SAMPLES: int = 1024
+# :param SELECT_INCLUDE_INPUT: also rank the INPUT checkpoint as a best-snapshot
+#     candidate, so a CONTINUATION run can never ship a model worse than what it started
+#     from (worst case it keeps the input). Off for from-pretrained runs.
+SELECT_INCLUDE_INPUT: bool = False
 
 # NOTE: __DEBUG__ must be False when submitting a sweep -- debug mode writes to a
 # single overwriteable folder, so parallel runs would clobber each other.
@@ -327,19 +331,27 @@ def experiment(e: Experiment) -> None:
                                size_dist, device, seed=e.SEED + 200, **eval_kw)
             return r
 
-        # rank ALL candidates (final included) at the SAME cheap step count for fairness
-        fin = rank_eval(model)
-        e.log(f"  final: disc(of valid)={fin['disconnected_frac_of_valid']:.1%} valid={fin['valid_frac']:.1%}")
-        best = (fin["disconnected_frac_of_valid"], fin["valid_frac"], None)
-        for sp in cands:
-            cm = DeFoGModel.load(sp, device="cpu").to(device)
-            rev = rank_eval(cm)
-            e.log(f"  {os.path.basename(sp)}: disc(of valid)={rev['disconnected_frac_of_valid']:.1%} "
-                  f"valid={rev['valid_frac']:.1%}")
-            if rev["valid_frac"] >= val_floor and rev["disconnected_frac_of_valid"] < best[0]:
-                best = (rev["disconnected_frac_of_valid"], rev["valid_frac"], sp)
-            del cm
+        # rank ALL candidates at the SAME cheap step count for fairness. Optionally seed
+        # from the INPUT checkpoint (continuation safety: never ship worse than input).
+        best = None
+        if e.SELECT_INCLUDE_INPUT:
+            inp = DeFoGModel.load(e.CKPT_PATH, device="cpu").to(device)
+            ir = rank_eval(inp)
+            e.log(f"  input: disc(of valid)={ir['disconnected_frac_of_valid']:.1%} valid={ir['valid_frac']:.1%}")
+            best = (ir["disconnected_frac_of_valid"], ir["valid_frac"], e.CKPT_PATH)
+            del inp
             torch.cuda.empty_cache()
+        for tag, path in [("final", None)] + [(os.path.basename(sp), sp) for sp in cands]:
+            if path is None:
+                rev = rank_eval(model)
+            else:
+                cm = DeFoGModel.load(path, device="cpu").to(device)
+                rev = rank_eval(cm)
+                del cm
+                torch.cuda.empty_cache()
+            e.log(f"  {tag}: disc(of valid)={rev['disconnected_frac_of_valid']:.1%} valid={rev['valid_frac']:.1%}")
+            if best is None or (rev["valid_frac"] >= val_floor and rev["disconnected_frac_of_valid"] < best[0]):
+                best = (rev["disconnected_frac_of_valid"], rev["valid_frac"], path)
         best_snapshot = os.path.basename(best[2]) if best[2] else "final"
         e.log(f"best-snapshot: WINNER = {best_snapshot} (rank disc {best[0]:.1%}, valid {best[1]:.1%})")
         if best[2] is not None:  # a snapshot beat the final -> load it as the output
