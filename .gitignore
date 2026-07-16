@@ -191,3 +191,6 @@ experiments/_inpaint_logp/
 experiments/_inpaint_smoke/
 experiments/_gdpo_*/
 experiments/_gdpo_*.log
+
+# structural-sanity reference cache (large, regenerated on demand)
+data/.sanity_ref_*.json
