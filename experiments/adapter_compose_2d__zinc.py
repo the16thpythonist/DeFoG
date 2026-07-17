@@ -45,8 +45,11 @@ BASE_CKPT: str = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.c
 LOGP_CKPT: str = ""             # path to logp_adapter.ckpt ("" -> build fresh, smoke only)
 TPSA_CKPT: str = ""             # path to tpsa_adapter.ckpt
 
-COMPOSE_MODE: str = "mean"      # recommended for N>1
-WEIGHT: float = 2.0             # per-branch guidance weight
+# Single-property eval found w=1 (exact conditional) is the accurate sweet spot;
+# w>1 overshoots. For a 2-branch joint, PRODUCT mode at w=1 each = the principled
+# joint conditional p(x|logP,TPSA) (sum of log-ratios); mean-mode would under-steer.
+COMPOSE_MODE: str = "product"
+WEIGHT: float = 1.0             # per-branch guidance weight
 N_PER_COMBO: int = 200
 EVAL_STEPS: int = 250
 ETA: float = 5.0
