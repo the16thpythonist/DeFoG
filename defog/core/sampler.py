@@ -66,6 +66,9 @@ class Sampler:
         # Generic per-step rectifier of the predicted marginals (external guidance
         # rides on this; None -> unmodified, behavior-preserving for all callers).
         self.posterior_transform = posterior_transform
+        # Frozen-base adapter composition (product-of-experts CFG-adapters). Only
+        # AdaptedSampler sets this; None -> byte-identical legacy denoise path.
+        self.composition = None
         # Schedule offset: the denoising loop runs steps ``start_step..sample_steps``.
         # 0 (the default) is full generation from noise; a refinement sampler that
         # seeds from a partially-noised guess sets this > 0 to skip the early,
@@ -121,6 +124,7 @@ class Sampler:
             guidance_scale=self.guidance_scale if use_cfg else None,
             eta=self.eta, omega=self.omega,
             posterior_transform=self.posterior_transform,
+            composition=self.composition,
         )
         return X, E, y
 
@@ -377,6 +381,27 @@ class GuidedSampler(Sampler):
 
     def _desc(self) -> str:
         return "Guided sampling"
+
+
+class AdaptedSampler(Sampler):
+    """Sampling under a frozen-base adapter composition (product-of-experts CFG).
+
+    Thin sugar over :class:`Sampler`, analogous to :class:`GuidedSampler`: it holds
+    an :class:`~defog.core.adapter.AdapterComposition` and threads it into every
+    ``denoise_step`` unconditionally (NOT gated by ``use_cfg``, which is always
+    ``False`` for the ``cond_dim=0`` frozen bases this targets). Everything else --
+    eta/omega, time distortion, posterior_transform, size distribution -- is
+    inherited unchanged, so it also composes with inpainting/refinement.
+    """
+
+    def __init__(self, model, composition, **kwargs):
+        super().__init__(model, **kwargs)
+        for br in composition.branches:
+            br.adapter.check_compatible(model)   # fail fast on dim/n_layers/base mismatch
+        self.composition = composition
+
+    def _desc(self) -> str:
+        return f"Adapted[{len(self.composition)}x,{self.composition.mode}]"
 
 
 class RefinementSampler(Sampler):

@@ -194,3 +194,4 @@ experiments/_gdpo_*.log
 
 # structural-sanity reference cache (large, regenerated on demand)
 data/.sanity_ref_*.json
+ckpts/

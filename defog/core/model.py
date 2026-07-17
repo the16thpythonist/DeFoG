@@ -285,6 +285,7 @@ class DeFoGModel(pl.LightningModule):
         noisy_data: Dict[str, torch.Tensor],
         extra_data: PlaceHolder,
         node_mask: torch.Tensor,
+        cond_modulation=None,
     ) -> PlaceHolder:
         """
         Forward pass through the transformer.
@@ -293,6 +294,8 @@ class DeFoGModel(pl.LightningModule):
             noisy_data: Dict with "X_t", "E_t", "y_t", "t", "node_mask"
             extra_data: PlaceHolder with extra features
             node_mask: Boolean mask (bs, n)
+            cond_modulation: Optional per-layer gated-FiLM Modulation from a
+                frozen-base adapter (see defog.core.adapter). None -> unchanged.
 
         Returns:
             PlaceHolder with predicted marginals
@@ -300,7 +303,7 @@ class DeFoGModel(pl.LightningModule):
         X = torch.cat((noisy_data["X_t"], extra_data.X), dim=2).float()
         E = torch.cat((noisy_data["E_t"], extra_data.E), dim=3).float()
         y = torch.hstack((noisy_data["y_t"], extra_data.y)).float()
-        return self.model(X, E, y, node_mask)
+        return self.model(X, E, y, node_mask, modulation=cond_modulation)
 
     def training_step(self, batch: Batch, batch_idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -789,6 +792,7 @@ class DeFoGModel(pl.LightningModule):
         eta: Optional[float] = None,
         omega: Optional[float] = None,
         posterior_transform: Optional[Callable] = None,
+        composition=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample z_s given z_t (one CTMC denoising step) -- the learned dynamics.
@@ -836,6 +840,19 @@ class DeFoGModel(pl.LightningModule):
             self.rate_matrix_designer.eta = eta
         if omega is not None:
             self.rate_matrix_designer.omega = omega
+
+        # Frozen-base adapter composition (N-branch product-of-experts). A None or
+        # empty composition falls through to the untouched legacy body below, so
+        # the default path is byte-identical to before this feature. Joint use with
+        # legacy input-CFG (guidance_scale) is out of scope for v1.
+        if composition is not None and len(composition) > 0:
+            assert guidance_scale is None, (
+                "composition (adapter CFG) and guidance_scale (legacy input-CFG) "
+                "cannot both be set in one denoise_step (v1 scope)."
+            )
+            return self._denoise_step_composed(
+                t, s, X_t, E_t, y_t, node_mask, composition, posterior_transform
+            )
 
         # Create noisy data dict
         noisy_data = {
@@ -937,6 +954,109 @@ class DeFoGModel(pl.LightningModule):
 
     # Backwards-compatible alias for the pre-refactor private name.
     _sample_step = denoise_step
+
+    @torch.no_grad()
+    def _denoise_step_composed(self, t, s, X_t, E_t, y_t, node_mask, composition,
+                               posterior_transform=None):
+        """One CTMC denoise step under an N-branch adapter composition (product-of-
+        experts). Runs a SINGLE batched (N+1)*bs forward (group 0 = frozen-base
+        unconditional bypass; groups 1..N = each adapter's modulation), blends the
+        per-branch rate matrices geometrically in log space, and at the terminal
+        step decodes the blended clean-graph marginals. eta/omega are assumed
+        already set on the rate-matrix designer by the caller."""
+        bs, n, _ = X_t.shape
+        device = X_t.device
+        dt = (s - t)[0]
+        rep = len(composition) + 1
+
+        # extra features depend only on X_t,E_t,t -> compute ONCE, tile across groups
+        base_noisy = {"X_t": X_t, "E_t": E_t, "y_t": y_t, "t": t, "node_mask": node_mask}
+        extra = self._compute_extra_data(base_noisy)
+        extra_b = PlaceHolder(
+            X=extra.X.repeat(rep, 1, 1),
+            E=extra.E.repeat(rep, 1, 1, 1),
+            y=extra.y.repeat(rep, 1),
+        )
+        nd = {
+            "X_t": X_t.repeat(rep, 1, 1),
+            "E_t": E_t.repeat(rep, 1, 1, 1),
+            "y_t": y_t.repeat(rep, 1),
+            "t": t.repeat(rep, 1),
+            "node_mask": node_mask.repeat(rep, 1),
+        }
+        mod = composition.build_modulation(bs, t)          # (N+1)*bs gated-FiLM modulation
+
+        pred = self.forward(nd, extra_b, nd["node_mask"], cond_modulation=mod)
+        pX = F.softmax(pred.X, dim=-1).view(rep, bs, *pred.X.shape[1:])
+        pE = F.softmax(pred.E, dim=-1).view(rep, bs, *pred.E.shape[1:])
+
+        # optional per-branch posterior_transform (keeps exact-guidance stacking)
+        if posterior_transform is not None:
+            gnd = {"X_t": X_t, "E_t": E_t, "y_t": y_t, "t": t, "node_mask": node_mask}
+            for g in range(rep):
+                pX[g], pE[g] = posterior_transform(pX[g], pE[g], gnd, node_mask)
+
+        # per-branch rate matrices (each draws its own X_1 sample, as shipped 2-branch CFG does)
+        RXs, REs = [], []
+        for g in range(rep):
+            rx, re = self.rate_matrix_designer.compute_rate_matrices(
+                t, node_mask, X_t, E_t, pX[g], pE[g]
+            )
+            RXs.append(rx)
+            REs.append(re)
+        RX, RE = torch.stack(RXs), torch.stack(REs)        # (N+1, bs, ...)
+        w = composition.weights(device, dtype=RX.dtype)
+
+        R_t_X = self._blend_rates(RX, w, composition.mode)
+        R_t_E = self._blend_rates(RE, w, composition.mode)
+        prob_X, prob_E = self._compute_step_probs(R_t_X, R_t_E, X_t, E_t, dt)
+
+        # terminal step: decode the blended clean-graph marginals (no single
+        # conditional branch exists here, so we PoE-blend the clean log-probs).
+        if s[0].item() >= 1.0 - 1e-6:
+            qX = self._blend_logp(pX, w, composition.mode)
+            qE = self._blend_logp(pE, w, composition.mode)
+            prob_X = F.one_hot(qX.argmax(dim=-1), num_classes=pX.shape[-1]).float()
+            prob_E = F.one_hot(qE.argmax(dim=-1), num_classes=pE.shape[-1]).float()
+
+        sampled_s = sample_from_probs(prob_X, prob_E, node_mask)
+        limit_X = self.limit_dist.X.to(device)
+        limit_E = self.limit_dist.E.to(device)
+        X_s = F.one_hot(sampled_s.X, num_classes=len(limit_X)).float()
+        E_s = F.one_hot(sampled_s.E, num_classes=len(limit_E)).float()
+        masked = PlaceHolder(X=X_s, E=E_s, y=y_t).mask(node_mask)
+        return masked.X, masked.E, y_t
+
+    @staticmethod
+    def _blend_rates(R, w, mode):
+        """Product-of-experts geometric blend of per-branch rate matrices in log
+        space. R: (N+1, ...), group 0 = uncond. RE-STABILIZED after the blend
+        (nan_to_num + >1e5 clamp, matching RateMatrixDesigner._stabilize) since
+        w>1 with a small R_uncond can make the log-ratio deviation explode;
+        structurally-forbidden transitions (R_uncond==0) stay forbidden."""
+        eps = 1e-6
+        lu = torch.log(R[0] + eps)
+        lc = torch.log(R[1:] + eps)                        # (N, ...)
+        dev = torch.einsum("i,i...->...", w, lc - lu)
+        if mode == "mean":
+            dev = dev / w.numel()
+        Rb = (lu + dev).exp()
+        Rb = torch.nan_to_num(Rb)
+        Rb = torch.where(Rb > 1e5, torch.zeros_like(Rb), Rb)
+        Rb = torch.where(R[0] == 0, torch.zeros_like(Rb), Rb)
+        return Rb
+
+    @staticmethod
+    def _blend_logp(p, w, mode):
+        """Same PoE blend on clean-graph softmax marginals -> unnormalized log q
+        (argmax is normalization-invariant). p: (N+1, ...), group 0 = uncond."""
+        eps = 1e-8
+        lu = torch.log(p[0] + eps)
+        lc = torch.log(p[1:] + eps)
+        dev = torch.einsum("i,i...->...", w, lc - lu)
+        if mode == "mean":
+            dev = dev / w.numel()
+        return lu + dev
 
     def _compute_step_probs(
         self,

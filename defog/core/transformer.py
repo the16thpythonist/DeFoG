@@ -140,6 +140,7 @@ class GraphTransformer(nn.Module):
         E: torch.Tensor,
         y: torch.Tensor,
         node_mask: torch.Tensor,
+        modulation=None,
     ) -> PlaceHolder:
         """
         Forward pass through the graph transformer.
@@ -191,9 +192,13 @@ class GraphTransformer(nn.Module):
         X = X * x_mask
         E = E * e_mask
 
-        # Transformer layers
-        for layer in self.tf_layers:
+        # Transformer layers. An optional gated-FiLM `modulation` (from a frozen-
+        # base AdaLNAdapter) tilts each layer's output; `None` -> byte-identical to
+        # the base (adapters are exact no-ops when absent or gate-zeroed).
+        for i, layer in enumerate(self.tf_layers):
             X, E, y = layer(X, E, y, node_mask)
+            if modulation is not None:
+                X, E, y = modulation.apply(i, X, E, y, x_mask, e_mask)
 
         # Output projections
         X = self.mlp_out_X(X)

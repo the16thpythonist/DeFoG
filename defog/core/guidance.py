@@ -247,9 +247,12 @@ class ExactGuidance:
                  target: Optional[float] = None, weight: float = 1.0):
         self.h = h_model.eval()
         self.density_ratio = density_ratio
+        # prop_mean / prop_std / target are scalars for a scalar-property (amortized)
+        # net and per-dim vectors (len == cond_dim) for a high-dimensional / latent
+        # condition (e.g. a fingerprint). Stored raw; normalized on demand in _g.
         self.prop_mean = prop_mean
         self.prop_std = prop_std
-        self.target = None if target is None else float(target)
+        self.target = target
         self.weight = float(weight)
         self._memo = None
         if h_model.cond_dim > 0:
@@ -258,11 +261,23 @@ class ExactGuidance:
                 "prop_mean/prop_std to normalize the target."
             )
 
-    def set_target(self, target: float) -> "ExactGuidance":
-        """Set the target property value for the next guided-sampling run."""
-        self.target = float(target)
+    def set_target(self, target) -> "ExactGuidance":
+        """Set the target for the next guided run -- a scalar (scalar-property net)
+        or a length-``cond_dim`` vector (latent/fingerprint net)."""
+        self.target = target
         self._memo = None
         return self
+
+    def _normalized_target(self, device) -> torch.Tensor:
+        """z-scored target as a ``(cond_dim,)`` tensor. Handles both a scalar
+        target/mean/std (broadcast to cond_dim) and per-dim vectors."""
+        t = torch.as_tensor(self.target, dtype=torch.float32, device=device).reshape(-1)
+        m = torch.as_tensor(self.prop_mean, dtype=torch.float32, device=device).reshape(-1)
+        s = torch.as_tensor(self.prop_std, dtype=torch.float32, device=device).reshape(-1)
+        c = (t - m) / s
+        if c.numel() == 1 and self.h.cond_dim > 1:
+            c = c.expand(self.h.cond_dim)
+        return c.reshape(self.h.cond_dim)
 
     def set_weight(self, weight: float) -> "ExactGuidance":
         """Set the guidance strength ``w`` (1.0 = exact; >1 = stronger steering)."""
@@ -285,10 +300,7 @@ class ExactGuidance:
                 "call set_target(value) before guided sampling with an amortized "
                 "guidance network."
             )
-            c_norm = torch.full(
-                (bs, 1), (self.target - self.prop_mean) / self.prop_std,
-                device=device, dtype=torch.float32,
-            )
+            c_norm = self._normalized_target(device).unsqueeze(0).expand(bs, -1)
             y_t = self.h._embed_condition(c_norm)
 
         h_noisy = {"X_t": nd["X_t"], "E_t": nd["E_t"], "t": nd["t"],
@@ -505,3 +517,141 @@ class AmortizedPropertyGuidanceModule(_GuidanceModuleBase):
         """A ready-to-sample :class:`ExactGuidance` around the trained conditional
         ``h``; call ``.set_target(value)`` before each guided run."""
         return ExactGuidance(self.h, prop_mean=self.prop_mean, prop_std=self.prop_std)
+
+
+# ===========================================================================
+# Generic high-dimensional / latent conditioning
+# ===========================================================================
+def tanimoto_similarity(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Row-wise Tanimoto (Jaccard) between two batches of ``{0,1}`` vectors.
+
+    ``a``, ``b`` are ``(bs, d)``; returns ``(bs,)`` in ``[0, 1]``. Computed as
+    ``|A∩B| / |A∪B|`` in pure tensor ops (no RDKit), so it is cheap to call in the
+    training loop and differentiable-free (used only as a detached reward)."""
+    inter = (a * b).sum(-1)
+    union = a.sum(-1) + b.sum(-1) - inter
+    return inter / union.clamp_min(eps)
+
+
+class LatentGuidanceModule(_GuidanceModuleBase):
+    """Amortized guidance on an ARBITRARY d-dim precomputed condition ``φ(x1)``
+    (a latent vector / fingerprint / soft cluster-membership) -- the vector-valued
+    generalization of :class:`AmortizedPropertyGuidanceModule`.
+
+    The guidance net ``h`` (``cond_dim = d``) is fed a TARGET condition ``c`` and
+    trained, via the same Bregman objective, so that ::
+
+        h_t(x1=z, x_t ; c)  =  E[ r_c(x1) | x1=z, x_t ]
+
+    with a target-conditioned reward ``r_c(x1) = reward_fn(φ(x1), c)`` (default:
+    Tanimoto). At sample time ``ExactGuidance.set_target(c)`` steers the frozen base
+    toward molecules whose ``φ`` is close to ``c``.
+
+    Positive-biased pairing
+    -----------------------
+    A randomly paired ``(x1, c)`` almost never matches in high dimensions -- the
+    reward collapses to ~0 and gradients vanish (concentration of distances). So the
+    target is drawn with a controlled positive fraction ``pos_frac``:
+
+    * with prob ``pos_frac``: ``c`` is the condition of a precomputed near-neighbor
+      of ``x1`` (a real, high-similarity match -> genuine up-signal), and
+    * otherwise: a random in-batch condition (a negative -> teaches ``h`` to
+      *suppress* off-target).
+
+    Data plumbing (attached upstream, per graph)
+    --------------------------------------------
+    * ``batch.<cond_attr>``: ``(d,)`` own condition ``φ(x1)``.
+    * ``batch.<nbr_attr>``: ``(K,)`` LongTensor of near-neighbor row indices into
+      ``cond_bank`` (e.g. top-K by Tanimoto).
+
+    ``cond_bank`` is the ``(N, d)`` matrix of ALL conditions, used to look up the
+    neighbor targets. It is kept OFF the checkpoint (a plain attribute, moved to the
+    batch device lazily) so guidance checkpoints stay small.
+
+    Args:
+        base: frozen pretrained :class:`DeFoGModel`.
+        cond_dim: condition width ``d`` (e.g. 128 for a 128-bit fingerprint).
+        cond_bank: ``(N, d)`` array/tensor of all per-molecule conditions.
+        cond_mean, cond_std: ``(d,)`` per-dim normalization stats for the condition
+            fed to ``h`` (also persisted for sample time).
+        reward_fn: ``(φ, c) -> (bs,)`` similarity in ``[0, 1]`` (default Tanimoto).
+        reward_sharpen: exponent ``β`` applied as ``r <- r**β`` -- sharpens the tilt
+            when the raw similarity is diffuse (128-bit folded FPs collide a lot).
+        pos_frac: fraction of each batch drawn as positives (near-neighbor targets).
+    """
+
+    def __init__(self, base: DeFoGModel, cond_dim: int, cond_bank,
+                 cond_mean, cond_std, reward_fn: Callable = tanimoto_similarity,
+                 reward_sharpen: float = 1.0, pos_frac: float = 0.5,
+                 cond_attr: str = "cond", nbr_attr: str = "nbr",
+                 h_model: Optional[DeFoGModel] = None, lr: float = 2e-4,
+                 lambda_edge: Optional[float] = None, g_clamp: float = 20.0,
+                 **h_overrides):
+        super().__init__()
+        self._freeze_base(base)
+        self.h = h_model if h_model is not None else build_guidance_network(
+            base, cond_dim=cond_dim, **h_overrides)
+        self.register_buffer("cond_mean", torch.as_tensor(cond_mean, dtype=torch.float32).reshape(-1))
+        self.register_buffer("cond_std", torch.as_tensor(cond_std, dtype=torch.float32).reshape(-1).clamp_min(1e-6))
+        # cond_bank: plain attribute (NOT a buffer/param) so it never enters the
+        # checkpoint; moved to the batch device lazily in _bank().
+        self._cond_bank = torch.as_tensor(cond_bank, dtype=torch.float32)
+        self.reward_fn = reward_fn
+        self.reward_sharpen = float(reward_sharpen)
+        self.pos_frac = float(pos_frac)
+        self.cond_attr, self.nbr_attr = cond_attr, nbr_attr
+        self.lr, self.g_clamp = lr, g_clamp
+        self.lambda_edge = lambda_edge if lambda_edge is not None else base.train_loss.lambda_edge
+
+    def _bank(self, device) -> torch.Tensor:
+        if self._cond_bank.device != device:
+            self._cond_bank = self._cond_bank.to(device)
+        return self._cond_bank
+
+    def training_step(self, batch, batch_idx):
+        self.base.eval()
+        X1, E1, node_mask = self._dense(batch)
+        bs = X1.size(0)
+        device = X1.device
+
+        phi = getattr(batch, self.cond_attr).to(device).view(bs, -1).float()   # (bs, d) own φ(x1)
+        nbr = getattr(batch, self.nbr_attr).to(device).view(bs, -1).long()     # (bs, K) neighbor idx
+        bank = self._bank(device)
+
+        # positive-biased target construction
+        is_pos = torch.rand(bs, device=device) < self.pos_frac
+        col = torch.randint(0, nbr.size(1), (bs, 1), device=device)
+        c_pos = bank[nbr.gather(1, col).squeeze(1)]            # a random near-neighbor's condition
+        c_neg = phi[torch.randperm(bs, device=device)]        # a random in-batch condition
+        c = torch.where(is_pos[:, None], c_pos, c_neg)
+
+        r = self.reward_fn(phi, c)
+        if self.reward_sharpen != 1.0:
+            r = r.clamp(0.0, 1.0) ** self.reward_sharpen
+        r = r.detach()
+
+        t = torch.rand(bs, 1, device=device)  # Eq. 11: t ~ U[0, 1]
+        y0 = torch.zeros(bs, 0, device=device)
+        with torch.no_grad():
+            noisy = self.base._apply_noise(X1, E1, y0, node_mask, t=t)
+
+        c_norm = (c - self.cond_mean) / self.cond_std
+        y_h = self.h._embed_condition(c_norm)
+        h_noisy = {"X_t": noisy["X_t"], "E_t": noisy["E_t"], "t": noisy["t"],
+                   "node_mask": node_mask, "y_t": y_h}
+        g = self.h.forward(h_noisy, self.h._compute_extra_data(h_noisy), node_mask)
+
+        loss = bregman_loss(g, X1, E1, r, node_mask, self.lambda_edge, self.g_clamp)
+        self.log("guid/loss", loss, prog_bar=True, on_epoch=True, batch_size=bs)
+        self.log("guid/r_mean", r.mean(), prog_bar=True, on_epoch=True, batch_size=bs)
+        self.log("guid/pos_frac", is_pos.float().mean(), on_epoch=True, batch_size=bs)
+        return loss
+
+    def guidance(self) -> ExactGuidance:
+        """A ready-to-sample :class:`ExactGuidance` around the trained latent ``h``;
+        call ``.set_target(vector)`` (length ``cond_dim``) before each guided run."""
+        return ExactGuidance(
+            self.h,
+            prop_mean=self.cond_mean.detach().cpu().numpy(),
+            prop_std=self.cond_std.detach().cpu().numpy(),
+        )

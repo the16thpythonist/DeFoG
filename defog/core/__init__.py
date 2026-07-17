@@ -62,7 +62,15 @@ from .size_distribution import (
     ConditionalSizeDistribution,
 )
 from .rate_matrix import RateMatrixDesigner
-from .sampler import Sampler, InpaintingSampler, GuidedSampler, RefinementSampler
+from .sampler import Sampler, InpaintingSampler, GuidedSampler, RefinementSampler, AdaptedSampler
+from .adapter import (
+    Modulation,
+    AdaLNAdapter,
+    ConditionBranch,
+    AdapterComposition,
+    AdapterRegistry,
+    AdapterModule,
+)
 from .constraint import Constraint, SubgraphConstraint
 from .guidance import (
     DensityRatio,
@@ -77,6 +85,8 @@ from .guidance import (
     CompositeGuidance,
     GuidanceModule,
     AmortizedPropertyGuidanceModule,
+    LatentGuidanceModule,
+    tanimoto_similarity,
 )
 from .feynman_kac import FeynmanKacSampler, JointGuidanceSampler, predict_clean
 from .rl import (
@@ -133,6 +143,13 @@ __all__ = [
     "Sampler",
     "InpaintingSampler",
     "GuidedSampler",
+    "AdaptedSampler",
+    "Modulation",
+    "AdaLNAdapter",
+    "ConditionBranch",
+    "AdapterComposition",
+    "AdapterRegistry",
+    "AdapterModule",
     "RefinementSampler",
     # Constraints (inpainting)
     "Constraint",
@@ -150,6 +167,8 @@ __all__ = [
     "MultiPropertyEnergy",
     "GuidanceModule",
     "AmortizedPropertyGuidanceModule",
+    "LatentGuidanceModule",
+    "tanimoto_similarity",
     "FeynmanKacSampler",
     "JointGuidanceSampler",
     "predict_clean",
