@@ -11,7 +11,7 @@
 # each): logP@2e-4, logP@4e-4, TPSA@2e-4, TPSA@4e-4. From scratch adapter, ~20
 # epochs / max_time 5h, then single-property steering eval.
 
-cd ~/Programming/DeFoG
+cd "$SLURM_SUBMIT_DIR"    # repo now lives under $PROJECT (submit from the repo dir)
 module load Stages/2026 GCCcore/14.3.0 PyTorch/2.9.1
 source .venv_jupiter/bin/activate
 export PYTHONPATH="$PWD:$PYTHONPATH"     # APPEND (overwriting breaks torch/numpy)

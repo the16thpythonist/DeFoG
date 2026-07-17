@@ -10,7 +10,7 @@
 # on ZINC 250k, one LR per GPU (1e-4/2e-4/3e-4/4e-4). From scratch, ~20 epochs /
 # max_time 5h, then a held-out Tanimoto-lift eval with a guidance-scale sweep.
 
-cd ~/Programming/DeFoG
+cd "$SLURM_SUBMIT_DIR"    # repo now lives under $PROJECT (submit from the repo dir)
 
 # aarch64: use the JSC PyTorch module (do NOT build torch); run module load BARE.
 module load Stages/2026 GCCcore/14.3.0 PyTorch/2.9.1
