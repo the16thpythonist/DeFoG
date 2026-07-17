@@ -27,9 +27,10 @@ from rdkit.Chem import Crippen, Descriptors, Draw
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 
-from experiments.utils import build_encoders, pyg_data_to_mol, mol_to_smiles
+from experiments.utils import build_encoders, smiles_to_pyg_data, pyg_data_to_mol, mol_to_smiles
 from defog.core import (
     DeFoGModel, AdaLNAdapter, AdapterComposition, ConditionBranch, AdaptedSampler,
+    ConditionalSizeDistribution,
 )
 
 RDLogger.DisableLog("rdApp.*")
@@ -55,6 +56,15 @@ EVAL_CHUNK: int = 40
 TARGET_PERCENTILES: list = [5, 95]
 REF_SUBSAMPLE: int = 20000      # dataset molecules for the 2D density background
 GRID_N: int = 12
+
+# Graph size is drawn from a property-CONDITIONAL size distribution: logP and TPSA
+# are strongly size-dependent, so a fixed global size prior caps the reachable
+# range (esp. the high end). Keyed on normalized [logP, TPSA]; passed to
+# AdaptedSampler.sample(condition=...) which drives sizing independently of the
+# adapter modulation. Matches the direct-CFG conditional recipe.
+USE_CONDITIONAL_SIZE: bool = True
+SIZE_DIST_METHOD: str = "kernel"
+SIZE_FIT_N: int = 20000         # molecules used to fit the conditional size distribution
 
 SEED: int = 42
 __DEBUG__: bool = False
@@ -114,16 +124,46 @@ def experiment(e: Experiment) -> None:
     adapters = {"logp": _load_or_fresh(e.LOGP_CKPT, "logp"),
                 "tpsa": _load_or_fresh(e.TPSA_CKPT, "tpsa")}
 
-    # dataset 2D density + high/low targets
+    # dataset 2D density, high/low targets, and a property-CONDITIONAL size prior.
+    # Build graphs + aligned RDKit logP/TPSA (matching how the adapters were trained).
     df = pd.read_csv(e.CSV_PATH)
     ref_smiles = df[e.SMILES_COLUMN].sample(min(e.REF_SUBSAMPLE, len(df)), random_state=e.SEED).tolist()
-    ds_lp, ds_tp = compute_2props(ref_smiles)
+    fit_graphs, lp_list, tp_list = [], [], []
+    for smi in ref_smiles[:e.SIZE_FIT_N]:
+        m = Chem.MolFromSmiles(smi)
+        if m is None:
+            continue
+        g = smiles_to_pyg_data(smi, atom_encoder, bond_encoder)
+        if g is None:
+            continue
+        try:
+            lp, tp = float(Crippen.MolLogP(m)), float(Descriptors.TPSA(m))
+        except Exception:
+            continue
+        fit_graphs.append(g); lp_list.append(lp); tp_list.append(tp)
+    ds_lp, ds_tp = np.asarray(lp_list), np.asarray(tp_list)
+    lp_mu, lp_sd = float(ds_lp.mean()), float(ds_lp.std() or 1.0)
+    tp_mu, tp_sd = float(ds_tp.mean()), float(ds_tp.std() or 1.0)
     tgt = {
         "logp": dict(zip(["low", "high"], [float(x) for x in np.percentile(ds_lp, e.TARGET_PERCENTILES)])),
         "tpsa": dict(zip(["low", "high"], [float(x) for x in np.percentile(ds_tp, e.TARGET_PERCENTILES)])),
     }
     e["eval/targets"] = tgt
-    e.log(f"targets: {tgt}")
+    e.log(f"targets: {tgt}  |  size-fit mols: {len(fit_graphs)}")
+
+    # property-conditional size distribution keyed on normalized [logP, TPSA]
+    size_dist = None
+    if e.USE_CONDITIONAL_SIZE:
+        from torch_geometric.loader import DataLoader
+        for g, lp, tp in zip(fit_graphs, ds_lp, ds_tp):
+            g.y = torch.tensor([[(lp - lp_mu) / lp_sd, (tp - tp_mu) / tp_sd]], dtype=torch.float)
+        size_dist = ConditionalSizeDistribution.from_dataloader(
+            DataLoader(fit_graphs, batch_size=256), method=e.SIZE_DIST_METHOD)
+        e.log(f"conditional size distribution fitted (method={e.SIZE_DIST_METHOD})")
+
+    def size_condition(lp_t, tp_t, n):
+        v = torch.tensor([(lp_t - lp_mu) / lp_sd, (tp_t - tp_mu) / tp_sd], dtype=torch.float)
+        return v.unsqueeze(0).expand(n, -1)
 
     colors = {("low", "low"): "#2c7fb8", ("low", "high"): "#31a354",
               ("high", "low"): "#d95f0e", ("high", "high"): "#756bb1"}
@@ -140,7 +180,9 @@ def experiment(e: Experiment) -> None:
         samples, rem = [], e.N_PER_COMBO
         while rem > 0:
             cur = min(e.EVAL_CHUNK, rem)
-            samples += samp.sample(cur, device=device, show_progress=False)
+            cond = size_condition(lp_t, tp_t, cur).to(device) if size_dist is not None else None
+            samples += samp.sample(cur, size_dist=size_dist, condition=cond,
+                                   device=device, show_progress=False)
             rem -= cur
         mols, glp, gtp = decode_props(samples, atom_decoder, bond_decoder)
         gen[(lp_lvl, tp_lvl)] = (glp, gtp)
@@ -191,6 +233,7 @@ def testing(e: Experiment):
     e.EVAL_CHUNK = 8
     e.EVAL_STEPS = 5
     e.REF_SUBSAMPLE = 400
+    e.SIZE_FIT_N = 120
     e.GRID_N = 4
     # LOGP_CKPT/TPSA_CKPT default "" -> fresh untrained adapters (mechanism smoke)
 
