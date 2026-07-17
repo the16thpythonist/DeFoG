@@ -43,6 +43,7 @@ Usage:
 import os
 import json
 import time
+import hashlib
 from collections import Counter
 
 import numpy as np
@@ -367,7 +368,11 @@ def prepare_reference(path, smiles_column, quantile, ring_min_count, limit,
     cache_path = None
     try:
         os.makedirs(cache_dir, exist_ok=True)
-        cache_path = os.path.join(cache_dir, f".sanity_ref_{abs(hash(key))}.json")
+        # stable digest (NOT hash() -- str hashing is salted per process, so hash()
+        # would give a different filename each run and never hit the cache; worse,
+        # parallel arms would each rebuild and race on the write).
+        digest = hashlib.md5(key.encode()).hexdigest()[:16]
+        cache_path = os.path.join(cache_dir, f".sanity_ref_{digest}.json")
         if os.path.exists(cache_path):
             with open(cache_path) as fh:
                 blob = json.load(fh)
@@ -670,15 +675,33 @@ def experiment(e: Experiment) -> None:
     best_snapshot = None
     if e.SELECT_BEST and e.CKPT_EVERY > 0:
         import glob
-        val_floor = before["valid_frac"] - 0.02
-        uniq_floor = before["unique_frac_of_valid"] - 0.02
         cands = sorted(glob.glob(os.path.join(ckpt_dir, "*.ckpt")))
-        e.log(f"best-snapshot: ranking {len(cands)} snapshots + final at {e.SELECT_EVAL_STEPS} steps "
-              f"(val_floor={val_floor:.1%} uniq_floor={uniq_floor:.1%})")
 
         def rank_eval(m):
             rr, _, _, _ = full_eval(m, e.SELECT_EVAL_SAMPLES, e.SELECT_EVAL_STEPS, e.SEED + 200, False)
             return rr
+
+        # Gate validity/uniqueness at the SAME step count used for ranking. Validity is
+        # a few pp lower at SELECT_EVAL_STEPS than at EVAL_STEPS, so a floor taken from
+        # the 500-step before eval is too strict for 100-step ranking (it would reject
+        # non-collapsed snapshots). When the input is ranked, use ITS same-step scores as
+        # the reference; else fall back to the before eval.
+        best = None
+        if e.SELECT_INCLUDE_INPUT:
+            inp = DeFoGModel.load(e.CKPT_PATH, device="cpu").to(device)
+            ir = rank_eval(inp)
+            val_floor = ir["valid_frac"] - 0.02
+            uniq_floor = ir["unique_frac_of_valid"] - 0.02
+            e.log(f"  input: violation={ir['violation_frac_all']:.1%} valid={ir['valid_frac']:.1%} "
+                  f"unique={ir['unique_frac_of_valid']:.1%}")
+            best = (ir["violation_frac_all"], ir["valid_frac"], e.CKPT_PATH)
+            del inp
+            torch.cuda.empty_cache()
+        else:
+            val_floor = before["valid_frac"] - 0.02
+            uniq_floor = before["unique_frac_of_valid"] - 0.02
+        e.log(f"best-snapshot: ranking {len(cands)} snapshots + final at {e.SELECT_EVAL_STEPS} steps "
+              f"(val_floor={val_floor:.1%} uniq_floor={uniq_floor:.1%})")
 
         def gated_better(rev, best):
             if best is None:
@@ -686,15 +709,6 @@ def experiment(e: Experiment) -> None:
             return (rev["valid_frac"] >= val_floor and rev["unique_frac_of_valid"] >= uniq_floor
                     and rev["violation_frac_all"] < best[0])
 
-        best = None
-        if e.SELECT_INCLUDE_INPUT:
-            inp = DeFoGModel.load(e.CKPT_PATH, device="cpu").to(device)
-            ir = rank_eval(inp)
-            e.log(f"  input: violation={ir['violation_frac_all']:.1%} valid={ir['valid_frac']:.1%} "
-                  f"unique={ir['unique_frac_of_valid']:.1%}")
-            best = (ir["violation_frac_all"], ir["valid_frac"], e.CKPT_PATH)
-            del inp
-            torch.cuda.empty_cache()
         for tag, path in [("final", None)] + [(os.path.basename(sp), sp) for sp in cands]:
             if path is None:
                 rev = rank_eval(model)
