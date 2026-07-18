@@ -97,9 +97,12 @@ def props_of(samples, atom_decoder, bond_decoder, prop_fn):
     for s in samples:
         mol = pyg_data_to_mol(s, atom_decoder, bond_decoder)
         smi = mol_to_smiles(mol) if mol is not None else None
-        if smi is not None and Chem.MolFromSmiles(smi) is not None:
+        # re-parse through SMILES so the mol is sanitized (ring perception done);
+        # descriptors like TPSA raise "RingInfo not initialized" on a raw decoded mol.
+        m = Chem.MolFromSmiles(smi) if smi is not None else None
+        if m is not None:
             try:
-                vals.append(prop_fn(mol))
+                vals.append(prop_fn(m))
             except Exception:
                 pass
     return np.asarray(vals, dtype=float)
@@ -129,10 +132,14 @@ class PropertyMatchReward:
         tgt = cond.reshape(-1).tolist()
         for i, d in enumerate(datas):
             mol = pyg_data_to_mol(d, self.ad, self.bd)
-            if mol is None:
+            smi = mol_to_smiles(mol) if mol is not None else None
+            # sanitize via SMILES round-trip (ring perception) so descriptors such as
+            # TPSA don't raise "RingInfo not initialized" and silently score invalid.
+            m = Chem.MolFromSmiles(smi) if smi is not None else None
+            if m is None:
                 continue
             try:
-                out[i] = -abs(float(self.prop_fn(mol)) - tgt[i]) / self.scale
+                out[i] = -abs(float(self.prop_fn(m)) - tgt[i]) / self.scale
             except Exception:
                 pass
         return out
