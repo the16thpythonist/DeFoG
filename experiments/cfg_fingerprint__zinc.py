@@ -96,7 +96,7 @@ MAX_TIME_HOURS: float = 5.0
 # --- Sampling / evaluation ---
 GEN_SAMPLE_STEPS: int = 500          # in-training validity probe
 GEN_ETA: float = 5.0
-EVAL_STEPS: int = 250
+EVAL_STEPS: int = 500
 ETA: float = 5.0
 OMEGA: float = 0.0
 SAMPLE_TIME_DISTORTION: str = "polydec"

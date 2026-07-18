@@ -69,7 +69,7 @@ COND_DROP_PROB: float = 0.0      # uncond branch IS the frozen base -> dropout n
 MAX_TIME_HOURS: float = 5.0
 
 # --- Sampling / evaluation ---
-EVAL_STEPS: int = 250
+EVAL_STEPS: int = 500
 ETA: float = 5.0
 OMEGA: float = 0.0
 TIME_DISTORTION: str = "polydec"
