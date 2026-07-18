@@ -183,7 +183,7 @@ class FPAdapterProbe(pl.Callback):
 # ============================================================================
 @Experiment(base_path=folder_path(__file__), namespace=file_namespace(__file__), glob=globals())
 def experiment(e: Experiment) -> None:
-    e.log("ZINC frozen-base AdaLN CFG-ADAPTER on 128-bit Morgan fingerprint")
+    e.log(f"ZINC frozen-base AdaLN CFG-ADAPTER on {e.FP_BITS}-bit Morgan fingerprint")
     pl.seed_everything(e.SEED, workers=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
