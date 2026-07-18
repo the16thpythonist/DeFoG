@@ -154,6 +154,111 @@ def test_save_load_roundtrip():
     return "save/load round-trip reproduces modulation + stats"
 
 
+def test_interior_null_equals_base():
+    """Interior (L4/L10) adapters must ALSO be exact no-ops at null (gate zero-init)."""
+    model, loader = build_tiny_model()
+    noisy, extra, mask, bs = a_noisy(model, loader)
+    pred_base = model.forward(noisy, extra, mask)
+    for kw, tag in [(dict(interior_ff=True), "L4"),
+                    (dict(interior_attn=True), "L10"),
+                    (dict(interior_ff=True, interior_attn=True), "L4+L10")]:
+        adapter = AdaLNAdapter.for_base(model, cond_dim=2, hidden=32, **kw).eval()
+        mod = adapter(torch.randn(bs, 2), t=noisy["t"])
+        pred = model.forward(noisy, extra, mask, cond_modulation=mod)
+        dX = (pred_base.X - pred.X).abs().max()
+        assert torch.allclose(pred_base.X, pred.X, atol=1e-6) and \
+               torch.allclose(pred_base.E, pred.E, atol=1e-6), f"{tag} not no-op (maxdX={dX})"
+    return "interior L4/L10/both = base exact at null"
+
+
+def test_interior_live():
+    """Perturbing the interior gates must move the output (wiring is live, not ignored)."""
+    model, loader = build_tiny_model()
+    noisy, extra, mask, bs = a_noisy(model, loader)
+    pred_base = model.forward(noisy, extra, mask)
+    moved = {}
+    for kw, tag, attr in [(dict(interior_ff=True), "L4", "ff"),
+                          (dict(interior_attn=True), "L10", "attn")]:
+        adapter = AdaLNAdapter.for_base(model, cond_dim=2, hidden=32, **kw).eval()
+        with torch.no_grad():
+            for ld in getattr(adapter, attr):
+                for k in ld:
+                    if k.startswith("gate"):
+                        ld[k].bias.add_(0.5)
+        mod = adapter(torch.randn(bs, 2), t=noisy["t"])
+        pred = model.forward(noisy, extra, mask, cond_modulation=mod)
+        m = (pred_base.X - pred.X).abs().max().item()
+        # live threshold 1e-5 is 10x above the verified <1e-6 no-op floor; the L10
+        # attention-logit path is more dampened than L4's direct node FiLM in the toy model.
+        assert m > 1e-5, f"{tag} did not move output (maxdX={m})"
+        moved[tag] = m
+    return f"interior live: L4 dX={moved['L4']:.2g}, L10 dX={moved['L10']:.2g}"
+
+
+def test_stack_groups_heterogeneous():
+    """stack_groups must handle adapters with DIFFERENT key sets (interior vs output-
+    only) in BOTH orders: no crash, union keys, (N+1)*bs rows, group-0 zero."""
+    from defog.core.adapter import Modulation
+    model, loader = build_tiny_model()
+    noisy, extra, mask, bs = a_noisy(model, loader)
+    a_out = AdaLNAdapter.for_base(model, cond_dim=1, hidden=32).eval()
+    a_int = AdaLNAdapter.for_base(model, cond_dim=1, hidden=32, interior_ff=True, interior_attn=True).eval()
+    for order in ([a_int, a_out], [a_out, a_int]):
+        mods = [ad(torch.zeros(bs, 1), t=noisy["t"]) for ad in order]
+        stk = Modulation.stack_groups(mods, bs, "cpu")
+        want = set(mods[0].layers[0]) | set(mods[1].layers[0])
+        assert set(stk.layers[0]) == want, "stack_groups did not union keys"
+        for k, v in stk.layers[0].items():
+            assert v.shape[0] == (len(order) + 1) * bs, f"{k} wrong batch dim"
+            assert torch.allclose(v[:bs], torch.zeros_like(v[:bs])), f"group-0 not zero for {k}"
+    return "stack_groups unions heterogeneous keys + group-0 bypass (both orders)"
+
+
+def test_interior_composability_bypass():
+    """Compose an INTERIOR adapter with an OUTPUT-ONLY adapter (the swappable+stackable
+    case that crashed pre-fix): every group of the (N+1)*bs forward must == base uncond."""
+    import torch.nn.functional as F
+    from defog.core.data import PlaceHolder
+    model, loader = build_tiny_model()
+    noisy, extra, mask, bs = a_noisy(model, loader)
+    a_out = AdaLNAdapter.for_base(model, cond_dim=1, hidden=32).eval()
+    a_int = AdaLNAdapter.for_base(model, cond_dim=1, hidden=32, interior_ff=True, interior_attn=True).eval()
+    comp = AdapterComposition(
+        [ConditionBranch(a_int, torch.zeros(bs, 1), 1.0), ConditionBranch(a_out, torch.ones(bs, 1), 1.0)],
+        base=model, mode="mean")
+    rep = len(comp) + 1
+    mod = comp.build_modulation(bs, noisy["t"])
+    nd = {"X_t": noisy["X_t"].repeat(rep, 1, 1), "E_t": noisy["E_t"].repeat(rep, 1, 1, 1),
+          "y_t": noisy["y_t"].repeat(rep, 1), "t": noisy["t"].repeat(rep, 1),
+          "node_mask": mask.repeat(rep, 1)}
+    extra_b = PlaceHolder(X=extra.X.repeat(rep, 1, 1), E=extra.E.repeat(rep, 1, 1, 1), y=extra.y.repeat(rep, 1))
+    pred = model.forward(nd, extra_b, nd["node_mask"], cond_modulation=mod)
+    pX = F.softmax(pred.X, -1).view(rep, bs, *pred.X.shape[1:])
+    base_pred = F.softmax(model.forward(noisy, extra, mask).X, -1)
+    for g in range(rep):
+        assert torch.allclose(pX[g], base_pred, atol=1e-6), f"group {g} != base (heterogeneous compose)"
+    return f"heterogeneous compose (interior+output-only): all {rep} groups == base"
+
+
+def test_interior_save_load():
+    """Interior adapter round-trips: flags in config, heads in state_dict."""
+    model, loader = build_tiny_model()
+    a = AdaLNAdapter.for_base(model, cond_dim=2, hidden=32, interior_ff=True,
+                              interior_attn=True, name="int").eval()
+    with torch.no_grad():
+        for ld in a.attn:
+            ld["gate"].weight.add_(torch.randn_like(ld["gate"].weight) * 0.01)
+    c, t = torch.randn(2, 2), torch.rand(2, 1)
+    m0 = a(c, t=t).layers[0]["gate_emul"]
+    with tempfile.TemporaryDirectory() as d:
+        p = a.save(os.path.join(d, "ai"))
+        b = AdaLNAdapter.load(p)
+    assert b.interior_ff and b.interior_attn, "interior flags lost on load"
+    m1 = b(c, t=t).layers[0]["gate_emul"]
+    assert torch.allclose(m0, m1, atol=1e-6), "interior save/load changed modulation"
+    return "interior adapter save/load round-trip (flags + heads)"
+
+
 if __name__ == "__main__":
     tests = [
         test_null_equals_base,
@@ -162,6 +267,11 @@ if __name__ == "__main__":
         test_empty_composition_fallthrough,
         test_adapted_sampler_runs_and_steers_shapewise,
         test_save_load_roundtrip,
+        test_interior_null_equals_base,
+        test_interior_live,
+        test_stack_groups_heterogeneous,
+        test_interior_composability_bypass,
+        test_interior_save_load,
     ]
     fails = 0
     for t in tests:

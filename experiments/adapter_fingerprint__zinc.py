@@ -60,6 +60,9 @@ FP_RADIUS: int = 2      # discriminative fingerprint + a cleaner Tanimoto signal
 H_HIDDEN: int = 256
 TIME_CONDITIONED: bool = True
 STREAMS: list = ["X", "E", "y"]
+INTERIOR_FF: bool = False        # L4: pre-FFN adaLN-Zero FiLM on X,E
+INTERIOR_ATTN: bool = False      # L10: condition e_mul (edge->attention logits)
+L10_LR_SCALE: float = 0.3        # smaller LR on the L10 heads (validity guard)
 
 # --- Training (8h wall on JUPITER; base frozen, only the adapter trains) ---
 EPOCHS: int = 50
@@ -221,10 +224,13 @@ def experiment(e: Experiment) -> None:
     adapter = AdaLNAdapter.for_base(
         base, cond_dim=e.FP_BITS, hidden=e.H_HIDDEN, time_conditioned=e.TIME_CONDITIONED,
         streams=tuple(e.STREAMS), cond_mean=cond_mean, cond_std=cond_std,
-        name="fp_adapter", cond_type="morgan128")
+        interior_ff=e.INTERIOR_FF, interior_attn=e.INTERIOR_ATTN,
+        name="fp_adapter", cond_type=f"morgan{e.FP_BITS}")
     e["adapter/num_params"] = sum(p.numel() for p in adapter.parameters())
-    e.log(f"adapter: {e['adapter/num_params']:,} params (base {sum(p.numel() for p in base.parameters()):,} frozen)")
-    module = AdapterModule(base, adapter, cond_attr="cond", cond_drop_prob=e.COND_DROP_PROB, lr=e.LEARNING_RATE)
+    e.log(f"adapter: {e['adapter/num_params']:,} params (interior_ff={e.INTERIOR_FF} interior_attn={e.INTERIOR_ATTN}; "
+          f"base {sum(p.numel() for p in base.parameters()):,} frozen)")
+    module = AdapterModule(base, adapter, cond_attr="cond", cond_drop_prob=e.COND_DROP_PROB,
+                           lr=e.LEARNING_RATE, l10_lr_scale=e.L10_LR_SCALE)
 
     # probe targets (held out) + cached unconditional baseline
     probe_idx = random.sample(holdout_idx, min(e.PROBE_N_TARGETS, len(holdout_idx)))

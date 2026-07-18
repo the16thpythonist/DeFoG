@@ -85,16 +85,27 @@ class Modulation:
     @staticmethod
     def stack_groups(mods: Sequence["Modulation"], bs: int, device) -> "Modulation":
         """Build a ``(N+1)·bs`` modulation: group 0 = uncond (all-zero => bypass),
-        groups 1..N = each adapter's modulation, concatenated along the batch dim."""
+        groups 1..N = each adapter's modulation, concatenated along the batch dim.
+
+        Robust to HETEROGENEOUS key sets across branches: an adapter that lacks an
+        interior key (e.g. an output-only adapter composed with an interior-enabled
+        one) is treated as gate=0 -> exact bypass at that site. Takes the UNION of
+        keys over all branches and zero-fills any key a branch does not define."""
         n_layers = len(mods[0].layers)
         combined = []
         for L in range(n_layers):
-            keys = mods[0].layers[L].keys()
+            keys = set()
+            for m in mods:
+                keys |= set(m.layers[L].keys())
             d = {}
-            for k in keys:
-                ch = mods[0].layers[L][k].shape[-1]
+            for k in sorted(keys):
+                ch = next(m.layers[L][k].shape[-1] for m in mods if k in m.layers[L])
                 zero = torch.zeros(bs, ch, device=device)
-                d[k] = torch.cat([zero] + [m.layers[L][k] for m in mods], dim=0)
+                rows = [zero]                                    # group-0 uncond bypass
+                for m in mods:
+                    t = m.layers[L].get(k)
+                    rows.append(t if t is not None else torch.zeros(bs, ch, device=device))
+                d[k] = torch.cat(rows, dim=0)
             combined.append(d)
         return Modulation(combined)
 
@@ -121,6 +132,7 @@ class AdaLNAdapter(nn.Module):
                  hidden: int = 256, time_conditioned: bool = True,
                  streams: Sequence[str] = _STREAMS, time_emb_dim: int = 64,
                  cond_mean=None, cond_std=None, name: str = "", cond_type: str = "",
+                 interior_ff: bool = False, interior_attn: bool = False,
                  base_token: Optional[float] = None):
         super().__init__()
         self.cond_dim = cond_dim
@@ -131,6 +143,8 @@ class AdaLNAdapter(nn.Module):
         self.time_emb_dim = time_emb_dim
         self.streams = tuple(streams)
         self.name, self.cond_type = name, cond_type
+        self.interior_ff = bool(interior_ff)      # L4: pre-FFN FiLM on X,E
+        self.interior_attn = bool(interior_attn)  # L10: condition e_mul (edge->attn logits)
         self.base_token = base_token
 
         cond_in = cond_dim + (time_emb_dim if time_conditioned else 0)
@@ -150,6 +164,31 @@ class AdaLNAdapter(nn.Module):
                 nn.init.zeros_(g.weight); nn.init.zeros_(g.bias)   # zero-init gate => exact no-op
                 gate_l[s] = g
             self.ss.append(ss_l); self.gate.append(gate_l)
+
+        # --- L4 (pre-FFN adaLN-Zero): gated FiLM heads on X(dx), E(de) ---
+        if self.interior_ff:
+            self.ff = nn.ModuleList()
+            for _ in range(n_layers):
+                ff_l = nn.ModuleDict()
+                for s in ("X", "E"):
+                    ch = dims[_DIMKEY[s]]
+                    ff_l[f"ss_{s}"] = nn.Linear(hidden, 2 * ch)
+                    g = nn.Linear(hidden, ch)
+                    nn.init.zeros_(g.weight); nn.init.zeros_(g.bias)   # zero-init gate => no-op
+                    ff_l[f"gate_{s}"] = g
+                self.ff.append(ff_l)
+
+        # --- L10 (edge->attention-logit): gated FiLM head on e_mul (dx) ---
+        if self.interior_attn:
+            self.attn = nn.ModuleList()
+            ch = dims["dx"]
+            for _ in range(n_layers):
+                a_l = nn.ModuleDict()
+                a_l["ss"] = nn.Linear(hidden, 2 * ch)
+                g = nn.Linear(hidden, ch)
+                nn.init.zeros_(g.weight); nn.init.zeros_(g.bias)       # zero-init gate => no-op
+                a_l["gate"] = g
+                self.attn.append(a_l)
 
         m = torch.zeros(cond_dim) if cond_mean is None else torch.as_tensor(cond_mean, dtype=torch.float32).reshape(-1)
         s = torch.ones(cond_dim) if cond_std is None else torch.as_tensor(cond_std, dtype=torch.float32).reshape(-1).clamp_min(1e-6)
@@ -186,8 +225,19 @@ class AdaLNAdapter(nn.Module):
                 scale, shift = self.ss[L][s](h).chunk(2, dim=-1)
                 gate = self.gate[L][s](h)
                 d[f"scale{s}"], d[f"shift{s}"], d[f"gate{s}"] = scale, shift, gate
+            if self.interior_ff:                     # L4 pre-FFN keys
+                for s in ("X", "E"):
+                    sc, sh = self.ff[L][f"ss_{s}"](h).chunk(2, dim=-1)
+                    d[f"scale_ff{s}"], d[f"shift_ff{s}"], d[f"gate_ff{s}"] = sc, sh, self.ff[L][f"gate_{s}"](h)
+            if self.interior_attn:                   # L10 edge->attn keys
+                sc, sh = self.attn[L]["ss"](h).chunk(2, dim=-1)
+                d["scale_emul"], d["shift_emul"], d["gate_emul"] = sc, sh, self.attn[L]["gate"](h)
             layers.append(d)
         return Modulation(layers)
+
+    def interior_attn_parameters(self):
+        """L10 head params (for an optional smaller-LR optimizer group)."""
+        return list(self.attn.parameters()) if self.interior_attn else []
 
     # --- compatibility / io -------------------------------------------------
     def check_compatible(self, base):
@@ -208,7 +258,9 @@ class AdaLNAdapter(nn.Module):
         return dict(cond_dim=self.cond_dim, n_layers=self.n_layers, dims=self.dims,
                     hidden=self.hidden, time_conditioned=self.time_conditioned,
                     streams=list(self.streams), time_emb_dim=self.time_emb_dim,
-                    name=self.name, cond_type=self.cond_type, base_token=self.base_token)
+                    name=self.name, cond_type=self.cond_type,
+                    interior_ff=self.interior_ff, interior_attn=self.interior_attn,
+                    base_token=self.base_token)
 
     def save(self, path):
         if not path.endswith(".ckpt"):
@@ -315,16 +367,25 @@ class AdapterModule(_GuidanceModuleBase):
     ``configure_optimizers`` (the base hardcodes ``self.h``)."""
 
     def __init__(self, base, adapter: AdaLNAdapter, cond_attr: str = "cond",
-                 cond_drop_prob: float = 0.0, lr: float = 2e-4):
+                 cond_drop_prob: float = 0.0, lr: float = 2e-4, l10_lr_scale: float = 1.0):
         super().__init__()
         self._freeze_base(base)
         self.adapter = adapter
         self.cond_attr = cond_attr
         self.cond_drop_prob = float(cond_drop_prob)
         self.lr = float(lr)
+        self.l10_lr_scale = float(l10_lr_scale)   # smaller LR on the L10 (attention) heads
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.adapter.parameters(), lr=self.lr, weight_decay=1e-5)
+        a = self.adapter
+        if a.interior_attn and self.l10_lr_scale != 1.0:
+            l10_ids = {id(p) for p in a.interior_attn_parameters()}
+            l10 = [p for p in a.parameters() if id(p) in l10_ids]
+            rest = [p for p in a.parameters() if id(p) not in l10_ids]
+            return torch.optim.AdamW(
+                [{"params": rest, "lr": self.lr},
+                 {"params": l10, "lr": self.lr * self.l10_lr_scale}], weight_decay=1e-5)
+        return torch.optim.AdamW(a.parameters(), lr=self.lr, weight_decay=1e-5)
 
     def training_step(self, batch, batch_idx):
         self.base.eval()

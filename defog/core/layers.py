@@ -172,7 +172,8 @@ class NodeEdgeBlock(nn.Module):
         X: Tensor,
         E: Tensor,
         y: Tensor,
-        node_mask: Tensor
+        node_mask: Tensor,
+        attn_mod=None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass through the attention block.
@@ -182,6 +183,8 @@ class NodeEdgeBlock(nn.Module):
             E: Edge features (batch_size, n_nodes, n_nodes, de)
             y: Global features (batch_size, dy)
             node_mask: Boolean mask (batch_size, n_nodes)
+            attn_mod: optional L10 gated-FiLM {scale,shift,gate} (each (bs,dx)) on the
+                edge->attention-logit map e_mul; None -> byte-identical to the base.
 
         Returns:
             Tuple of (new_X, new_E, new_y) with same shapes as inputs
@@ -208,6 +211,15 @@ class NodeEdgeBlock(nn.Module):
 
         # 4. Incorporate edge features via FiLM
         E1 = self.e_mul(E) * e_mask1 * e_mask2  # (bs, n, n, dx)
+        if attn_mod is not None:
+            # L10: gated FiLM on the multiplicative edge->logit gate E1. Conditioning
+            # e_mul (not e_add) means every added term rides on the per-pair Y_ij, so
+            # it survives the softmax-over-keys (a graph-constant additive bias would
+            # cancel). Zero-init gate => exact no-op at null.
+            g = attn_mod["gate"][:, None, None]    # (bs,1,1,dx)
+            s = attn_mod["scale"][:, None, None]
+            h = attn_mod["shift"][:, None, None]
+            E1 = E1 + (e_mask1 * e_mask2) * (g * (s * E1 + h))
         E1 = E1.reshape(bs, n, n, self.n_head, self.df)
         E2 = self.e_add(E) * e_mask1 * e_mask2
         E2 = E2.reshape(bs, n, n, self.n_head, self.df)
@@ -319,7 +331,8 @@ class XEyTransformerLayer(nn.Module):
         X: Tensor,
         E: Tensor,
         y: Tensor,
-        node_mask: Tensor
+        node_mask: Tensor,
+        interior=None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass through the transformer layer.
@@ -329,12 +342,22 @@ class XEyTransformerLayer(nn.Module):
             E: Edge features (batch_size, n_nodes, n_nodes, de)
             y: Global features (batch_size, dy)
             node_mask: Boolean mask (batch_size, n_nodes)
+            interior: optional per-layer adapter modulation dict. Consumed here for
+                the interior conditioning sites (L10 attn keys -> self-attention;
+                L4 ``*_ff*`` keys -> pre-FFN FiLM). Absent keys => that site is a
+                no-op, so an output-only adapter behaves byte-identically.
 
         Returns:
             Tuple of (new_X, new_E, new_y) with same shapes
         """
+        # L10 (edge->attention-logit) modulation for this layer, if present
+        attn_mod = None
+        if interior is not None and "gate_emul" in interior:
+            attn_mod = {"scale": interior["scale_emul"], "shift": interior["shift_emul"],
+                        "gate": interior["gate_emul"]}
+
         # Self-attention
-        newX, newE, new_y = self.self_attn(X, E, y, node_mask)
+        newX, newE, new_y = self.self_attn(X, E, y, node_mask, attn_mod=attn_mod)
 
         # Node residual + norm
         newX_d = self.dropoutX1(newX)
@@ -347,6 +370,19 @@ class XEyTransformerLayer(nn.Module):
         # Global residual + norm
         new_y_d = self.dropout_y1(new_y)
         y = self.norm_y1(y + new_y_d)
+
+        # L4 (pre-FFN adaLN-Zero): gated FiLM on X, E before the feedforward.
+        # Applied to the normalized activations feeding both the FFN and its residual;
+        # zero-init gate => exact no-op at null. Masked delta (never the state).
+        if interior is not None and "gate_ffX" in interior:
+            x_mask = node_mask.unsqueeze(-1)                     # (bs,n,1)
+            e_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(1)   # (bs,n,n,1)
+            gX, sX, hX = interior["gate_ffX"][:, None], interior["scale_ffX"][:, None], interior["shift_ffX"][:, None]
+            X = X + x_mask * (gX * (sX * X + hX))
+            gE = interior["gate_ffE"][:, None, None]
+            sE = interior["scale_ffE"][:, None, None]
+            hE = interior["shift_ffE"][:, None, None]
+            E = E + e_mask * (gE * (sE * E + hE))
 
         # Node feedforward
         ff_outputX = self.linX2(self.dropoutX2(self.activation(self.linX1(X))))

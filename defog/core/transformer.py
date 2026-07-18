@@ -196,9 +196,10 @@ class GraphTransformer(nn.Module):
         # base AdaLNAdapter) tilts each layer's output; `None` -> byte-identical to
         # the base (adapters are exact no-ops when absent or gate-zeroed).
         for i, layer in enumerate(self.tf_layers):
-            X, E, y = layer(X, E, y, node_mask)
+            interior = modulation.layers[i] if modulation is not None else None
+            X, E, y = layer(X, E, y, node_mask, interior=interior)   # L4/L10 interior sites
             if modulation is not None:
-                X, E, y = modulation.apply(i, X, E, y, x_mask, e_mask)
+                X, E, y = modulation.apply(i, X, E, y, x_mask, e_mask)  # post-layer output FiLM
 
         # Output projections
         X = self.mlp_out_X(X)
