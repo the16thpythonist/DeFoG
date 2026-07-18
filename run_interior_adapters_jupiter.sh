@@ -3,7 +3,7 @@
 #SBATCH --partition=booster
 #SBATCH --nodes=1
 #SBATCH --gpus=4
-#SBATCH --time=06:00:00
+#SBATCH --time=11:00:00
 #SBATCH --output=interior_adapters_%j.out
 
 # JUPITER: train NEW adapters with interior conditioning (L4 pre-FFN + L10
