@@ -91,6 +91,7 @@ from .guidance import (
 from .feynman_kac import FeynmanKacSampler, JointGuidanceSampler, predict_clean
 from .rl import (
     GDPOTrainer,
+    AdapterGDPOTrainer,
     RolloutSampler,
     RolloutBuffer,
     Reward,
@@ -174,6 +175,7 @@ __all__ = [
     "predict_clean",
     # GDPO reinforcement-learning fine-tuning (arXiv:2402.16302)
     "GDPOTrainer",
+    "AdapterGDPOTrainer",
     "RolloutSampler",
     "RolloutBuffer",
     "Reward",

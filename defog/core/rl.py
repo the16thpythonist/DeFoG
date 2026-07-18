@@ -566,3 +566,159 @@ class GDPOTrainer:
             self.model.load_state_dict(backup)
             return out
         return self.model.save(path)
+
+
+# ===========================================================================
+# Frozen-base ADAPTER RL fine-tuning (composability-safe: only the adapter moves)
+# ===========================================================================
+def _adapter_clean_pred(base, adapter, X_t, E_t, t, node_mask, cond):
+    """base + adapter clean-graph prediction at a noisy state, with a PER-ROW target
+    ``cond`` (each row/trajectory carries its own condition). base stays frozen."""
+    y0 = torch.zeros(X_t.size(0), 0, device=X_t.device)
+    noisy = {"X_t": X_t, "E_t": E_t, "y_t": y0, "t": t, "node_mask": node_mask}
+    mod = adapter(cond, t=t)
+    return base.forward(noisy, base._compute_extra_data(noisy), node_mask, cond_modulation=mod)
+
+
+def adapter_eager_logprob(base, adapter, X_t, E_t, cond, t, X1, E1, node_mask,
+                          lambda_edge: float = 1.0, reduction: str = "mean") -> torch.Tensor:
+    """:func:`eager_logprob` through base+adapter (only the adapter has grad)."""
+    pred = _adapter_clean_pred(base, adapter, X_t, E_t, t, node_mask, cond)
+    logpX = F.log_softmax(pred.X, dim=-1)
+    logpE = F.log_softmax(pred.E, dim=-1)
+    lpX = (X1 * logpX).sum(-1)
+    lpE = (E1 * logpE).sum(-1)
+    emask = _edge_upper_mask(node_mask)
+    node_sum = (lpX * node_mask).sum(-1)
+    edge_sum = (lpE * emask).sum(dim=(1, 2))
+    if reduction == "mean":
+        return node_sum / node_mask.sum(-1).clamp_min(1) + lambda_edge * edge_sum / emask.sum(dim=(1, 2)).clamp_min(1)
+    return node_sum + lambda_edge * edge_sum
+
+
+def adapter_kl_clean(base, adapter, ref_adapter, X_t, E_t, cond, t, node_mask,
+                     lambda_edge: float = 1.0, reduction: str = "mean") -> torch.Tensor:
+    """KL(base+adapter || base+ref_adapter) on the clean marginals (reward-hacking
+    guard, measured against the PRE-RL adapter)."""
+    p = _adapter_clean_pred(base, adapter, X_t, E_t, t, node_mask, cond)
+    with torch.no_grad():
+        q = _adapter_clean_pred(base, ref_adapter, X_t, E_t, t, node_mask, cond)
+    pX, pE = F.log_softmax(p.X, -1), F.log_softmax(p.E, -1)
+    qX, qE = F.log_softmax(q.X, -1), F.log_softmax(q.E, -1)
+    klX = (pX.exp() * (pX - qX)).sum(-1)
+    klE = (pE.exp() * (pE - qE)).sum(-1)
+    emask = _edge_upper_mask(node_mask)
+    node_kl = (klX * node_mask).sum(-1)
+    edge_kl = (klE * emask).sum(dim=(1, 2))
+    if reduction == "mean":
+        node_kl = node_kl / node_mask.sum(-1).clamp_min(1)
+        edge_kl = edge_kl / emask.sum(dim=(1, 2)).clamp_min(1)
+    return (node_kl + lambda_edge * edge_kl).mean()
+
+
+class AdapterGDPOTrainer(GDPOTrainer):
+    """GDPO fine-tuning of a FROZEN-base AdaLN adapter -- only the adapter's params
+    move, so the shared unconditional path (hence composability) is preserved.
+
+    Differences from :class:`GDPOTrainer`:
+      * Policy = frozen base + trainable adapter. Rollouts apply the adapter's
+        modulation at a PER-ROW target (each trajectory carries its own condition)
+        via an ``AdapterComposition`` on a ``RolloutSampler`` (behavior policy = plain
+        conditional, w=1, no CFG blend).
+      * Reward is CONDITIONAL: ``cond_reward(X1, E1, node_mask, cond) -> (K,)`` (match
+        to each rollout's own target); GRPO advantage grouped by target.
+      * KL reference is a frozen copy of the PRE-RL adapter.
+
+    ``condition_sampler() -> (cond (K, cond_dim) RAW targets, groups (K,))`` is required
+    (pass it via the usual GDPOTrainer kwarg).
+    """
+
+    def __init__(self, base, adapter, cond_reward, *, ref_adapter=None, kl_coef: float = 0.0,
+                 kl_anchor: str = "fixed", anchor_decay: float = 0.99, kl_target=None,
+                 lr: float = 1e-5, weight_decay: float = 1e-5, ema_decay=0.999, **gdpo_kw):
+        # Bring up GDPO plumbing with model=base but suppress its base-ref/opt/ema
+        # (kl_coef=0, ema_decay=None); we build adapter-scoped versions below.
+        super().__init__(base, reward_fn=None, kl_coef=0.0, ema_decay=None,
+                         lr=lr, weight_decay=weight_decay, **gdpo_kw)
+        self.base = base.eval().requires_grad_(False)
+        self.adapter = adapter
+        self.cond_reward = cond_reward
+        self.kl_coef = float(kl_coef)
+        self.kl_anchor, self.anchor_decay, self.kl_target = kl_anchor, anchor_decay, kl_target
+        self.opt = torch.optim.AdamW(adapter.parameters(), lr=lr, weight_decay=weight_decay)
+        self.ema = EMA(adapter, ema_decay) if ema_decay else None
+        self.ref_adapter, self._anchor = None, None
+        if self.kl_coef > 0:
+            self.ref_adapter = ref_adapter if ref_adapter is not None else self._frozen_adapter_ref()
+            if self.kl_anchor == "moving":
+                self._anchor = EMA(adapter, self.anchor_decay)
+
+    def _frozen_adapter_ref(self):
+        ref = type(self.adapter)(**self.adapter._config())
+        ref.load_state_dict(self.adapter.state_dict())
+        return ref.to(self.device).eval().requires_grad_(False)
+
+    @torch.no_grad()
+    def rollout(self) -> RolloutBuffer:
+        from .adapter import AdapterComposition, ConditionBranch
+        self._iter = getattr(self, "_iter", 0)
+        idx = self._choose_subsample()
+        cond, groups = self.condition_sampler()
+        cond = cond.to(self.device).float()
+        comp = AdapterComposition([ConditionBranch(self.adapter, cond, 1.0)], base=self.base, mode="product")
+        sampler = RolloutSampler(self.base, subsample_idx=idx, eta=self.eta, omega=self.omega,
+                                 sample_steps=self.sample_steps, time_distortion=self.time_distortion,
+                                 guidance_scale=1.0)
+        sampler.composition = comp
+        sampler.sample(self.rollout_size, num_nodes=self.num_nodes, size_dist=self.size_dist,
+                       device=self.device, show_progress=False)
+        X1, E1 = sampler.endpoint
+        node_mask = sampler.end_node_mask
+        states = list(zip(sampler.trace_X, sampler.trace_E, sampler.trace_t))
+        Xr, Er, _ = self.base.limit_dist.ignore_virtual_classes(X1.clone(), E1.clone())
+        r = self.cond_reward(Xr, Er, node_mask, cond).to(self.device).float().reshape(-1)
+        A = group_advantage(r, groups, self.advantage_mode, self.advantage_eps, self.advantage_clip)
+        return RolloutBuffer(states, X1, E1, cond, node_mask, r, A)   # cond stored in the y slot
+
+    def update(self, buf: RolloutBuffer) -> dict:
+        was_training = self.adapter.training
+        self.adapter.eval()
+        A = buf.advantage.clamp_min(0.0) if self.positive_only else buf.advantage
+        K = A.shape[0]
+        n_states = max(1, len(buf.states))
+        mb = self.minibatch_size or K
+        cond = buf.y
+        self.opt.zero_grad()
+        pg_loss = kl_val = 0.0
+        for (X_t, E_t, t) in buf.states:
+            for j in range(0, K, mb):
+                sl = slice(j, min(j + mb, K))
+                nb = sl.stop - sl.start
+                lp = adapter_eager_logprob(self.base, self.adapter, X_t[sl], E_t[sl], cond[sl], t[sl],
+                                           buf.X1[sl], buf.E1[sl], buf.node_mask[sl],
+                                           self.lambda_edge, self.reduction)
+                loss = -(A[sl] * lp).sum() / (K * n_states)
+                if self.kl_coef > 0:
+                    kl = adapter_kl_clean(self.base, self.adapter, self.ref_adapter, X_t[sl], E_t[sl],
+                                          cond[sl], t[sl], buf.node_mask[sl], self.lambda_edge, self.reduction)
+                    loss = loss + (self.kl_coef / n_states) * kl * (nb / K)
+                    kl_val += float(kl.detach()) * (nb / K) / n_states
+                loss.backward()
+                pg_loss += float(loss.detach())
+        gnorm = clip_grad_norm_(self.adapter.parameters(), self.grad_clip)
+        self.opt.step()
+        if self.ema:
+            self.ema.update(self.adapter)
+        if was_training:
+            self.adapter.train()
+        return {"loss": pg_loss, "kl": kl_val, "grad_norm": float(gnorm)}
+
+    def save(self, path: str, use_ema: bool = True) -> str:
+        """Save the RL'd ADAPTER (loads with AdaLNAdapter.load)."""
+        if use_ema and self.ema is not None:
+            backup = {k: v.detach().clone() for k, v in self.adapter.state_dict().items()}
+            self.ema.copy_to(self.adapter)
+            out = self.adapter.save(path)
+            self.adapter.load_state_dict(backup)
+            return out
+        return self.adapter.save(path)
