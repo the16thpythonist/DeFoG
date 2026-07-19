@@ -67,7 +67,12 @@ KL_COEF: float = 0.1             # swept per-arm; KL to the pre-RL adapter
 EMA_DECAY: float = 0.999
 GRAD_CLIP: float = 1.0
 LAMBDA_EDGE: float = 1.0
-INVALID_REWARD: float = -10.0
+# --- connectivity-FIRST reward: connected on-target > connected off-target >
+#     disconnected > invalid. prop term clamped so ANY connected molecule outranks
+#     ANY disconnected one, while property still gets a full gradient among connected. ---
+INVALID_REWARD: float = -10.0     # unparseable molecule (worst)
+DISCONNECT_REWARD: float = -4.0   # valid but fragmented ('.' in SMILES); < -PROP_CLAMP
+PROP_CLAMP: float = 3.0           # connected reward in [-PROP_CLAMP, 0]
 TARGET_RANGE_PCT: list = [1, 99]  # amortized RL targets sampled uniform over this range
 LOG_EVERY: int = 10
 PROBE_EVERY: int = 40
@@ -92,20 +97,25 @@ __TESTING__: bool = False
 # ============================================================================
 # Helpers
 # ============================================================================
-def props_of(samples, atom_decoder, bond_decoder, prop_fn):
-    vals = []
+def gen_eval(samples, atom_decoder, bond_decoder, prop_fn):
+    """Return (property values of CONNECTED+valid mols, n_total, n_valid, n_disconnected).
+    Property is computed on the SMILES-reparsed (sanitized) mol; disconnected = '.' in SMILES."""
+    vals, n_valid, n_disc = [], 0, 0
     for s in samples:
         mol = pyg_data_to_mol(s, atom_decoder, bond_decoder)
         smi = mol_to_smiles(mol) if mol is not None else None
-        # re-parse through SMILES so the mol is sanitized (ring perception done);
-        # descriptors like TPSA raise "RingInfo not initialized" on a raw decoded mol.
         m = Chem.MolFromSmiles(smi) if smi is not None else None
-        if m is not None:
-            try:
-                vals.append(prop_fn(m))
-            except Exception:
-                pass
-    return np.asarray(vals, dtype=float)
+        if m is None:
+            continue
+        n_valid += 1
+        if "." in smi:
+            n_disc += 1
+            continue
+        try:
+            vals.append(prop_fn(m))
+        except Exception:
+            pass
+    return np.asarray(vals, dtype=float), len(samples), n_valid, n_disc
 
 
 def chunked(sampler, n, chunk, device):
@@ -118,12 +128,17 @@ def chunked(sampler, n, chunk, device):
 
 
 class PropertyMatchReward:
-    """Conditional RL reward: ``-|property(mol) - target| / scale`` per row; invalid
-    molecules get ``invalid_reward``. Higher = closer to the target."""
+    """Connectivity-FIRST conditional reward. Ordering (best->worst): connected+valid
+    on-target > connected+valid off-target > disconnected > invalid. The property term
+    ``-min(|prop-target|/scale, clamp)`` lives in ``[-clamp, 0]``; ``disconnect_reward``
+    is below ``-clamp`` so ANY connected molecule outranks ANY disconnected one, while
+    property still gets a full gradient among connected molecules."""
 
-    def __init__(self, atom_decoder, bond_decoder, prop_fn, scale=1.0, invalid_reward=-10.0):
+    def __init__(self, atom_decoder, bond_decoder, prop_fn, scale=1.0,
+                 invalid_reward=-10.0, disconnect_reward=-4.0, prop_clamp=3.0):
         self.ad, self.bd, self.prop_fn = atom_decoder, bond_decoder, prop_fn
         self.scale, self.invalid = float(scale), float(invalid_reward)
+        self.disconnect, self.clamp = float(disconnect_reward), float(prop_clamp)
 
     def __call__(self, X1, E1, node_mask, cond):
         n = node_mask.sum(-1)
@@ -133,15 +148,16 @@ class PropertyMatchReward:
         for i, d in enumerate(datas):
             mol = pyg_data_to_mol(d, self.ad, self.bd)
             smi = mol_to_smiles(mol) if mol is not None else None
-            # sanitize via SMILES round-trip (ring perception) so descriptors such as
-            # TPSA don't raise "RingInfo not initialized" and silently score invalid.
             m = Chem.MolFromSmiles(smi) if smi is not None else None
             if m is None:
+                continue                                   # invalid -> floor (-10)
+            if "." in smi:
+                out[i] = self.disconnect                   # disconnected -> flat penalty
                 continue
             try:
-                out[i] = -abs(float(self.prop_fn(m)) - tgt[i]) / self.scale
+                out[i] = -min(abs(float(self.prop_fn(m)) - tgt[i]) / self.scale, self.clamp)
             except Exception:
-                pass
+                pass                                       # prop error -> invalid floor
         return out
 
 
@@ -161,20 +177,27 @@ def make_condition_sampler(p_lo, p_hi, K, G, seed):
     return sampler
 
 
+def _disc(n_valid, n_disc):
+    return (n_disc / n_valid) if n_valid else None
+
+
 def steer_eval(base, adapter, atom_decoder, bond_decoder, prop_fn, targets, weights,
                steps, eta, omega, td, n_per, n_base, chunk, device):
-    """Achieved property (mean, MAE) when steering to low/high targets + baseline."""
+    """Per (level,w): achieved-property MAE over CONNECTED mols + disconnection% +
+    validity%. MAE measures conditioning tightness; disc% measures the connectivity goal."""
     bs = Sampler(base, eta=eta, omega=omega, sample_steps=steps, time_distortion=td)
-    base_vals = props_of(chunked(bs, n_base, chunk, device), atom_decoder, bond_decoder, prop_fn)
-    out = {"baseline_mean": float(base_vals.mean()) if base_vals.size else None, "levels": {}}
+    bvals, bt, bvalid, bdisc = gen_eval(chunked(bs, n_base, chunk, device), atom_decoder, bond_decoder, prop_fn)
+    out = {"baseline_mean": float(bvals.mean()) if bvals.size else None,
+           "baseline_disc": _disc(bvalid, bdisc), "levels": {}}
     for lvl, tgt in targets.items():
         out["levels"][lvl] = {"target": tgt, "per_w": {}}
         for w in weights:
             comp = AdapterComposition([ConditionBranch(adapter, torch.tensor([tgt]), w)], base=base, mode="product")
             samp = AdaptedSampler(base, comp, eta=eta, omega=omega, sample_steps=steps, time_distortion=td)
-            gv = props_of(chunked(samp, n_per, chunk, device), atom_decoder, bond_decoder, prop_fn)
+            gv, tot, nvalid, ndisc = gen_eval(chunked(samp, n_per, chunk, device), atom_decoder, bond_decoder, prop_fn)
             out["levels"][lvl]["per_w"][str(w)] = {
-                "n": int(gv.size), "mean": float(gv.mean()) if gv.size else None,
+                "n": int(gv.size), "valid": (nvalid / tot) if tot else None, "disc": _disc(nvalid, ndisc),
+                "mean": float(gv.mean()) if gv.size else None,
                 "mae": float(np.mean(np.abs(gv - tgt))) if gv.size else None}
     return out
 
@@ -184,7 +207,8 @@ def _fmt(ev, weights):
     for lvl, d in ev["levels"].items():
         for w in weights:
             r = d["per_w"][str(w)]
-            parts.append(f"{lvl}->{d['target']:.1f}@w{w}: mean={r['mean']} mae={r['mae']}")
+            disc = f"{r['disc']*100:.0f}%" if r["disc"] is not None else "?"
+            parts.append(f"{lvl}->{d['target']:.1f}@w{w}: mae={r['mae']} disc={disc}")
     return " | ".join(parts)
 
 
@@ -220,7 +244,9 @@ def experiment(e: Experiment) -> None:
     e["eval/targets"] = targets
     e.log(f"RL target range [{p_lo:.1f}, {p_hi:.1f}]  eval targets {targets}  prop_std={prop_std:.2f}")
 
-    reward = PropertyMatchReward(atom_decoder, bond_decoder, prop_fn, scale=prop_std, invalid_reward=e.INVALID_REWARD)
+    reward = PropertyMatchReward(atom_decoder, bond_decoder, prop_fn, scale=prop_std,
+                                 invalid_reward=e.INVALID_REWARD, disconnect_reward=e.DISCONNECT_REWARD,
+                                 prop_clamp=e.PROP_CLAMP)
     cond_sampler = make_condition_sampler(p_lo, p_hi, e.ROLLOUT_SIZE, e.N_GROUPS, e.SEED)
 
     def eval_now(tag):
@@ -272,14 +298,19 @@ def experiment(e: Experiment) -> None:
     # -- compare + plot MAE pre vs post --------------------------------------
     summary = {"property": e.PROPERTY, "kl_coef": e.KL_COEF, "iterations": it,
                "targets": targets, "pre": pre_ev, "post": post_ev, "mae_delta": {}}
+    summary["disc_delta"] = {}
     e.log("=" * 60)
+    e.log("PROPERTY MAE (lower=tighter)  +  DISCONNECTION% (lower=better) — pre -> post")
     for lvl in e.LEVEL_NAMES:
         for w in e.GUIDANCE_WEIGHTS:
-            pre = pre_ev["levels"][lvl]["per_w"][str(w)]["mae"]
-            post = post_ev["levels"][lvl]["per_w"][str(w)]["mae"]
+            pr, po = pre_ev["levels"][lvl]["per_w"][str(w)], post_ev["levels"][lvl]["per_w"][str(w)]
+            pre, post = pr["mae"], po["mae"]
             d = (post - pre) if (pre is not None and post is not None) else None
             summary["mae_delta"][f"{lvl}_w{w}"] = {"pre": pre, "post": post, "delta": d}
-            e.log(f"{lvl} w={w}: MAE {pre} -> {post}  (delta {d})")
+            dpre, dpost = pr["disc"], po["disc"]
+            summary["disc_delta"][f"{lvl}_w{w}"] = {"pre": dpre, "post": dpost}
+            ds = lambda x: f"{x*100:.0f}%" if x is not None else "?"
+            e.log(f"{lvl} w={w}: MAE {pre} -> {post} (Δ{d}) | disc {ds(dpre)} -> {ds(dpost)}")
     e.commit_json("rl_finetune_metrics.json", summary)
 
     fig, ax = plt.subplots(figsize=(8, 5))
