@@ -20,6 +20,7 @@ reconstruction: :func:`pyg_data_to_mol` and :func:`mol_to_smiles` live here and
 from __future__ import annotations
 
 import io
+import random
 import re
 import warnings
 from typing import List, Optional
@@ -28,6 +29,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from rdkit import Chem, RDLogger
+from rdkit.Chem import Descriptors, QED
 from torch_geometric.data import Data
 
 from defog.core.domain import GraphDomain, _num_nodes, generation_metrics
@@ -284,6 +286,7 @@ class MoleculeDomain(GraphDomain):
         self.image_size = image_size
         self.show_smiles = show_smiles
         self.max_caption_len = max_caption_len
+        self._ref_desc = None  # cached reference logP/TPSA/QED arrays for KL
 
     # ------------------------------------------------------------------ encode
     def _atom_encoder(self):
@@ -498,7 +501,218 @@ class MoleculeDomain(GraphDomain):
         pct = (100.0 * n_valid / n) if n else 0.0
         return f"valid {n_valid}/{n} ({pct:.0f}%) | avg atoms {avg_atoms:.1f}"
 
+    # ------------------------------------------------------------------ sanity
+    def is_connected(self, data) -> bool:
+        """A valid molecule whose graph is a single fragment (SMILES has no '.')."""
+        smi = self._valid_smiles(data)
+        return smi is not None and "." not in smi
+
+    def is_sane(self, data) -> bool:
+        """Valid AND connected AND every ring size within [3, 8]."""
+        smi = self._valid_smiles(data)
+        if smi is None or "." in smi:
+            return False
+        m = Chem.MolFromSmiles(smi)
+        return m is not None and ring_sizes_ok(m)
+
     # ----------------------------------------------------------------- metrics
-    def metrics(self, samples, reference: Optional[set] = None):
+    def metrics(self, samples, reference: Optional[set] = None, compute_kl: bool = True):
+        """Extended molecular metric suite (see :func:`molecular_metrics`).
+
+        Adds connected / disconnected / sanity / ring diagnostics and the
+        logP/TPSA/QED KL divergence on top of validity/uniqueness/novelty. The
+        KL reference distribution is derived once from ``self.reference`` and
+        cached on the instance.
+        """
         ref = reference if reference is not None else self.reference
-        return generation_metrics(self, samples, ref)
+        if compute_kl and self._ref_desc is None and self.reference:
+            self._ref_desc = property_distributions(self.reference)
+        return molecular_metrics(
+            samples, self.atom_decoder, self.bond_decoder,
+            reference_smiles=ref, reference_descriptors=self._ref_desc,
+            compute_kl=compute_kl,
+        )
+
+
+# ===========================================================================
+# Extended molecular evaluation metrics
+# ===========================================================================
+# Beyond RDKit validity/uniqueness/novelty, foundation-model evaluation tracks:
+#   - connected / disconnected: fraction of VALID mols that are a single
+#     fragment. A valid molecule can still be disconnected (SMILES with a '.'),
+#     since is_valid sanitizes the full reconstructed graph.
+#   - sanity: fraction of ALL samples that are valid AND connected AND have every
+#     ring size within [3, 8] -- a stricter, "actually usable" validity.
+#   - KL divergence of logP / TPSA / QED between generated and reference
+#     distributions (Gaussian-KDE estimate, GuacaMol-style) + aggregate score.
+
+# Each maps an RDKit Mol -> float.
+PROPERTY_FUNCS = {
+    "logp": Descriptors.MolLogP,
+    "tpsa": Descriptors.TPSA,
+    "qed": QED.qed,
+}
+
+
+def ring_sizes_ok(mol, lo: int = 3, hi: int = 8) -> bool:
+    """True iff every ring (SSSR) in ``mol`` has size within ``[lo, hi]``."""
+    for ring in mol.GetRingInfo().AtomRings():
+        if len(ring) < lo or len(ring) > hi:
+            return False
+    return True
+
+
+def descriptor_values(mol) -> Optional[dict]:
+    """{'logp':.., 'tpsa':.., 'qed':..} for an RDKit mol, or None on failure."""
+    try:
+        return {k: float(fn(mol)) for k, fn in PROPERTY_FUNCS.items()}
+    except Exception:
+        return None
+
+
+def property_distributions(smiles_iter, max_n: int = 25000, seed: int = 0) -> dict:
+    """Reference descriptor arrays from an iterable of SMILES.
+
+    Subsamples up to ``max_n`` molecules (seeded) for a stable, cheap reference
+    distribution. Returns {property: np.ndarray} over successfully-parsed mols.
+    """
+    smis = list(smiles_iter)
+    if len(smis) > max_n:
+        smis = random.Random(seed).sample(smis, max_n)
+    out = {k: [] for k in PROPERTY_FUNCS}
+    for smi in smis:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        d = descriptor_values(mol)
+        if d is None:
+            continue
+        for k in PROPERTY_FUNCS:
+            out[k].append(d[k])
+    return {k: np.asarray(v, dtype=float) for k, v in out.items()}
+
+
+def continuous_kl(ref, gen, num: int = 1000, eps: float = 1e-10) -> float:
+    """KL(P_ref || Q_gen) for 1-D samples via Gaussian-KDE (GuacaMol-style).
+
+    Returns NaN when either side has <2 samples or ~zero variance (KDE is then
+    undefined), so callers can treat it as "not measurable".
+    """
+    ref = np.asarray(ref, dtype=float)
+    gen = np.asarray(gen, dtype=float)
+    if ref.size < 2 or gen.size < 2:
+        return float("nan")
+    if np.std(ref) < 1e-8 or np.std(gen) < 1e-8:
+        return float("nan")
+    try:
+        from scipy.stats import gaussian_kde, entropy
+        kde_ref = gaussian_kde(ref)
+        kde_gen = gaussian_kde(gen)
+        lo = float(min(ref.min(), gen.min()))
+        hi = float(max(ref.max(), gen.max()))
+        if hi <= lo:
+            return float("nan")
+        x = np.linspace(lo, hi, num)
+        P = kde_ref(x) + eps
+        Q = kde_gen(x) + eps
+        return float(entropy(P, Q))
+    except Exception:
+        return float("nan")
+
+
+def molecular_metrics(
+    samples,
+    atom_decoder,
+    bond_decoder,
+    *,
+    reference_smiles=None,
+    reference_descriptors=None,
+    compute_kl: bool = True,
+    kl_ref_size: int = 25000,
+    seed: int = 0,
+    ring_lo: int = 3,
+    ring_hi: int = 8,
+) -> dict:
+    """Full molecular evaluation suite over a batch of generated PyG samples.
+
+    Returns a dict with validity, uniqueness, novelty (if a reference is given),
+    connected, disconnected, sanity, wonky_ring_frac and -- when ``compute_kl``
+    -- kl_logp / kl_tpsa / kl_qed plus the aggregate kl_score = exp(-mean KL).
+
+    Denominators are deliberately different, matching what each number means:
+      - validity, sanity: over ALL samples ("what fraction of generations are
+        valid / actually sane");
+      - connected, disconnected, wonky_ring_frac: over VALID (decoded) mols
+        only, per the agreed 'decoded molecules only' basis;
+      - uniqueness / novelty: over valid / unique respectively.
+    """
+    n = len(samples)
+    ref_set = set(reference_smiles) if reference_smiles is not None else None
+
+    valid_smiles = []
+    n_connected = 0
+    n_sane = 0
+    n_wonky = 0
+    gen_desc = {k: [] for k in PROPERTY_FUNCS}
+
+    for s in samples:
+        mol = pyg_data_to_mol(s, atom_decoder, bond_decoder)
+        smi = mol_to_smiles(mol) if mol is not None else None
+        if smi is None:
+            continue
+        rmol = Chem.MolFromSmiles(smi)
+        if rmol is None:
+            continue
+        valid_smiles.append(smi)
+        connected = "." not in smi
+        rings_ok = ring_sizes_ok(rmol, ring_lo, ring_hi)
+        if connected:
+            n_connected += 1
+        if not rings_ok:
+            n_wonky += 1
+        if connected and rings_ok:
+            n_sane += 1
+        if compute_kl:
+            d = descriptor_values(rmol)
+            if d is not None:
+                for k in PROPERTY_FUNCS:
+                    gen_desc[k].append(d[k])
+
+    n_valid = len(valid_smiles)
+    unique = set(valid_smiles)
+    n_unique = len(unique)
+
+    out = {
+        "num_samples": n,
+        "num_valid": n_valid,
+        "num_unique": n_unique,
+        "validity": n_valid / n if n else 0.0,
+        "uniqueness": n_unique / n_valid if n_valid else 0.0,
+        "sanity": n_sane / n if n else 0.0,
+        "connected": n_connected / n_valid if n_valid else 0.0,
+        "disconnected": (n_valid - n_connected) / n_valid if n_valid else 0.0,
+        "wonky_ring_frac": n_wonky / n_valid if n_valid else 0.0,
+    }
+    if ref_set is not None:
+        n_novel = sum(1 for s in unique if s not in ref_set)
+        out["novelty"] = n_novel / n_unique if n_unique else 0.0
+
+    if compute_kl:
+        if reference_descriptors is None and reference_smiles is not None:
+            reference_descriptors = property_distributions(
+                reference_smiles, max_n=kl_ref_size, seed=seed
+            )
+        if reference_descriptors is not None:
+            kls = []
+            for k in PROPERTY_FUNCS:
+                kl = continuous_kl(
+                    reference_descriptors.get(k, np.array([])),
+                    np.asarray(gen_desc[k], dtype=float),
+                )
+                out[f"kl_{k}"] = kl
+                kls.append(kl)
+            out["kl_score"] = (
+                float(np.exp(-np.mean(kls)))
+                if kls and all(np.isfinite(kls)) else float("nan")
+            )
+    return out
