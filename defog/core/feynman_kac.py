@@ -83,9 +83,17 @@ class FeynmanKacSampler(Sampler):
                  proposal_transform: Optional[Callable] = None,
                  ess_frac: Optional[float] = None, rejuvenate: bool = False,
                  jump_length: Optional[int] = None, constraint=None,
-                 n_free: Optional[int] = None, **kwargs):
+                 n_free: Optional[int] = None, composition=None, **kwargs):
         super().__init__(model, posterior_transform=proposal_transform, **kwargs)
         self.energy_fn = energy_fn
+        # Optional AdapterComposition as the PROPOSAL: the frozen-base dynamics are
+        # conditioned by the adapter(s) -- the inherited Sampler._advance threads
+        # self.composition into denoise_step -- while FK reward-tilts + resamples on
+        # top. The FK energy is scored on the ADAPTER-conditioned predicted-clean graph
+        # (target-aware), so "FK refinement over adapter conditioning" works end-to-end.
+        # composition and proposal_transform are independent (different denoise args).
+        if composition is not None:
+            self.composition = composition
         self.beta = float(beta)
         self.resample_interval = resample_interval
         self.warmup_frac = warmup_frac
@@ -117,6 +125,8 @@ class FeynmanKacSampler(Sampler):
 
     def _desc(self) -> str:
         tag = "+guided" if self.posterior_transform is not None else ""
+        if getattr(self, "composition", None) is not None and len(self.composition) > 0:
+            tag += "+adapter"
         return "FK-SMC" + tag + ("+rejuv" if self.rejuvenate else "") + \
             ("+inpaint" if self.constraint is not None else "")
 
@@ -170,8 +180,35 @@ class FeynmanKacSampler(Sampler):
         return masked.X, masked.E
 
     @torch.no_grad()
+    def _predict_clean(self, X, E, y, t_norm, node_mask):
+        """MAP clean-graph prediction for the reward. If an adapter ``composition`` is
+        the proposal, predict WITH the adapter modulation (target-aware) -- averaging
+        the branch predictions for a multi-branch composition -- so the energy reflects
+        the conditioned model rather than the unconditional base."""
+        comp = getattr(self, "composition", None)
+        if comp is None or len(comp) == 0:
+            return predict_clean(self.model, X, E, y, t_norm, node_mask)
+        K = X.size(0)
+        noisy = {"X_t": X, "E_t": E, "y_t": y, "t": t_norm, "node_mask": node_mask}
+        extra = self.model._compute_extra_data(noisy)
+        pXs, pEs = [], []
+        for br in comp.branches:
+            c = torch.as_tensor(br.condition, dtype=torch.float32, device=X.device)
+            if c.dim() == 1:
+                c = c.unsqueeze(0)
+            if c.size(0) == 1 and K > 1:
+                c = c.expand(K, -1)
+            pred = self.model.forward(noisy, extra, node_mask, cond_modulation=br.adapter(c, t=t_norm))
+            pXs.append(F.softmax(pred.X, dim=-1)); pEs.append(F.softmax(pred.E, dim=-1))
+        pX = torch.stack(pXs).mean(0); pE = torch.stack(pEs).mean(0)
+        X1 = F.one_hot(pX.argmax(-1), pX.size(-1)).float()
+        E1 = F.one_hot(pE.argmax(-1), pE.size(-1)).float()
+        ph = PlaceHolder(X=X1, E=E1, y=y).mask(node_mask)
+        return ph.X, ph.E
+
+    @torch.no_grad()
     def _potential(self, X, E, y, t_norm, node_mask):
-        X1, E1 = predict_clean(self.model, X, E, y, t_norm, node_mask)
+        X1, E1 = self._predict_clean(X, E, y, t_norm, node_mask)
         energy = self.energy_fn(X1, E1, node_mask).to(X.device).reshape(-1)
         return -self.beta * energy
 

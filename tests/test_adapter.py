@@ -12,7 +12,8 @@ import torch
 from torch_geometric.loader import DataLoader
 
 from experiments.utils import build_encoders, smiles_to_pyg_data
-from defog.core import DeFoGModel, AdaLNAdapter, AdapterComposition, ConditionBranch, AdaptedSampler, Sampler
+from defog.core import (DeFoGModel, AdaLNAdapter, AdapterComposition, ConditionBranch,
+                        AdaptedSampler, Sampler, FeynmanKacSampler)
 from defog.core.data import to_dense
 
 
@@ -259,6 +260,21 @@ def test_interior_save_load():
     return "interior adapter save/load round-trip (flags + heads)"
 
 
+def test_fk_over_adapter_runs():
+    """FeynmanKacSampler with an AdapterComposition as the proposal (FK refinement over
+    adapter conditioning): the composition is wired in, and sampling returns valid graphs."""
+    model, loader = build_tiny_model()
+    a = AdaLNAdapter.for_base(model, cond_dim=1, hidden=32).eval()
+    comp = AdapterComposition([ConditionBranch(a, torch.tensor([0.5]), 1.0)], base=model, mode="product")
+    energy = lambda X1, E1, node_mask: E1[..., 1:].sum(dim=(1, 2, 3)).float()  # toy per-graph energy
+    fk = FeynmanKacSampler(model, energy, beta=1.0, warmup_frac=0.4, sample_steps=6,
+                           eta=0.0, omega=0.0, composition=comp)
+    assert fk.composition is comp and "+adapter" in fk._desc(), "composition not wired into FK"
+    out = fk.sample(4, device="cpu", show_progress=False)
+    assert len(out) == 4 and all(d.x.size(0) >= 1 for d in out)
+    return f"FK over adapter composition runs ({fk._desc()}, {len(out)} graphs)"
+
+
 if __name__ == "__main__":
     tests = [
         test_null_equals_base,
@@ -272,6 +288,7 @@ if __name__ == "__main__":
         test_stack_groups_heterogeneous,
         test_interior_composability_bypass,
         test_interior_save_load,
+        test_fk_over_adapter_runs,
     ]
     fails = 0
     for t in tests:
