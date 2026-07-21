@@ -63,9 +63,9 @@ ROLLOUT_OMEGA: float = 0.0
 TIME_DISTORTION: str = "polydec"
 SUBSAMPLE_STEPS: int = 16
 MINIBATCH: int = 16
-LR: float = 1e-5
+LR: float = 1e-4                 # was 1e-5 (20x below the adapter's training LR) -> too weak to learn; raised
 KL_COEF: float = 0.1             # swept per-arm; KL to the pre-RL adapter
-EMA_DECAY: float = 0.999
+EMA_DECAY: float = 0.9           # was 0.999 -> EMA lagged near-original on short runs; fast EMA tracks the live weights
 GRAD_CLIP: float = 1.0
 LAMBDA_EDGE: float = 1.0
 # --- connectivity-FIRST reward: connected on-target > connected off-target >
@@ -93,6 +93,7 @@ LEVEL_NAMES: list = ["low", "high"]
 N_PER_TARGET: int = 128
 N_BASELINE: int = 256
 EVAL_CHUNK: int = 32
+EVAL_SEED: int = 1234            # PAIRED eval: fixed rng so pre/post/probe sample the SAME draws -> the delta is real, not sampling noise
 REF_SUBSAMPLE: int = 20000
 
 SEED: int = 42
@@ -188,9 +189,13 @@ def _disc(n_valid, n_disc):
 
 
 def steer_eval(base, adapter, atom_decoder, bond_decoder, prop_fn, targets, weights,
-               steps, eta, omega, td, n_per, n_base, chunk, device):
+               steps, eta, omega, td, n_per, n_base, chunk, device, seed=None):
     """Per (level,w): achieved-property MAE over CONNECTED mols + disconnection% +
-    validity%. MAE measures conditioning tightness; disc% measures the connectivity goal."""
+    validity%. MAE measures conditioning tightness; disc% measures the connectivity goal.
+    ``seed`` fixes the rng (saved+restored) so pre/post evals sample the SAME draws (paired)."""
+    _rng = torch.get_rng_state() if seed is not None else None
+    if seed is not None:
+        torch.manual_seed(seed)
     bs = Sampler(base, eta=eta, omega=omega, sample_steps=steps, time_distortion=td)
     bvals, bt, bvalid, bdisc = gen_eval(chunked(bs, n_base, chunk, device), atom_decoder, bond_decoder, prop_fn)
     out = {"baseline_mean": float(bvals.mean()) if bvals.size else None,
@@ -205,6 +210,8 @@ def steer_eval(base, adapter, atom_decoder, bond_decoder, prop_fn, targets, weig
                 "n": int(gv.size), "valid": (nvalid / tot) if tot else None, "disc": _disc(nvalid, ndisc),
                 "mean": float(gv.mean()) if gv.size else None,
                 "mae": float(np.mean(np.abs(gv - tgt))) if gv.size else None}
+    if _rng is not None:
+        torch.set_rng_state(_rng)
     return out
 
 
@@ -258,12 +265,16 @@ def experiment(e: Experiment) -> None:
     def eval_now(tag):
         ev = steer_eval(base, adapter, atom_decoder, bond_decoder, prop_fn, targets, e.GUIDANCE_WEIGHTS,
                         e.EVAL_STEPS, e.ETA, e.OMEGA, e.TIME_DISTORTION, e.N_PER_TARGET, e.N_BASELINE,
-                        e.EVAL_CHUNK, device)
+                        e.EVAL_CHUNK, device, seed=e.EVAL_SEED)
         e.log(f"[{tag}] baseline={ev['baseline_mean']}  {_fmt(ev, e.GUIDANCE_WEIGHTS)}")
         return ev
 
     e.log("=== PRE-RL eval ===")
     pre_ev = eval_now("pre-RL")
+
+    # Snapshot the INPUT adapter weights so we can prove the RL actually moved them
+    # (guards against ever again shipping an unchanged adapter as a "result").
+    input_state = {k: v.detach().clone() for k, v in adapter.state_dict().items()}
 
     trainer = AdapterGDPOTrainer(
         base, adapter, reward, kl_coef=e.KL_COEF, lr=e.LR, ema_decay=e.EMA_DECAY,
@@ -287,16 +298,22 @@ def experiment(e: Experiment) -> None:
     best = {"mae": float("inf"), "state": None, "iter": -1}
 
     def probe_eval():
-        """Cheap conditional eval at DEPLOYMENT settings (w=1, PROBE_STEPS, EMA weights):
-        mean achieved-property MAE over connected mols + min validity across levels."""
+        """PAIRED conditional eval at the DEPLOYMENT policy (w=1, EVAL_STEPS, EMA weights):
+        mean achieved-property MAE over connected mols + min validity across levels. Fixed rng
+        (saved+restored) so the probe reflects the adapter, not sampling noise. Uses the FULL
+        EVAL_STEPS (not a cheaper PROBE_STEPS) so early-stop selects a snapshot that is actually
+        best at deployment -- a shorter-step probe mis-ranks (validated: 60-step probe picked a
+        snapshot that was worse at 150 steps)."""
+        _rng = torch.get_rng_state(); torch.manual_seed(e.EVAL_SEED)
         maes, valids = [], []
         for lvl, tgt in targets.items():
             comp = AdapterComposition([ConditionBranch(adapter, torch.tensor([tgt]), 1.0)], base=base, mode="product")
-            samp = AdaptedSampler(base, comp, eta=e.ETA, omega=e.OMEGA, sample_steps=e.PROBE_STEPS, time_distortion=e.TIME_DISTORTION)
+            samp = AdaptedSampler(base, comp, eta=e.ETA, omega=e.OMEGA, sample_steps=e.EVAL_STEPS, time_distortion=e.TIME_DISTORTION)
             gv, tot, nvalid, _ = gen_eval(chunked(samp, e.PROBE_N_PER, e.EVAL_CHUNK, device), atom_decoder, bond_decoder, prop_fn)
             valids.append((nvalid / tot) if tot else 0.0)
             if gv.size:
                 maes.append(float(np.mean(np.abs(gv - tgt))))
+        torch.set_rng_state(_rng)
         return (float(np.mean(maes)) if maes else float("inf")), (min(valids) if valids else 0.0)
 
     t0 = time.time()
@@ -333,6 +350,15 @@ def experiment(e: Experiment) -> None:
         e.log(f"early-stop: deploying best snapshot from iter {best['iter']} (probe mae={best['mae']:.3f})")
     elif trainer.ema is not None:
         trainer.ema.copy_to(adapter)
+    # Sanity: how far did the deployed adapter actually move from the input? A tiny diff
+    # means the RL never learned (LR too low / EMA lag) and any pre->post MAE change is
+    # just eval noise -- surface it loudly instead of silently shipping a no-op.
+    _dep = adapter.state_dict()
+    wdiff = max(float((_dep[k] - input_state[k]).abs().max())
+                for k in input_state if _dep[k].dtype.is_floating_point)
+    e["results/deployed_weight_diff"] = wdiff
+    e.log(f"deployed adapter max|Δweight| vs input = {wdiff:.3e}"
+          + ("   ⚠️ NEAR-ZERO: RL did not learn (pre->post is noise)" if wdiff < 1e-4 else ""))
     ckpt = adapter.save(os.path.join(e.path, f"{e.PROPERTY}_adapter_rl"))
     e.log(f"Saved RL'd adapter -> {ckpt}")
 
@@ -343,6 +369,7 @@ def experiment(e: Experiment) -> None:
     summary = {"property": e.PROPERTY, "kl_coef": e.KL_COEF, "iterations": it,
                "crn": e.CRN, "rollout_eta": e.ROLLOUT_ETA, "rollouts_per_group": e.ROLLOUT_SIZE // e.N_GROUPS,
                "early_stop_best_iter": (best["iter"] if e.EARLY_STOP else None),
+               "deployed_weight_diff": wdiff, "lr": e.LR, "ema_decay": e.EMA_DECAY,
                "targets": targets, "pre": pre_ev, "post": post_ev, "mae_delta": {}}
     summary["disc_delta"] = {}
     e.log("=" * 60)
