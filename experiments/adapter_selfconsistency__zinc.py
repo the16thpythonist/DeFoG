@@ -249,6 +249,11 @@ def experiment(e: Experiment) -> None:
                          callbacks=[EMACallback(decay=0.999)])
     trainer.fit(module, loader)
 
+    # Lightning moves the whole module (base + adapter + head) to CPU during fit
+    # teardown. Re-move to device (with the EMA-baked weights) before ANY eval,
+    # else head(...) [eval 1] and AdaptedSampler(base, ...) [eval 2] crash on a
+    # cuda-input / cpu-param mismatch. (base is a registered submodule too.)
+    module.to(device)
     adapter.eval(); head.eval()
     a_path = adapter.save(os.path.join(e.path, f"{e.PROPERTY}_adapter_sc"))
     torch.save({"state_dict": head.state_dict(), "na": na, "nb": nb, "hid": e.HEAD_HIDDEN,
