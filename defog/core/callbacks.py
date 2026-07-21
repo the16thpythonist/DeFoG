@@ -546,6 +546,12 @@ class TrainingMonitorCallback(pl.Callback):
         # generation probe fires on round epochs (10, 20, 30, ...).
         if trainer.sanity_checking:
             return
+        # DDP: the figure, the generation probe (sampling), and best-checkpoint
+        # saving are rank-0 only -- otherwise every rank samples and races to write
+        # the same archive / best_model.ckpt. Per-epoch accumulators are reset in
+        # on_train_epoch_start on ALL ranks, so this early return cannot leak them.
+        if not trainer.is_global_zero:
+            return
 
         epoch_time = time.time() - self._epoch_start_time
         self.history["epoch_time"].append(epoch_time)
@@ -1192,6 +1198,8 @@ class SampleVisualizationCallback(pl.Callback):
         # Skip Lightning's pre-training sanity-check validation so previews land
         # on round epochs (every_k_epochs then counts real epochs only).
         if trainer.sanity_checking:
+            return
+        if not trainer.is_global_zero:  # DDP: render/track previews on rank 0 only
             return
 
         self._val_epoch_count += 1
