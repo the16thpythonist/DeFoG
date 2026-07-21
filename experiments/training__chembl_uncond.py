@@ -96,6 +96,19 @@ EPOCHS: int = 100
 #     Wall-clock cap for trainer.fit so end-of-run eval still fits inside the
 #     SLURM walltime (JUPITER hard limit = 12h). None = no cap (local runs).
 MAX_TIME_HOURS: float = None
+# :param CKPT_DIR:
+#     Stable directory for a resumable full-state checkpoint (last.ckpt = model +
+#     optimizer + LR schedule + EMA shadow + epoch). Enables chaining across 12h
+#     JUPITER jobs. None => weights-only behavior (the LR-sweep default).
+CKPT_DIR: str = None
+# :param RESUME_CKPT:
+#     Explicit checkpoint to resume from. If None and CKPT_DIR/last.ckpt exists,
+#     the run auto-resumes from it, so a chained job just re-runs the same script.
+RESUME_CKPT: str = None
+# :param CKPT_EVERY_N_STEPS:
+#     How often to write last.ckpt (a max_time cut mid-epoch then loses <= this
+#     many steps). Only used when CKPT_DIR is set.
+CKPT_EVERY_N_STEPS: int = 2000
 BATCH_SIZE: int = 256
 NUM_WORKERS: int = 8
 LEARNING_RATE: float = 2e-4
@@ -272,12 +285,34 @@ def experiment(e: Experiment) -> None:
         mins = int(round((e.MAX_TIME_HOURS - hrs) * 60))
         max_time = {"hours": hrs, "minutes": mins}
         e.log(f"Trainer max_time = {hrs}h{mins:02d}m (leaves room for eval before SLURM kill)")
+
+    # Resumable full-state checkpointing (optimizer + LR + EMA shadow + epoch) for
+    # multi-job chaining. When CKPT_DIR is set, write last.ckpt there and auto-resume
+    # from it if present. For a continuous cosine schedule across links, keep EPOCHS
+    # (the cosine horizon) fixed and let MAX_TIME_HOURS cut each job.
+    resume_path = e.RESUME_CKPT
+    enable_ckpt = False
+    if e.CKPT_DIR:
+        os.makedirs(e.CKPT_DIR, exist_ok=True)
+        from pytorch_lightning.callbacks import ModelCheckpoint
+        callbacks.append(ModelCheckpoint(
+            dirpath=e.CKPT_DIR, save_last=True, save_top_k=0,
+            every_n_train_steps=e.CKPT_EVERY_N_STEPS,
+        ))
+        enable_ckpt = True
+        auto = os.path.join(e.CKPT_DIR, "last.ckpt")
+        if resume_path is None and os.path.exists(auto):
+            resume_path = auto
+        e.log(f"Resumable checkpointing -> {e.CKPT_DIR} (every {e.CKPT_EVERY_N_STEPS} steps); "
+              + (f"RESUMING from {resume_path}" if resume_path else "fresh start"))
+
     trainer = pl.Trainer(
         max_epochs=e.EPOCHS, max_time=max_time, accelerator="auto", devices=1,
-        enable_progress_bar=True, enable_checkpointing=False, logger=False,
+        enable_progress_bar=True, enable_checkpointing=enable_ckpt, logger=False,
         callbacks=callbacks,
     )
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader,
+                ckpt_path=resume_path)
 
     model_path = model.save(os.path.join(e.path, "model"))
     e.log(f"Saved final model to {model_path}")
