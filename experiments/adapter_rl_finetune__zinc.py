@@ -58,7 +58,7 @@ ROLLOUT_SIZE: int = 128          # K trajectories / iteration (= N_GROUPS * roll
 N_GROUPS: int = 8                # distinct targets / iteration -> 16 rollouts each
 CRN: bool = True                 # common random numbers: share start noise+size within each target group
 ROLLOUT_STEPS: int = 250
-ROLLOUT_ETA: float = 5.0         # SWEPT per-arm; under CRN this is the sole within-group diversity source
+ROLLOUT_ETA: float = 1.0         # sweep winner (job 1006501): low eta best under CRN; sole within-group diversity source
 ROLLOUT_OMEGA: float = 0.0
 TIME_DISTORTION: str = "polydec"
 SUBSAMPLE_STEPS: int = 16
