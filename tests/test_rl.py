@@ -323,9 +323,8 @@ def test_optional_features_default_to_noop(small_model):
     # all new features off by default -> behavior identical to before
     t = GDPOTrainer(small_model, edge_count_reward, kl_coef=0.0, ema_decay=None)
     assert t.positive_only is False
-    assert t.kl_anchor == "fixed"
     assert t.kl_target is None
-    assert t._anchor is None
+    assert t.advantage_mode == "mean"   # Dr. GRPO is the default
 
 
 def test_positive_only_clamps_and_still_learns(small_model):
@@ -355,36 +354,16 @@ def test_positive_only_clamps_and_still_learns(small_model):
     assert after > before, f"positive-only did not learn: {before:.2f} -> {after:.2f}"
 
 
-def test_moving_anchor_follows_policy_fixed_stays_frozen(small_model):
-    torch.manual_seed(21)
-    model = small_model
-    init = {k: v.detach().clone() for k, v in model.state_dict().items()}
-
-    def max_dev(sd):
-        return max(float((sd[k] - init[k]).abs().max())
-                   for k in init if sd[k].dtype.is_floating_point)
-
-    # moving anchor: the reference should drift toward the (changing) policy
-    mov = GDPOTrainer(model, edge_count_reward, rollout_size=16, sample_steps=5,
-                      subsample_steps=None, eta=0.0, time_distortion="identity",
-                      kl_coef=0.1, kl_anchor="moving", anchor_decay=0.5,
-                      lr=5e-3, ema_decay=None, seed=21)
-    assert mov._anchor is not None
-    mov.fit(6)
-    assert max_dev(mov.ref.state_dict()) > 1e-5  # ref moved away from init
-
-
-def test_fixed_anchor_reference_is_frozen(small_model):
+def test_kl_reference_is_frozen(small_model):
     torch.manual_seed(22)
     model = small_model
     fix = GDPOTrainer(model, edge_count_reward, rollout_size=16, sample_steps=5,
                       subsample_steps=None, eta=0.0, time_distortion="identity",
-                      kl_coef=0.1, kl_anchor="fixed", lr=5e-3, ema_decay=None, seed=22)
-    assert fix._anchor is None
+                      kl_coef=0.1, lr=5e-3, ema_decay=None, seed=22)
     ref0 = {k: v.detach().clone() for k, v in fix.ref.state_dict().items()}
     fix.fit(6)
     ref1 = fix.ref.state_dict()
-    # a fixed anchor never updates the reference
+    # the KL reference is a fixed frozen copy of the pretrained weights; never updates
     assert all(torch.equal(ref0[k], ref1[k]) for k in ref0)
     assert all(not p.requires_grad for p in fix.ref.parameters())
 
@@ -410,3 +389,196 @@ def test_reward_from_energy_floors_invalid():
     out = r(None, None, torch.ones(2, 3, dtype=torch.bool))
     assert abs(float(out[0]) - (-0.5)) < 1e-6
     assert abs(float(out[1]) - (-5.0)) < 1e-6
+
+
+# ======================================================================
+# Adapter GDPO: behavior == scored (the eager gradient scores the SAME
+# product-of-experts blend the rollout samples, at any CFG weight)
+# ======================================================================
+def _model_composed_logmarginal(base, adapter, X_t, E_t, t, node_mask, cond, w, mode):
+    """Reference: the model's OWN composed clean-graph marginal at the terminal decode
+    (mirrors DeFoGModel._denoise_step_composed) -- a single batched (N+1)*bs forward
+    through the composition, then _blend_logp. This is the behavior policy."""
+    from defog.core.adapter import AdapterComposition, ConditionBranch
+    from defog.core.data import PlaceHolder
+    bs, rep = X_t.size(0), 2
+    y0 = torch.zeros(bs, 0)
+    base_noisy = {"X_t": X_t, "E_t": E_t, "y_t": y0, "t": t, "node_mask": node_mask}
+    extra = base._compute_extra_data(base_noisy)
+    extra_b = PlaceHolder(X=extra.X.repeat(rep, 1, 1), E=extra.E.repeat(rep, 1, 1, 1),
+                          y=extra.y.repeat(rep, 1))
+    nd = {"X_t": X_t.repeat(rep, 1, 1), "E_t": E_t.repeat(rep, 1, 1, 1),
+          "y_t": y0.repeat(rep, 1), "t": t.repeat(rep, 1), "node_mask": node_mask.repeat(rep, 1)}
+    comp = AdapterComposition([ConditionBranch(adapter, cond, w)], base=base, mode=mode)
+    mod = comp.build_modulation(bs, t)
+    pred = base.forward(nd, extra_b, nd["node_mask"], cond_modulation=mod)
+    pX = F.softmax(pred.X, -1).view(rep, bs, *pred.X.shape[1:])
+    pE = F.softmax(pred.E, -1).view(rep, bs, *pred.E.shape[1:])
+    ww = comp.weights(X_t.device, dtype=pX.dtype)
+    qX = base._blend_logp(pX, ww, comp.mode)
+    qE = base._blend_logp(pE, ww, comp.mode)
+    return F.log_softmax(qX, -1), F.log_softmax(qE, -1)
+
+
+def _make_adapter(base):
+    from defog.core.adapter import AdaLNAdapter
+    a = AdaLNAdapter.for_base(base, cond_dim=2, time_conditioned=True)
+    with torch.no_grad():                        # off the zero-init no-op so cond != uncond
+        for p in a.parameters():
+            p.add_(0.2 * torch.randn_like(p))
+    return a
+
+
+def test_adapter_scoring_matches_rollout_blend_at_any_weight(small_model):
+    # The fix: the adapter eager log-prob must SCORE the endpoint under the SAME
+    # composed policy the rollout samples -- at any CFG weight, not only w=1. Compare
+    # the scored value (what enters the gradient) to scoring the endpoint under the
+    # model's OWN composed clean marginal.
+    from defog.core.rl import adapter_eager_logprob
+    torch.manual_seed(31)
+    base = small_model.eval()
+    adapter = _make_adapter(base)
+    bs, n = 3, 7
+    node_mask = _mask(bs, n, [7, 6, 5])
+    X_t, E_t = _rand_onehot_graph(bs, n, 4, 2, node_mask)
+    X1, E1 = _rand_onehot_graph(bs, n, 4, 2, node_mask)
+    cond = torch.randn(bs, 2)
+    t = torch.full((bs, 1), 0.4)
+    emask = _edge_upper_mask(node_mask)
+    for w in (1.0, 2.0):
+        got = adapter_eager_logprob(base, adapter, X_t, E_t, cond, t, X1, E1, node_mask,
+                                    weight=w, mode="product", reduction="mean")
+        rX, rE = _model_composed_logmarginal(base, adapter, X_t, E_t, t, node_mask, cond, w, "product")
+        lpX, lpE = (X1 * rX).sum(-1), (E1 * rE).sum(-1)
+        ref = ((lpX * node_mask).sum(-1) / node_mask.sum(-1).clamp_min(1)
+               + (lpE * emask).sum(dim=(1, 2)) / emask.sum(dim=(1, 2)).clamp_min(1))
+        # atol swallows float32 log/exp round-trip noise; a real formula bug (wrong
+        # weight, logits-not-softmax, uncond/cond swap) would be O(1), not O(1e-3).
+        assert torch.allclose(got, ref, atol=1e-3), f"scored logprob != rollout blend at w={w}"
+
+
+def test_adapter_scoring_w1_matches_plain_conditional_on_realistic_endpoint(small_model):
+    # Backward compat where it matters: for a HIGH-PROB endpoint -- the model's own
+    # argmax, i.e. what a rollout actually produces -- the composed w=1 scoring matches
+    # the plain conditional. (The _blend_logp eps floor only diverges for near-zero-prob
+    # classes, which a real rollout endpoint never selects; a RANDOM endpoint would.)
+    from defog.core.rl import adapter_eager_logprob
+    torch.manual_seed(32)
+    base = small_model.eval()
+    adapter = _make_adapter(base)
+    bs, n = 3, 8
+    node_mask = _mask(bs, n, [8, 6, 5])
+    X_t, E_t = _rand_onehot_graph(bs, n, 4, 2, node_mask)
+    cond = torch.randn(bs, 2)
+    t = torch.full((bs, 1), 0.4)
+    y0 = torch.zeros(bs, 0)
+    noisy = {"X_t": X_t, "E_t": E_t, "y_t": y0, "t": t, "node_mask": node_mask}
+    pred = base.forward(noisy, base._compute_extra_data(noisy), node_mask,
+                        cond_modulation=adapter(cond, t=t))
+    X1 = F.one_hot(pred.X.argmax(-1), 4).float() * node_mask[..., None]   # high-prob G1
+    E1 = F.one_hot(pred.E.argmax(-1), 2).float()
+    got = adapter_eager_logprob(base, adapter, X_t, E_t, cond, t, X1, E1, node_mask,
+                                weight=1.0, mode="product", reduction="mean")
+    lpX = (X1 * F.log_softmax(pred.X, -1)).sum(-1)
+    lpE = (E1 * F.log_softmax(pred.E, -1)).sum(-1)
+    emask = _edge_upper_mask(node_mask)
+    ref = ((lpX * node_mask).sum(-1) / node_mask.sum(-1).clamp_min(1)
+           + (lpE * emask).sum(dim=(1, 2)) / emask.sum(dim=(1, 2)).clamp_min(1))
+    assert torch.allclose(got, ref, atol=1e-3)
+
+
+def test_adapter_scoring_grad_only_to_adapter(small_model):
+    from defog.core.rl import _base_uncond_softmax, _compose_logmarginals
+    torch.manual_seed(33)
+    base = small_model.eval().requires_grad_(False)
+    adapter = _make_adapter(base)
+    bs, n = 2, 6
+    node_mask = _mask(bs, n, [6, 5])
+    X_t, E_t = _rand_onehot_graph(bs, n, 4, 2, node_mask)
+    cond = torch.randn(bs, 2)
+    t = torch.full((bs, 1), 0.3)
+    puX, puE, noisy, extra = _base_uncond_softmax(base, X_t, E_t, t, node_mask)
+    logpX, logpE = _compose_logmarginals(base, adapter, noisy, extra, node_mask, cond, puX, puE, 2.0, "product")
+    (logpX.sum() + logpE.sum()).backward()
+    assert all(p.grad is None for p in base.parameters())      # frozen base gets no grad
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in adapter.parameters())
+
+
+def test_adapter_trainer_step_at_weight2_updates_adapter(small_model):
+    # End-to-end: rollout + update at rollout_weight=2 with KL on runs and moves the
+    # adapter (base frozen). Exercises the shared weight/mode source-of-truth path.
+    from defog.core.rl import AdapterGDPOTrainer
+    torch.manual_seed(34)
+    base = small_model
+    adapter = _make_adapter(base)
+
+    def cond_sampler():
+        return torch.randn(8, 2), torch.zeros(8, dtype=torch.long)
+
+    def cond_reward(X1, E1, node_mask, cond):
+        emask = _edge_upper_mask(node_mask)
+        return ((E1.argmax(-1) == 1).float() * emask).sum(dim=(1, 2))
+
+    before = [p.detach().clone() for p in adapter.parameters()]
+    trainer = AdapterGDPOTrainer(
+        base, adapter, cond_reward, condition_sampler=cond_sampler,
+        rollout_weight=2.0, kl_coef=0.1, rollout_size=8, sample_steps=5,
+        subsample_steps=2, minibatch_size=4, eta=0.0, time_distortion="identity",
+        lr=1e-2, ema_decay=None, seed=34,
+    )
+    m = trainer.step()
+    assert all(v == v for v in (m["loss"], m["kl"], m["grad_norm"]))   # finite (not NaN)
+    assert all(not p.requires_grad for p in base.parameters())
+    assert any(not torch.equal(b, p) for b, p in zip(before, adapter.parameters())), \
+        "adapter did not update"
+
+
+# ======================================================================
+# Common random numbers (shared start noise+size within an advantage group)
+# ======================================================================
+def test_crn_init_state_shares_within_group_and_differs_across(small_model):
+    from defog.core.rl import RolloutSampler
+    group_ids = torch.tensor([0, 0, 0, 1, 1, 1])
+    s = RolloutSampler(small_model, group_ids=group_ids, crn=True)
+    bs, n = 6, 7
+    node_mask = _mask(bs, n, [7, 5, 6, 4, 7, 3])   # varied sizes to prove replication
+    X, E = _rand_onehot_graph(bs, n, 4, 2, node_mask)
+    n_nodes = node_mask.sum(-1).long()
+    X2, E2, nm2, nn2 = s._init_state(X.clone(), E.clone(), node_mask.clone(), n_nodes.clone())
+    for gid in (0, 1):
+        idx = (group_ids == gid).nonzero(as_tuple=True)[0]
+        r = idx[0]
+        for j in idx.tolist():
+            assert torch.equal(X2[j], X2[r]) and torch.equal(E2[j], E2[r])
+            assert torch.equal(nm2[j], nm2[r]) and int(nn2[j]) == int(nn2[r])
+    # each group took its representative's size (member 0): group0->row0 (7), group1->row3 (4)
+    assert nn2.tolist() == [7, 7, 7, 4, 4, 4]
+
+
+def test_crn_off_is_noop(small_model):
+    from defog.core.rl import RolloutSampler
+    s = RolloutSampler(small_model, group_ids=torch.tensor([0, 0, 1, 1]), crn=False)
+    bs, n = 4, 6
+    node_mask = _mask(bs, n, [6, 5, 4, 6])
+    X, E = _rand_onehot_graph(bs, n, 4, 2, node_mask)
+    n_nodes = node_mask.sum(-1).long()
+    X2, E2, nm2, nn2 = s._init_state(X.clone(), E.clone(), node_mask.clone(), n_nodes.clone())
+    assert torch.equal(X2, X) and torch.equal(E2, E)
+    assert torch.equal(nm2, node_mask) and torch.equal(nn2, n_nodes)
+
+
+def test_crn_rollout_first_recorded_state_shared_within_group(small_model):
+    # End-to-end: through Sampler.sample -> _init_state -> _pre_step, the initial
+    # recorded state is identical within each group (shared noise), different across.
+    from defog.core.rl import RolloutSampler
+    torch.manual_seed(42)
+    group_ids = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+    s = RolloutSampler(small_model, group_ids=group_ids, crn=True, sample_steps=3,
+                       eta=0.0, time_distortion="identity", subsample_idx=None)
+    s.sample(8, device=torch.device("cpu"), show_progress=False)
+    x0 = s.trace_X[0]                          # state entering step 0 = the initial noise
+    for gid in (0, 1):
+        idx = (group_ids == gid).nonzero(as_tuple=True)[0]
+        r = int(idx[0])
+        for j in idx.tolist():
+            assert torch.equal(x0[j], x0[r])

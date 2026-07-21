@@ -54,10 +54,11 @@ PROPERTY: str = "logp"           # logp | tpsa
 # --- RL (GDPO) ---
 MAX_TIME_HOURS: float = 4.0      # RL-loop wall budget (evals happen outside it)
 MAX_ITERS: int = 100000          # unreached cap; time bounds it
-ROLLOUT_SIZE: int = 64           # K trajectories / iteration
-N_GROUPS: int = 8                # distinct targets / iteration (K/N_GROUPS rollouts each)
+ROLLOUT_SIZE: int = 128          # K trajectories / iteration (= N_GROUPS * rollouts-per-group)
+N_GROUPS: int = 8                # distinct targets / iteration -> 16 rollouts each
+CRN: bool = True                 # common random numbers: share start noise+size within each target group
 ROLLOUT_STEPS: int = 250
-ROLLOUT_ETA: float = 5.0
+ROLLOUT_ETA: float = 5.0         # SWEPT per-arm; under CRN this is the sole within-group diversity source
 ROLLOUT_OMEGA: float = 0.0
 TIME_DISTORTION: str = "polydec"
 SUBSAMPLE_STEPS: int = 16
@@ -76,12 +77,17 @@ PROP_CLAMP: float = 3.0           # connected reward in [-PROP_CLAMP, 0]
 TARGET_RANGE_PCT: list = [1, 99]  # amortized RL targets sampled uniform over this range
 LOG_EVERY: int = 10
 PROBE_EVERY: int = 40
+# --- early stopping: keep the best EMA snapshot by periodic probe MAE (validity-gated) ---
+EARLY_STOP: bool = True
+PROBE_STEPS: int = 100           # cheap denoising steps for the periodic probe
+PROBE_N_PER: int = 48            # samples per eval target during a probe
+VALIDITY_FLOOR_MARGIN: float = 0.05  # a snapshot must keep validity >= (pre-RL - this) to be eligible
 
 # --- Evaluation (pre & post RL) ---
 EVAL_STEPS: int = 500
 ETA: float = 5.0
 OMEGA: float = 0.0
-GUIDANCE_WEIGHTS: list = [1.0, 2.0]
+GUIDANCE_WEIGHTS: list = [1.0]  # eval the optimized policy: RL rolls out / scores at w=1 only
 TARGET_PERCENTILES: list = [5, 95]
 LEVEL_NAMES: list = ["low", "high"]
 N_PER_TARGET: int = 128
@@ -264,11 +270,35 @@ def experiment(e: Experiment) -> None:
         rollout_size=e.ROLLOUT_SIZE, sample_steps=e.ROLLOUT_STEPS, eta=e.ROLLOUT_ETA,
         omega=e.ROLLOUT_OMEGA, time_distortion=e.TIME_DISTORTION, condition_sampler=cond_sampler,
         subsample_steps=e.SUBSAMPLE_STEPS, minibatch_size=e.MINIBATCH, lambda_edge=e.LAMBDA_EDGE,
+        crn=e.CRN,
         grad_clip=e.GRAD_CLIP, seed=e.SEED, device=device,
     )
 
     e.log(f"=== RL fine-tuning: max_time={e.MAX_TIME_HOURS}h rollout(K={e.ROLLOUT_SIZE},G={e.N_GROUPS},"
-          f"{e.ROLLOUT_STEPS} steps) lr={e.LR} kl={e.KL_COEF} ===")
+          f"per={e.ROLLOUT_SIZE // e.N_GROUPS},crn={e.CRN},eta={e.ROLLOUT_ETA},{e.ROLLOUT_STEPS} steps) "
+          f"lr={e.LR} kl={e.KL_COEF} early_stop={e.EARLY_STOP} ===")
+
+    # early-stop bookkeeping: keep the best (validity-gated) EMA snapshot by probe MAE
+    w1 = str(e.GUIDANCE_WEIGHTS[0])
+    pre_valid_floor = 0.0
+    if e.EARLY_STOP:
+        vs = [pre_ev["levels"][lvl]["per_w"][w1]["valid"] or 0.0 for lvl in e.LEVEL_NAMES]
+        pre_valid_floor = max(0.0, min(vs) - e.VALIDITY_FLOOR_MARGIN)
+    best = {"mae": float("inf"), "state": None, "iter": -1}
+
+    def probe_eval():
+        """Cheap conditional eval at DEPLOYMENT settings (w=1, PROBE_STEPS, EMA weights):
+        mean achieved-property MAE over connected mols + min validity across levels."""
+        maes, valids = [], []
+        for lvl, tgt in targets.items():
+            comp = AdapterComposition([ConditionBranch(adapter, torch.tensor([tgt]), 1.0)], base=base, mode="product")
+            samp = AdaptedSampler(base, comp, eta=e.ETA, omega=e.OMEGA, sample_steps=e.PROBE_STEPS, time_distortion=e.TIME_DISTORTION)
+            gv, tot, nvalid, _ = gen_eval(chunked(samp, e.PROBE_N_PER, e.EVAL_CHUNK, device), atom_decoder, bond_decoder, prop_fn)
+            valids.append((nvalid / tot) if tot else 0.0)
+            if gv.size:
+                maes.append(float(np.mean(np.abs(gv - tgt))))
+        return (float(np.mean(maes)) if maes else float("inf")), (min(valids) if valids else 0.0)
+
     t0 = time.time()
     deadline = t0 + e.MAX_TIME_HOURS * 3600
     history = []
@@ -279,24 +309,40 @@ def experiment(e: Experiment) -> None:
         if it % e.LOG_EVERY == 0:
             e.log(f"[iter {it}] reward={m['reward_mean']:+.3f}(min {m['reward_min']:+.2f}) "
                   f"kl={m['kl']:.4f} adv_std={m['adv_std']:.2f} grad={m['grad_norm']:.2f}")
-        if e.PROBE_EVERY and it > 0 and it % e.PROBE_EVERY == 0:
-            pv = eval_now(f"iter{it}")
-            e.track("rl_progress_reward", None) if False else None
+        if e.EARLY_STOP and e.PROBE_EVERY and it > 0 and it % e.PROBE_EVERY == 0:
+            backup = {k: v.detach().clone() for k, v in adapter.state_dict().items()}
+            if trainer.ema is not None:
+                trainer.ema.copy_to(adapter)
+            mae, valid = probe_eval()
+            adapter.load_state_dict(backup)              # restore live training weights
+            improved = (valid >= pre_valid_floor) and (mae < best["mae"])
+            if improved:
+                src = trainer.ema.state_dict() if trainer.ema is not None else adapter.state_dict()
+                best = {"mae": mae, "iter": it, "state": {k: v.detach().clone() for k, v in src.items()}}
+            e.track("probe_mae", float(mae)); e.track("probe_valid", float(valid))
+            e.log(f"[probe iter{it}] mae={mae:.3f} valid={valid:.1%} floor={pre_valid_floor:.1%} "
+                  f"best={best['mae']:.3f}@{best['iter']} {'*NEW*' if improved else ''}")
         it += 1
     e.log(f"RL done: {it} iterations in {(time.time()-t0)/60:.1f} min")
     e.commit_json("rl_history.json", history)
 
-    ckpt = trainer.save(os.path.join(e.path, f"{e.PROPERTY}_adapter_rl"))
-    e.log(f"Saved RL'd adapter -> {ckpt}")
-    # load EMA weights into the live adapter for the post eval
-    if trainer.ema is not None:
+    # Deployment weights: the best early-stop snapshot (validity-gated probe minimum),
+    # else the final EMA. Load into the live adapter, then save + eval THOSE weights.
+    if e.EARLY_STOP and best["state"] is not None:
+        adapter.load_state_dict(best["state"])
+        e.log(f"early-stop: deploying best snapshot from iter {best['iter']} (probe mae={best['mae']:.3f})")
+    elif trainer.ema is not None:
         trainer.ema.copy_to(adapter)
+    ckpt = adapter.save(os.path.join(e.path, f"{e.PROPERTY}_adapter_rl"))
+    e.log(f"Saved RL'd adapter -> {ckpt}")
 
     e.log("=== POST-RL eval ===")
     post_ev = eval_now("post-RL")
 
     # -- compare + plot MAE pre vs post --------------------------------------
     summary = {"property": e.PROPERTY, "kl_coef": e.KL_COEF, "iterations": it,
+               "crn": e.CRN, "rollout_eta": e.ROLLOUT_ETA, "rollouts_per_group": e.ROLLOUT_SIZE // e.N_GROUPS,
+               "early_stop_best_iter": (best["iter"] if e.EARLY_STOP else None),
                "targets": targets, "pre": pre_ev, "post": post_ev, "mae_delta": {}}
     summary["disc_delta"] = {}
     e.log("=" * 60)
@@ -340,9 +386,13 @@ def testing(e: Experiment):
     e.N_PER_TARGET = 8
     e.N_BASELINE = 8
     e.EVAL_CHUNK = 8
-    e.GUIDANCE_WEIGHTS = [2.0]
+    e.GUIDANCE_WEIGHTS = [1.0]
     e.REF_SUBSAMPLE = 300
-    e.PROBE_EVERY = 0
+    e.PROBE_EVERY = 1
+    e.PROBE_STEPS = 5
+    e.PROBE_N_PER = 8
+    e.EARLY_STOP = True
+    e.CRN = True
     e.LOG_EVERY = 1
     e.BASE_CKPT = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
 

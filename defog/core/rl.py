@@ -155,7 +155,7 @@ def group_advantage(r, groups=None, mode: str = "grpo", eps: float = 1e-4,
 
     ``mode``: ``"grpo"`` -> ``(r - mu)/(sigma + eps)`` (removes reward scale AND
     offset, so one ``lr`` transfers across arbitrary rewards); ``"mean"`` -> ``r -
-    mu`` (offset-only control variate); ``"none"`` -> ``r``. With ``groups`` (int
+    mu`` (offset-only control variate; = Dr. GRPO, no std-norm); ``"none"`` -> ``r``. With ``groups`` (int
     ids, e.g. per-target for multi-condition runs) the statistics are computed
     within each group. Optionally clamped to ``+-clip``.
     """
@@ -236,9 +236,17 @@ class RolloutSampler(Sampler):
     the gradient is computed later by :func:`eager_logprob` in a fresh pass.
     """
 
-    def __init__(self, model, *, subsample_idx: Optional[Sequence[int]] = None, **kwargs):
+    def __init__(self, model, *, subsample_idx: Optional[Sequence[int]] = None,
+                 group_ids=None, crn: bool = False, **kwargs):
         super().__init__(model, **kwargs)
         self.subsample_idx = set(subsample_idx) if subsample_idx is not None else None
+        # Common random numbers: when `crn` and `group_ids` are given, every member of
+        # an advantage group starts from the SAME initial noise + graph size (see
+        # `_init_state`), so the group-relative advantage reflects the sampling
+        # stochasticity (eta), not the luck of the initial draw. Needs eta>0 (or the
+        # inherent multinomial step noise) for any within-group diversity.
+        self.group_ids = group_ids
+        self.crn = bool(crn)
         self._step = 0
         self.trace_X: List[torch.Tensor] = []
         self.trace_E: List[torch.Tensor] = []
@@ -267,6 +275,23 @@ class RolloutSampler(Sampler):
         self.endpoint = (X.detach(), E.detach())
         self.end_node_mask = node_mask.detach()
         return X, E
+
+    def _init_state(self, X, E, node_mask, n_nodes):
+        """Common random numbers: overwrite every group member's initial state with
+        its group representative's (member 0), so all members of an advantage group
+        start from the same noised graph AND the same size. No-op unless `crn` and
+        `group_ids` are set."""
+        if not self.crn or self.group_ids is None:
+            return X, E, node_mask, n_nodes
+        g = torch.as_tensor(self.group_ids, device=X.device)
+        for gid in torch.unique(g):
+            idx = (g == gid).nonzero(as_tuple=True)[0]
+            r = idx[0]
+            X[idx] = X[r].clone()
+            E[idx] = E[r].clone()
+            node_mask[idx] = node_mask[r].clone()
+            n_nodes[idx] = n_nodes[r].clone()
+        return X, E, node_mask, n_nodes
 
 
 class RolloutBuffer:
@@ -310,7 +335,8 @@ class GDPOTrainer:
         subsample_steps: how many noisy states per trajectory enter the gradient
             (None -> all). ``subsample``: "stratified" | "uniform" | "late".
         lambda_edge / reduction: passed to :func:`eager_logprob`.
-        advantage_mode / advantage_clip / advantage_eps: variance reduction.
+        advantage_mode / advantage_clip / advantage_eps: variance reduction
+            (advantage_mode default "mean" = Dr. GRPO; "grpo" adds std-normalization).
         kl_coef / ref_model: KL-to-frozen-reference strength (0 -> no ref built).
         lr / weight_decay / grad_clip / ema_decay: optimization.
     """
@@ -329,14 +355,20 @@ class GDPOTrainer:
         size_dist=None,
         num_nodes=None,
         condition_sampler: Optional[Callable] = None,
+        # common random numbers: share the initial noise+size within each advantage
+        # group so the group-relative baseline has lower variance (needs groups + eta>0).
+        crn: bool = False,
         # eager gradient
         subsample_steps: Optional[int] = 16,
         subsample: str = "stratified",
         minibatch_size: Optional[int] = 16,
         lambda_edge: float = 1.0,
         reduction: str = "mean",
-        # advantage
-        advantage_mode: str = "grpo",
+        # advantage. Default "mean" (Dr. GRPO): a mean baseline WITHOUT the per-group
+        # std-normalization, which otherwise amplifies medium-variance groups and
+        # biases learning toward mid-difficulty targets. "grpo" restores the std-
+        # normalized form; "none" uses the raw reward.
+        advantage_mode: str = "mean",
         advantage_clip: Optional[float] = 5.0,
         advantage_eps: float = 1e-4,
         # positive-only / RAFT: clamp the advantage to >=0 so the loss NEVER pushes
@@ -347,11 +379,6 @@ class GDPOTrainer:
         # KL to reference
         kl_coef: float = 0.0,
         ref_model=None,
-        # KL anchor: "fixed" = frozen initial weights (a floor pinned to pretrained);
-        # "moving" = a slow EMA of the policy (a trust region that FOLLOWS the policy),
-        # letting it drift far from pretrained without collapsing. Optional.
-        kl_anchor: str = "fixed",
-        anchor_decay: float = 0.99,
         # adaptive KL: if set, nudge kl_coef each step toward this target KL. Optional.
         kl_target: Optional[float] = None,
         # optim
@@ -372,6 +399,7 @@ class GDPOTrainer:
         self.size_dist = size_dist
         self.num_nodes = num_nodes
         self.condition_sampler = condition_sampler
+        self.crn = bool(crn)
         self.subsample_steps = subsample_steps
         self.subsample = subsample
         self.minibatch_size = minibatch_size
@@ -382,8 +410,6 @@ class GDPOTrainer:
         self.advantage_eps = advantage_eps
         self.positive_only = bool(positive_only)
         self.kl_coef = float(kl_coef)
-        self.kl_anchor = kl_anchor
-        self.anchor_decay = anchor_decay
         self.kl_target = kl_target
         self.grad_clip = grad_clip
         self.device = device if device is not None else model.device
@@ -394,15 +420,10 @@ class GDPOTrainer:
 
         # Reference for the KL term. Built from hyperparameters + weight copy (NOT
         # copy.deepcopy -- avoids duplicating a live LightningModule). Only when KL
-        # is on. For a MOVING anchor, an extra EMA of the policy is tracked and its
-        # weights are synced into the reference each step (trust region that follows
-        # the policy), so the reference is not frozen at the initial weights.
+        # is on. The reference is a fixed frozen copy of the pretrained weights.
         self.ref = None
-        self._anchor = None
         if self.kl_coef > 0:
             self.ref = ref_model if ref_model is not None else self._frozen_reference()
-            if self.kl_anchor == "moving":
-                self._anchor = EMA(model, self.anchor_decay)
 
     def _frozen_reference(self):
         cls = type(self.model)
@@ -445,6 +466,7 @@ class GDPOTrainer:
         sampler = RolloutSampler(
             self.model, subsample_idx=idx, eta=self.eta, omega=self.omega,
             sample_steps=self.sample_steps, time_distortion=self.time_distortion,
+            group_ids=groups, crn=self.crn,
             # CFG is a sampling heuristic, not a differentiable policy: force it off
             # so the behavior policy matches the plain-conditional gradient recompute
             # (else conditional rollouts are CFG-tilted but the gradient is not).
@@ -524,12 +546,6 @@ class GDPOTrainer:
         buf = self.rollout()
         metrics = self.update(buf)
 
-        # moving anchor: advance the EMA trust region and sync it into the KL
-        # reference, so subsequent KLs are measured against a recent version of the
-        # policy rather than the frozen initial weights.
-        if self._anchor is not None:
-            self._anchor.update(self.model)
-            self.ref.load_state_dict(self._anchor.state_dict())
         # adaptive KL controller: multiplicatively nudge kl_coef toward kl_target.
         if self.kl_target is not None and self.kl_coef > 0:
             err = metrics.get("kl", 0.0) / max(self.kl_target, 1e-8)
@@ -571,21 +587,39 @@ class GDPOTrainer:
 # ===========================================================================
 # Frozen-base ADAPTER RL fine-tuning (composability-safe: only the adapter moves)
 # ===========================================================================
-def _adapter_clean_pred(base, adapter, X_t, E_t, t, node_mask, cond):
-    """base + adapter clean-graph prediction at a noisy state, with a PER-ROW target
-    ``cond`` (each row/trajectory carries its own condition). base stays frozen."""
+def _base_uncond_softmax(base, X_t, E_t, t, node_mask):
+    """Frozen-base UNCONDITIONAL clean-graph softmax marginals -- group 0 of the
+    rollout's composition (no adapter modulation). No grad (the base is frozen). Also
+    returns the shared ``(noisy, extra)`` so the conditional branch reuses one extra-
+    feature computation, exactly as ``_denoise_step_composed`` does."""
     y0 = torch.zeros(X_t.size(0), 0, device=X_t.device)
     noisy = {"X_t": X_t, "E_t": E_t, "y_t": y0, "t": t, "node_mask": node_mask}
-    mod = adapter(cond, t=t)
-    return base.forward(noisy, base._compute_extra_data(noisy), node_mask, cond_modulation=mod)
+    extra = base._compute_extra_data(noisy)
+    with torch.no_grad():
+        pu = base.forward(noisy, extra, node_mask)
+    return F.softmax(pu.X, -1), F.softmax(pu.E, -1), noisy, extra
 
 
-def adapter_eager_logprob(base, adapter, X_t, E_t, cond, t, X1, E1, node_mask,
-                          lambda_edge: float = 1.0, reduction: str = "mean") -> torch.Tensor:
-    """:func:`eager_logprob` through base+adapter (only the adapter has grad)."""
-    pred = _adapter_clean_pred(base, adapter, X_t, E_t, t, node_mask, cond)
-    logpX = F.log_softmax(pred.X, dim=-1)
-    logpE = F.log_softmax(pred.E, dim=-1)
+def _compose_logmarginals(base, adapter, noisy, extra, node_mask, cond, puX, puE,
+                          weight: float = 1.0, mode: str = "product"):
+    """Composed clean-graph log-marginals ``log softmax_C(q)`` for base+adapter, where
+    ``q`` is the SAME product-of-experts blend the rollout applies at its terminal
+    decode -- reusing the model's own ``_blend_logp`` so the scored policy is bit-
+    identical to the behavior policy (GDPO's behavior==scored invariant, for ANY
+    ``weight``, not only w=1). Grad flows only through the adapter's conditional
+    branch; the frozen uncond marginals ``(puX, puE)`` enter as constants."""
+    mod = adapter(cond, t=noisy["t"])
+    pc = base.forward(noisy, extra, node_mask, cond_modulation=mod)
+    pcX, pcE = F.softmax(pc.X, -1), F.softmax(pc.E, -1)
+    w = puX.new_tensor([float(weight)])
+    qX = base._blend_logp(torch.stack([puX, pcX]), w, mode)   # (bs, n, dx) unnormalized log q
+    qE = base._blend_logp(torch.stack([puE, pcE]), w, mode)   # (bs, n, n, de)
+    return F.log_softmax(qX, dim=-1), F.log_softmax(qE, dim=-1)
+
+
+def _score_logprob(logpX, logpE, X1, E1, node_mask, lambda_edge, reduction):
+    """Masking-/symmetry-aware ``log p_theta(G1|G_t)`` from clean-graph log-marginals
+    (shared node/edge reduction for the adapter eager term)."""
     lpX = (X1 * logpX).sum(-1)
     lpE = (E1 * logpE).sum(-1)
     emask = _edge_upper_mask(node_mask)
@@ -596,15 +630,8 @@ def adapter_eager_logprob(base, adapter, X_t, E_t, cond, t, X1, E1, node_mask,
     return node_sum + lambda_edge * edge_sum
 
 
-def adapter_kl_clean(base, adapter, ref_adapter, X_t, E_t, cond, t, node_mask,
-                     lambda_edge: float = 1.0, reduction: str = "mean") -> torch.Tensor:
-    """KL(base+adapter || base+ref_adapter) on the clean marginals (reward-hacking
-    guard, measured against the PRE-RL adapter)."""
-    p = _adapter_clean_pred(base, adapter, X_t, E_t, t, node_mask, cond)
-    with torch.no_grad():
-        q = _adapter_clean_pred(base, ref_adapter, X_t, E_t, t, node_mask, cond)
-    pX, pE = F.log_softmax(p.X, -1), F.log_softmax(p.E, -1)
-    qX, qE = F.log_softmax(q.X, -1), F.log_softmax(q.E, -1)
+def _kl_from_logmarginals(pX, pE, qX, qE, node_mask, lambda_edge, reduction):
+    """Forward KL ``KL(p||q)`` over clean-graph log-marginals, batch-averaged."""
     klX = (pX.exp() * (pX - qX)).sum(-1)
     klE = (pE.exp() * (pE - qE)).sum(-1)
     emask = _edge_upper_mask(node_mask)
@@ -616,6 +643,32 @@ def adapter_kl_clean(base, adapter, ref_adapter, X_t, E_t, cond, t, node_mask,
     return (node_kl + lambda_edge * edge_kl).mean()
 
 
+def adapter_eager_logprob(base, adapter, X_t, E_t, cond, t, X1, E1, node_mask,
+                          weight: float = 1.0, mode: str = "product",
+                          lambda_edge: float = 1.0, reduction: str = "mean") -> torch.Tensor:
+    """GDPO eager ``log p_theta(G1|G_t)`` through the COMPOSED base+adapter policy at
+    CFG ``weight``/``mode`` (only the adapter has grad). At ``weight=1`` this reduces
+    exactly to the plain conditional log-prob; at ``weight!=1`` it tracks the rollout's
+    product-of-experts blend so behavior==scored and the gradient stays unbiased."""
+    puX, puE, noisy, extra = _base_uncond_softmax(base, X_t, E_t, t, node_mask)
+    logpX, logpE = _compose_logmarginals(base, adapter, noisy, extra, node_mask, cond,
+                                         puX, puE, weight, mode)
+    return _score_logprob(logpX, logpE, X1, E1, node_mask, lambda_edge, reduction)
+
+
+def adapter_kl_clean(base, adapter, ref_adapter, X_t, E_t, cond, t, node_mask,
+                     weight: float = 1.0, mode: str = "product",
+                     lambda_edge: float = 1.0, reduction: str = "mean") -> torch.Tensor:
+    """KL(composed policy || composed reference) on the clean marginals at the SAME
+    CFG ``weight``/``mode`` as the eager term (reward-hacking guard vs the PRE-RL
+    adapter). Both branches share the frozen uncond marginals."""
+    puX, puE, noisy, extra = _base_uncond_softmax(base, X_t, E_t, t, node_mask)
+    pX, pE = _compose_logmarginals(base, adapter, noisy, extra, node_mask, cond, puX, puE, weight, mode)
+    with torch.no_grad():
+        qX, qE = _compose_logmarginals(base, ref_adapter, noisy, extra, node_mask, cond, puX, puE, weight, mode)
+    return _kl_from_logmarginals(pX, pE, qX, qE, node_mask, lambda_edge, reduction)
+
+
 class AdapterGDPOTrainer(GDPOTrainer):
     """GDPO fine-tuning of a FROZEN-base AdaLN adapter -- only the adapter's params
     move, so the shared unconditional path (hence composability) is preserved.
@@ -623,8 +676,10 @@ class AdapterGDPOTrainer(GDPOTrainer):
     Differences from :class:`GDPOTrainer`:
       * Policy = frozen base + trainable adapter. Rollouts apply the adapter's
         modulation at a PER-ROW target (each trajectory carries its own condition)
-        via an ``AdapterComposition`` on a ``RolloutSampler`` (behavior policy = plain
-        conditional, w=1, no CFG blend).
+        via a single-branch ``AdapterComposition`` at CFG ``rollout_weight`` on a
+        ``RolloutSampler``. The eager-gradient recompute reproduces the SAME product-
+        of-experts blend, so the scored policy matches the behavior policy at ANY
+        weight (not only w=1) -- weight/mode are a single shared source of truth.
       * Reward is CONDITIONAL: ``cond_reward(X1, E1, node_mask, cond) -> (K,)`` (match
         to each rollout's own target); GRPO advantage grouped by target.
       * KL reference is a frozen copy of the PRE-RL adapter.
@@ -634,7 +689,8 @@ class AdapterGDPOTrainer(GDPOTrainer):
     """
 
     def __init__(self, base, adapter, cond_reward, *, ref_adapter=None, kl_coef: float = 0.0,
-                 kl_anchor: str = "fixed", anchor_decay: float = 0.99, kl_target=None,
+                 kl_target=None, rollout_weight: float = 1.0, rollout_mode: str = "product",
+                 crn: bool = True,
                  lr: float = 1e-5, weight_decay: float = 1e-5, ema_decay=0.999, **gdpo_kw):
         # Bring up GDPO plumbing with model=base but suppress its base-ref/opt/ema
         # (kl_coef=0, ema_decay=None); we build adapter-scoped versions below.
@@ -644,14 +700,20 @@ class AdapterGDPOTrainer(GDPOTrainer):
         self.adapter = adapter
         self.cond_reward = cond_reward
         self.kl_coef = float(kl_coef)
-        self.kl_anchor, self.anchor_decay, self.kl_target = kl_anchor, anchor_decay, kl_target
+        self.kl_target = kl_target
+        # CFG weight/mode of the single adapter branch: the ONE source of truth for
+        # BOTH the rollout composition and the eager-gradient recompute, so behavior
+        # and scored policy can never diverge (GDPO requires them identical). weight=1
+        # is the plain conditional; weight!=1 is a genuine product-of-experts that the
+        # scoring now reproduces exactly. (For N=1, product and mean are identical.)
+        self.rollout_weight = float(rollout_weight)
+        self.rollout_mode = rollout_mode
+        self.crn = bool(crn)   # CRN on by default: grouped-target adapter RL always has groups
         self.opt = torch.optim.AdamW(adapter.parameters(), lr=lr, weight_decay=weight_decay)
         self.ema = EMA(adapter, ema_decay) if ema_decay else None
-        self.ref_adapter, self._anchor = None, None
+        self.ref_adapter = None
         if self.kl_coef > 0:
             self.ref_adapter = ref_adapter if ref_adapter is not None else self._frozen_adapter_ref()
-            if self.kl_anchor == "moving":
-                self._anchor = EMA(adapter, self.anchor_decay)
 
     def _frozen_adapter_ref(self):
         ref = type(self.adapter)(**self.adapter._config())
@@ -665,10 +727,11 @@ class AdapterGDPOTrainer(GDPOTrainer):
         idx = self._choose_subsample()
         cond, groups = self.condition_sampler()
         cond = cond.to(self.device).float()
-        comp = AdapterComposition([ConditionBranch(self.adapter, cond, 1.0)], base=self.base, mode="product")
+        comp = AdapterComposition([ConditionBranch(self.adapter, cond, self.rollout_weight)],
+                                  base=self.base, mode=self.rollout_mode)
         sampler = RolloutSampler(self.base, subsample_idx=idx, eta=self.eta, omega=self.omega,
                                  sample_steps=self.sample_steps, time_distortion=self.time_distortion,
-                                 guidance_scale=1.0)
+                                 group_ids=groups, crn=self.crn, guidance_scale=1.0)
         sampler.composition = comp
         sampler.sample(self.rollout_size, num_nodes=self.num_nodes, size_dist=self.size_dist,
                        device=self.device, show_progress=False)
@@ -688,19 +751,27 @@ class AdapterGDPOTrainer(GDPOTrainer):
         n_states = max(1, len(buf.states))
         mb = self.minibatch_size or K
         cond = buf.y
+        w, mode = self.rollout_weight, self.rollout_mode
         self.opt.zero_grad()
         pg_loss = kl_val = 0.0
         for (X_t, E_t, t) in buf.states:
             for j in range(0, K, mb):
                 sl = slice(j, min(j + mb, K))
                 nb = sl.stop - sl.start
-                lp = adapter_eager_logprob(self.base, self.adapter, X_t[sl], E_t[sl], cond[sl], t[sl],
-                                           buf.X1[sl], buf.E1[sl], buf.node_mask[sl],
-                                           self.lambda_edge, self.reduction)
+                nm = buf.node_mask[sl]
+                # Composed policy log-marginals (SAME PoE blend as the rollout). The
+                # uncond marginals are computed once here and shared with the KL term.
+                puX, puE, noisy, extra = _base_uncond_softmax(self.base, X_t[sl], E_t[sl], t[sl], nm)
+                logpX, logpE = _compose_logmarginals(self.base, self.adapter, noisy, extra, nm,
+                                                     cond[sl], puX, puE, w, mode)
+                lp = _score_logprob(logpX, logpE, buf.X1[sl], buf.E1[sl], nm,
+                                    self.lambda_edge, self.reduction)
                 loss = -(A[sl] * lp).sum() / (K * n_states)
                 if self.kl_coef > 0:
-                    kl = adapter_kl_clean(self.base, self.adapter, self.ref_adapter, X_t[sl], E_t[sl],
-                                          cond[sl], t[sl], buf.node_mask[sl], self.lambda_edge, self.reduction)
+                    with torch.no_grad():
+                        rX, rE = _compose_logmarginals(self.base, self.ref_adapter, noisy, extra, nm,
+                                                       cond[sl], puX, puE, w, mode)
+                    kl = _kl_from_logmarginals(logpX, logpE, rX, rE, nm, self.lambda_edge, self.reduction)
                     loss = loss + (self.kl_coef / n_states) * kl * (nb / K)
                     kl_val += float(kl.detach()) * (nb / K) / n_states
                 loss.backward()

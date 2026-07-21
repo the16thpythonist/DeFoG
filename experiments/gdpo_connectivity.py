@@ -13,9 +13,8 @@ train and eval are the same policy), and exports the reward+disconnected trace,
 before/after grids, per-iter history, periodic pre-collapse snapshots, and metrics.
 
 Optional stabilizers (all off by default -> plain GDPO):
-  * ADVANTAGE_MODE="mean"  -- fixed baseline so the gradient fades as reward saturates
+  * ADVANTAGE_MODE="grpo"  -- add per-group std-normalization (Dr. GRPO warns it biases toward mid-difficulty; default is "mean")
   * POSITIVE_ONLY=True     -- RAFT-style: never push DOWN bad endpoints (no atom-soup)
-  * KL_ANCHOR="moving"     -- EMA-of-policy trust region (drift past the pretrained floor)
   * KL_TARGET=<float>      -- adaptively controls KL_COEF toward a target KL
 
 The SWEEP is NOT done here: submit MANY of these runs (one per grid point) and
@@ -55,7 +54,7 @@ SEED: int = 0
 #     FIXED strong anchor to the round's starting weights, then the (EMA) result
 #     becomes the next round's base AND anchor. A fixed anchor per round prevents
 #     collapse; ratcheting it between rounds relaxes the floor -- the stable way to
-#     push below it (a continuous moving anchor collapses instead). ROUNDS=1 = a
+#     push below it (re-anchoring per round, not continuously). ROUNDS=1 = a
 #     plain single fine-tune.
 ROUNDS: int = 1
 # :param ITERATIONS: GDPO updates PER round (keep short enough to stop before the
@@ -77,8 +76,8 @@ MINIBATCH_SIZE: int = 16
 # --- eager gradient / advantage ---
 # :param REDUCTION: "sum" (true joint LL, keeps bond-gradient weight) | "mean".
 REDUCTION: str = "sum"
-# :param ADVANTAGE_MODE: "grpo" | "mean" (fades as reward saturates) | "none".
-ADVANTAGE_MODE: str = "grpo"
+# :param ADVANTAGE_MODE: "mean" (default, Dr. GRPO: mean baseline, no std-norm) | "grpo" (std-normalized) | "none".
+ADVANTAGE_MODE: str = "mean"
 # :param POSITIVE_ONLY: RAFT-style -- clamp advantage>=0, never push down bad endpoints.
 POSITIVE_ONLY: bool = False
 # :param LAMBDA_EDGE: weight of the edge (bond) term in the eager log-prob vs the node
@@ -91,10 +90,6 @@ LR: float = 2e-5
 # --- KL to reference (over-optimization guard) ---
 # :param KL_COEF: KL-to-reference strength (0 -> no reference built, no KL).
 KL_COEF: float = 0.3
-# :param KL_ANCHOR: "fixed" (frozen initial weights) | "moving" (EMA-of-policy trust region).
-KL_ANCHOR: str = "fixed"
-# :param ANCHOR_DECAY: EMA decay of the moving anchor.
-ANCHOR_DECAY: float = 0.99
 # :param KL_TARGET: if set, adaptively nudge KL_COEF toward this target KL (else fixed).
 KL_TARGET: float = None
 # :param EMA_DECAY: deployment-weights EMA (evaluated / saved). ~0.9 for short runs.
@@ -237,7 +232,7 @@ def save_curves(history, before_disc, path):
 def experiment(e: Experiment) -> None:
     e.log(f"GDPO connectivity: ckpt={os.path.basename(e.CKPT_PATH)} K={e.ROLLOUT_SIZE} "
           f"iters={e.ITERATIONS} adv={e.ADVANTAGE_MODE} pos_only={e.POSITIVE_ONLY} "
-          f"kl_coef={e.KL_COEF} kl_anchor={e.KL_ANCHOR} kl_target={e.KL_TARGET}")
+          f"kl_coef={e.KL_COEF} kl_target={e.KL_TARGET}")
     from pytorch_lightning import seed_everything
     seed_everything(e.SEED, workers=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -271,15 +266,15 @@ def experiment(e: Experiment) -> None:
         # Fresh trainer each round: its KL reference is a frozen copy of the CURRENT
         # weights, so round r is anchored to round (r-1)'s result. A fixed strong
         # anchor per round keeps it stable; ratcheting the anchor between rounds
-        # relaxes the floor -- the stable way down (a continuous moving anchor
-        # collapses). Fresh optimizer + EMA per round; the old trainer is GC'd.
+        # relaxes the floor -- the stable way down (re-anchoring per round, not
+        # continuously). Fresh optimizer + EMA per round; the old trainer is GC'd.
         trainer = GDPOTrainer(
             model, reward, rollout_size=e.ROLLOUT_SIZE, sample_steps=e.SAMPLE_STEPS,
             subsample_steps=e.SUBSAMPLE_STEPS, minibatch_size=e.MINIBATCH_SIZE,
             eta=e.ETA, omega=e.OMEGA, time_distortion=e.TIME_DISTORTION, size_dist=size_dist,
             advantage_mode=e.ADVANTAGE_MODE, reduction=e.REDUCTION, lambda_edge=e.LAMBDA_EDGE,
             positive_only=e.POSITIVE_ONLY,
-            kl_coef=e.KL_COEF, kl_anchor=e.KL_ANCHOR, anchor_decay=e.ANCHOR_DECAY, kl_target=e.KL_TARGET,
+            kl_coef=e.KL_COEF, kl_target=e.KL_TARGET,
             lr=e.LR, ema_decay=e.EMA_DECAY, device=device, seed=e.SEED + r,
         )
 

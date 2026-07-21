@@ -73,7 +73,7 @@ N_HOLDOUT: int = 4000             # held-out molecules -> target FP pool (unseen
 EVAL_STEPS: int = 500
 ETA: float = 5.0
 OMEGA: float = 0.0
-GUIDANCE_WEIGHTS: list = [1.0, 2.0]
+GUIDANCE_WEIGHTS: list = [1.0]  # eval the optimized policy: RL rolls out / scores at w=1 only
 N_TARGETS: int = 6                # held-out eval target FPs
 N_PER_TARGET: int = 64
 N_BASELINE: int = 128
