@@ -46,9 +46,12 @@ echo "ChEMBL DDP foundation link @ $(date); CKPT_DIR=$CKPT_DIR"
 [ -f "$CKPT_DIR/last.ckpt" ] && echo "  -> resuming from last.ckpt" || echo "  -> fresh start"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
+# batch-size is PER-RANK: 64 x 4 GPUs = effective batch 256, matching the LR
+# ablation (lr=3e-4 tuned at batch 256). Bump to 256 (eff. 1024) only with a
+# scaled LR.
 srun python -u scripts/train_chembl_ddp.py \
     --devices 4 --num-nodes 1 --lr ${LR} --epochs ${EPOCHS} \
-    --max-time-hours 9.5 --batch-size 256 --num-workers 8 \
+    --max-time-hours 9.5 --batch-size 64 --num-workers 8 \
     --ckpt-dir "${CKPT_DIR}"
 
 echo "ChEMBL DDP foundation link finished @ $(date)"
