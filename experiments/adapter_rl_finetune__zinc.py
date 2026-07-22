@@ -26,21 +26,41 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from rdkit import Chem, RDLogger
-from rdkit.Chem import Crippen, Descriptors
+from rdkit.Chem import Crippen, Descriptors, QED
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 
 from experiments.utils import build_encoders, pyg_data_to_mol, mol_to_smiles
 from defog.core import (
     DeFoGModel, AdaLNAdapter, AdapterComposition, ConditionBranch, AdaptedSampler,
-    Sampler, AdapterGDPOTrainer,
+    Sampler, AdapterGDPOTrainer, PropertyHead,
 )
-from defog.core.data import dense_to_pyg
+from defog.core.data import dense_to_pyg, to_dense
 
 RDLogger.DisableLog("rdApp.*")
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROP_FNS = {"logp": lambda m: float(Crippen.MolLogP(m)),
-            "tpsa": lambda m: float(Descriptors.TPSA(m))}
+
+
+def _make_prop_fns():
+    """RDKit ground-truth property fns -- used for EVAL/validation even when the REWARD is a
+    learned head. SAScore lives in RDKit's Contrib dir, so add it to sys.path."""
+    fns = {"logp": lambda m: float(Crippen.MolLogP(m)),
+           "tpsa": lambda m: float(Descriptors.TPSA(m)),
+           "qed": lambda m: float(QED.qed(m))}
+    try:
+        import sys as _sys
+        from rdkit.Chem import RDConfig
+        _sa = os.path.join(RDConfig.RDContribDir, "SA_Score")
+        if _sa not in _sys.path:
+            _sys.path.append(_sa)
+        import sascorer
+        fns["sascore"] = lambda m: float(sascorer.calculateScore(m))
+    except Exception as _ex:
+        print(f"[warn] SAScore (RDKit Contrib) unavailable: {_ex}")
+    return fns
+
+
+PROP_FNS = _make_prop_fns()
 
 # ============================================================================
 CSV_PATH: str = os.path.join(_PROJECT_DIR, "data", "zinc_250k_rdkit.csv")
@@ -49,7 +69,15 @@ BOND_TYPES: list = ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
 ATOM_TYPES: list = ["C", "N", "O", "S", "F", "Cl", "Br", "I", "P"]
 BASE_CKPT: str = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
 ADAPTER_CKPT: str = ""           # trained scalar-property adapter to RL-finetune
-PROPERTY: str = "logp"           # logp | tpsa
+PROPERTY: str = "logp"           # logp | tpsa | qed | sascore
+# --- reward source: RDKit ground-truth vs a learned property HEAD ---
+# :param REWARD_SOURCE: "rdkit" (closed-form true fn) | "head" (learned PropertyHead -> tests
+#     head-as-reward for properties with no true fn). With "head" the REWARD, the early-stop
+#     PROBE and the best-SEED selection ALL use the head; EVAL additionally reports RDKit truth
+#     to VALIDATE whether optimizing the head moved the real property.
+REWARD_SOURCE: str = "rdkit"
+# :param HEAD_CKPT: PropertyHead ckpt (required for REWARD_SOURCE="head").
+HEAD_CKPT: str = ""
 
 # --- RL (GDPO) ---
 MAX_TIME_HOURS: float = 4.0      # RL-loop wall budget (evals happen outside it)
@@ -104,10 +132,11 @@ __TESTING__: bool = False
 # ============================================================================
 # Helpers
 # ============================================================================
-def gen_eval(samples, atom_decoder, bond_decoder, prop_fn):
-    """Return (property values of CONNECTED+valid mols, n_total, n_valid, n_disconnected).
-    Property is computed on the SMILES-reparsed (sanitized) mol; disconnected = '.' in SMILES."""
-    vals, n_valid, n_disc = [], 0, 0
+def gen_eval(samples, atom_decoder, bond_decoder):
+    """Return (connected+valid RDKit Mols, n_total, n_valid, n_disconnected). Mols are the
+    SMILES-reparsed connected molecules; the caller computes RDKit and/or head properties on
+    them so ONE generation can be scored under both."""
+    mols, n_valid, n_disc = [], 0, 0
     for s in samples:
         mol = pyg_data_to_mol(s, atom_decoder, bond_decoder)
         smi = mol_to_smiles(mol) if mol is not None else None
@@ -118,11 +147,24 @@ def gen_eval(samples, atom_decoder, bond_decoder, prop_fn):
         if "." in smi:
             n_disc += 1
             continue
+        mols.append(m)
+    return mols, len(samples), n_valid, n_disc
+
+
+def _rdkit_stats(mols, tgt, prop_fn):
+    """(MAE, mean, n) of prop_fn over mols vs tgt; skips prop errors."""
+    vals = []
+    for m in mols:
         try:
-            vals.append(prop_fn(m))
+            v = float(prop_fn(m))
         except Exception:
-            pass
-    return np.asarray(vals, dtype=float), len(samples), n_valid, n_disc
+            continue
+        if v == v:
+            vals.append(v)
+    if not vals:
+        return None, None, 0
+    a = np.asarray(vals)
+    return float(np.mean(np.abs(a - tgt))), float(a.mean()), len(a)
 
 
 def chunked(sampler, n, chunk, device):
@@ -168,6 +210,74 @@ class PropertyMatchReward:
         return out
 
 
+def head_predict_batch(mols, head, atom_encoder, bond_encoder, device):
+    """The HEAD's predicted property for each RDKit Mol via its native re-encoding
+    (SMILES -> smiles_to_pyg_data -> to_dense -> head.predict), exactly as LearnedPropertyEnergy
+    does (the head is trained on that encoding; the raw graph mispredicts). Returns a list
+    aligned to ``mols`` (None where re-encode fails). Batched over the molecules."""
+    from torch_geometric.data import Batch
+    from defog.domains.molecule import smiles_to_pyg_data
+    reenc, idx = [], []
+    for i, m in enumerate(mols):
+        if m is None:
+            continue
+        try:
+            rd = smiles_to_pyg_data(Chem.MolToSmiles(m), atom_encoder, bond_encoder)
+        except Exception:
+            rd = None
+        if rd is not None and getattr(rd, "x", None) is not None:
+            reenc.append(rd); idx.append(i)
+    out = [None] * len(mols)
+    if reenc:
+        batch = Batch.from_data_list(reenc).to(device)
+        dense, mask = to_dense(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+        dense = dense.mask(mask)
+        preds = head.predict(dense.X, dense.E, mask).reshape(-1).tolist()
+        for j, i in enumerate(idx):
+            out[i] = float(preds[j])
+    return out
+
+
+class HeadPropertyMatchReward:
+    """Connectivity-FIRST conditional reward with a learned HEAD as the property term (instead
+    of RDKit): connected+valid on-target > connected off-target > disconnected > invalid. The
+    property term ``-min(|head(mol)-target|/scale, clamp)`` uses ``head.predict`` (batched over
+    the connected mols). Same tiering/scale as :class:`PropertyMatchReward`."""
+
+    def __init__(self, head, atom_encoder, bond_encoder, atom_decoder, bond_decoder, device,
+                 scale=1.0, invalid_reward=-10.0, disconnect_reward=-4.0, prop_clamp=3.0):
+        self.head = head
+        self.ae, self.be = atom_encoder, bond_encoder
+        self.ad, self.bd = atom_decoder, bond_decoder
+        self.device = device
+        self.scale, self.invalid = float(scale), float(invalid_reward)
+        self.disconnect, self.clamp = float(disconnect_reward), float(prop_clamp)
+
+    def __call__(self, X1, E1, node_mask, cond):
+        n = node_mask.sum(-1)
+        datas = dense_to_pyg(X1, E1, None, node_mask, n)
+        out = X1.new_full((len(datas),), self.invalid)
+        tgt = cond.reshape(-1).tolist()
+        conn_mols, conn_idx = [], []
+        for i, d in enumerate(datas):
+            mol = pyg_data_to_mol(d, self.ad, self.bd)
+            smi = mol_to_smiles(mol) if mol is not None else None
+            m = Chem.MolFromSmiles(smi) if smi is not None else None
+            if m is None:
+                continue                                   # invalid -> floor
+            if "." in smi:
+                out[i] = self.disconnect; continue         # disconnected -> flat penalty
+            conn_mols.append(m); conn_idx.append(i)
+        if conn_mols:
+            preds = head_predict_batch(conn_mols, self.head, self.ae, self.be, self.device)
+            for j, i in enumerate(conn_idx):
+                p = preds[j]
+                if p is None:
+                    continue                               # re-encode failed -> invalid floor
+                out[i] = -min(abs(p - tgt[i]) / self.scale, self.clamp)
+        return out
+
+
 def make_condition_sampler(p_lo, p_hi, K, G, seed):
     gen = torch.Generator().manual_seed(seed)
     per = max(1, K // G)
@@ -189,27 +299,34 @@ def _disc(n_valid, n_disc):
 
 
 def steer_eval(base, adapter, atom_decoder, bond_decoder, prop_fn, targets, weights,
-               steps, eta, omega, td, n_per, n_base, chunk, device, seed=None):
-    """Per (level,w): achieved-property MAE over CONNECTED mols + disconnection% +
-    validity%. MAE measures conditioning tightness; disc% measures the connectivity goal.
+               steps, eta, omega, td, n_per, n_base, chunk, device, seed=None, head_fn=None):
+    """Per (level,w): achieved-property MAE (RDKit truth) + disconnection% + validity%, and --
+    when ``head_fn`` is given -- ALSO the HEAD's MAE (``head_mae``, the selection metric).
     ``seed`` fixes the rng (saved+restored) so pre/post evals sample the SAME draws (paired)."""
     _rng = torch.get_rng_state() if seed is not None else None
     if seed is not None:
         torch.manual_seed(seed)
     bs = Sampler(base, eta=eta, omega=omega, sample_steps=steps, time_distortion=td)
-    bvals, bt, bvalid, bdisc = gen_eval(chunked(bs, n_base, chunk, device), atom_decoder, bond_decoder, prop_fn)
-    out = {"baseline_mean": float(bvals.mean()) if bvals.size else None,
-           "baseline_disc": _disc(bvalid, bdisc), "levels": {}}
+    bmols, _bt, bvalid, bdisc = gen_eval(chunked(bs, n_base, chunk, device), atom_decoder, bond_decoder)
+    _, bmean, _ = _rdkit_stats(bmols, 0.0, prop_fn)
+    out = {"baseline_mean": bmean, "baseline_disc": _disc(bvalid, bdisc), "levels": {}}
     for lvl, tgt in targets.items():
         out["levels"][lvl] = {"target": tgt, "per_w": {}}
         for w in weights:
             comp = AdapterComposition([ConditionBranch(adapter, torch.tensor([tgt]), w)], base=base, mode="product")
             samp = AdaptedSampler(base, comp, eta=eta, omega=omega, sample_steps=steps, time_distortion=td)
-            gv, tot, nvalid, ndisc = gen_eval(chunked(samp, n_per, chunk, device), atom_decoder, bond_decoder, prop_fn)
-            out["levels"][lvl]["per_w"][str(w)] = {
-                "n": int(gv.size), "valid": (nvalid / tot) if tot else None, "disc": _disc(nvalid, ndisc),
-                "mean": float(gv.mean()) if gv.size else None,
-                "mae": float(np.mean(np.abs(gv - tgt))) if gv.size else None}
+            mols, tot, nvalid, ndisc = gen_eval(chunked(samp, n_per, chunk, device), atom_decoder, bond_decoder)
+            mae, mean, ncon = _rdkit_stats(mols, tgt, prop_fn)
+            rec = {"n": ncon, "valid": (nvalid / tot) if tot else None, "disc": _disc(nvalid, ndisc),
+                   "mean": mean, "mae": mae}
+            if head_fn is not None:
+                hp = [v for v in head_fn(mols) if v is not None]
+                if hp:
+                    ha = np.asarray(hp, dtype=float)
+                    rec["head_mae"], rec["head_mean"] = float(np.mean(np.abs(ha - tgt))), float(ha.mean())
+                else:
+                    rec["head_mae"] = rec["head_mean"] = None
+            out["levels"][lvl]["per_w"][str(w)] = rec
     if _rng is not None:
         torch.set_rng_state(_rng)
     return out
@@ -221,7 +338,9 @@ def _fmt(ev, weights):
         for w in weights:
             r = d["per_w"][str(w)]
             disc = f"{r['disc']*100:.0f}%" if r["disc"] is not None else "?"
-            parts.append(f"{lvl}->{d['target']:.1f}@w{w}: mae={r['mae']} disc={disc}")
+            val = f"{r['valid']*100:.0f}%" if r.get("valid") is not None else "?"
+            hm = f" head_mae={r['head_mae']}" if "head_mae" in r else ""
+            parts.append(f"{lvl}->{d['target']:.1f}@w{w}: mae={r['mae']}{hm} disc={disc} valid={val}")
     return " | ".join(parts)
 
 
@@ -257,15 +376,29 @@ def experiment(e: Experiment) -> None:
     e["eval/targets"] = targets
     e.log(f"RL target range [{p_lo:.1f}, {p_hi:.1f}]  eval targets {targets}  prop_std={prop_std:.2f}")
 
-    reward = PropertyMatchReward(atom_decoder, bond_decoder, prop_fn, scale=prop_std,
-                                 invalid_reward=e.INVALID_REWARD, disconnect_reward=e.DISCONNECT_REWARD,
-                                 prop_clamp=e.PROP_CLAMP)
+    # Reward source: RDKit ground-truth OR the learned head. With the head, the reward + the
+    # early-stop probe + best-seed selection all use it; EVAL still reports RDKit truth to validate.
+    head_fn = None
+    if e.REWARD_SOURCE == "head":
+        assert e.HEAD_CKPT, "REWARD_SOURCE='head' needs --HEAD_CKPT"
+        head = PropertyHead.load(e.HEAD_CKPT, device=device)
+        head_fn = lambda mols: head_predict_batch(mols, head, atom_encoder, bond_encoder, device)
+        reward = HeadPropertyMatchReward(head, atom_encoder, bond_encoder, atom_decoder, bond_decoder,
+                                         device, scale=prop_std, invalid_reward=e.INVALID_REWARD,
+                                         disconnect_reward=e.DISCONNECT_REWARD, prop_clamp=e.PROP_CLAMP)
+        e.log(f"REWARD_SOURCE=head: PropertyHead from {e.HEAD_CKPT} "
+              f"(prop_mean={float(head.prop_mean):.3f} prop_std={float(head.prop_std):.3f}); "
+              f"probe/selection use HEAD, eval reports RDKit truth too")
+    else:
+        reward = PropertyMatchReward(atom_decoder, bond_decoder, prop_fn, scale=prop_std,
+                                     invalid_reward=e.INVALID_REWARD, disconnect_reward=e.DISCONNECT_REWARD,
+                                     prop_clamp=e.PROP_CLAMP)
     cond_sampler = make_condition_sampler(p_lo, p_hi, e.ROLLOUT_SIZE, e.N_GROUPS, e.SEED)
 
     def eval_now(tag):
         ev = steer_eval(base, adapter, atom_decoder, bond_decoder, prop_fn, targets, e.GUIDANCE_WEIGHTS,
                         e.EVAL_STEPS, e.ETA, e.OMEGA, e.TIME_DISTORTION, e.N_PER_TARGET, e.N_BASELINE,
-                        e.EVAL_CHUNK, device, seed=e.EVAL_SEED)
+                        e.EVAL_CHUNK, device, seed=e.EVAL_SEED, head_fn=head_fn)
         e.log(f"[{tag}] baseline={ev['baseline_mean']}  {_fmt(ev, e.GUIDANCE_WEIGHTS)}")
         return ev
 
@@ -299,20 +432,26 @@ def experiment(e: Experiment) -> None:
 
     def probe_eval():
         """PAIRED conditional eval at the DEPLOYMENT policy (w=1, EVAL_STEPS, EMA weights):
-        mean achieved-property MAE over connected mols + min validity across levels. Fixed rng
-        (saved+restored) so the probe reflects the adapter, not sampling noise. Uses the FULL
-        EVAL_STEPS (not a cheaper PROBE_STEPS) so early-stop selects a snapshot that is actually
-        best at deployment -- a shorter-step probe mis-ranks (validated: 60-step probe picked a
-        snapshot that was worse at 150 steps)."""
+        mean achieved-property MAE via the SELECTION property (the HEAD if REWARD_SOURCE='head',
+        else RDKit) over connected mols + min validity across levels. Fixed rng (saved+restored)
+        so the probe reflects the adapter, not sampling noise. Full EVAL_STEPS so early-stop
+        selects a snapshot that is actually best at deployment."""
         _rng = torch.get_rng_state(); torch.manual_seed(e.EVAL_SEED)
         maes, valids = [], []
         for lvl, tgt in targets.items():
             comp = AdapterComposition([ConditionBranch(adapter, torch.tensor([tgt]), 1.0)], base=base, mode="product")
             samp = AdaptedSampler(base, comp, eta=e.ETA, omega=e.OMEGA, sample_steps=e.EVAL_STEPS, time_distortion=e.TIME_DISTORTION)
-            gv, tot, nvalid, _ = gen_eval(chunked(samp, e.PROBE_N_PER, e.EVAL_CHUNK, device), atom_decoder, bond_decoder, prop_fn)
+            mols, tot, nvalid, _ = gen_eval(chunked(samp, e.PROBE_N_PER, e.EVAL_CHUNK, device), atom_decoder, bond_decoder)
             valids.append((nvalid / tot) if tot else 0.0)
-            if gv.size:
-                maes.append(float(np.mean(np.abs(gv - tgt))))
+            if mols:
+                if head_fn is not None:
+                    vals = [v for v in head_fn(mols) if v is not None]
+                    if vals:
+                        maes.append(float(np.mean(np.abs(np.asarray(vals, dtype=float) - tgt))))
+                else:
+                    mae_l, _, _ = _rdkit_stats(mols, tgt, prop_fn)
+                    if mae_l is not None:
+                        maes.append(mae_l)
         torch.set_rng_state(_rng)
         return (float(np.mean(maes)) if maes else float("inf")), (min(valids) if valids else 0.0)
 
@@ -367,23 +506,29 @@ def experiment(e: Experiment) -> None:
 
     # -- compare + plot MAE pre vs post --------------------------------------
     summary = {"property": e.PROPERTY, "kl_coef": e.KL_COEF, "iterations": it,
-               "crn": e.CRN, "rollout_eta": e.ROLLOUT_ETA, "rollouts_per_group": e.ROLLOUT_SIZE // e.N_GROUPS,
+               "reward_source": e.REWARD_SOURCE, "crn": e.CRN, "rollout_eta": e.ROLLOUT_ETA,
+               "rollouts_per_group": e.ROLLOUT_SIZE // e.N_GROUPS,
                "early_stop_best_iter": (best["iter"] if e.EARLY_STOP else None),
                "deployed_weight_diff": wdiff, "lr": e.LR, "ema_decay": e.EMA_DECAY,
                "targets": targets, "pre": pre_ev, "post": post_ev, "mae_delta": {}}
     summary["disc_delta"] = {}
+    ds = lambda x: f"{x*100:.0f}%" if x is not None else "?"
     e.log("=" * 60)
-    e.log("PROPERTY MAE (lower=tighter)  +  DISCONNECTION% (lower=better) — pre -> post")
+    e.log(f"pre -> post   (RDKit-MAE = TRUTH; head-MAE = selection metric; reward={e.REWARD_SOURCE})")
     for lvl in e.LEVEL_NAMES:
         for w in e.GUIDANCE_WEIGHTS:
             pr, po = pre_ev["levels"][lvl]["per_w"][str(w)], post_ev["levels"][lvl]["per_w"][str(w)]
             pre, post = pr["mae"], po["mae"]
             d = (post - pre) if (pre is not None and post is not None) else None
-            summary["mae_delta"][f"{lvl}_w{w}"] = {"pre": pre, "post": post, "delta": d}
-            dpre, dpost = pr["disc"], po["disc"]
-            summary["disc_delta"][f"{lvl}_w{w}"] = {"pre": dpre, "post": dpost}
-            ds = lambda x: f"{x*100:.0f}%" if x is not None else "?"
-            e.log(f"{lvl} w={w}: MAE {pre} -> {post} (Δ{d}) | disc {ds(dpre)} -> {ds(dpost)}")
+            hpre, hpost = pr.get("head_mae"), po.get("head_mae")
+            hd = (hpost - hpre) if (hpre is not None and hpost is not None) else None
+            summary["mae_delta"][f"{lvl}_w{w}"] = {"pre": pre, "post": post, "delta": d,
+                                                   "head_pre": hpre, "head_post": hpost, "head_delta": hd,
+                                                   "valid_pre": pr.get("valid"), "valid_post": po.get("valid")}
+            summary["disc_delta"][f"{lvl}_w{w}"] = {"pre": pr["disc"], "post": po["disc"]}
+            hstr = f" | HEAD-MAE {hpre} -> {hpost} (Δ{hd})" if hpre is not None else ""
+            e.log(f"{lvl} w={w}: RDKit-MAE {pre} -> {post} (Δ{d}){hstr} | "
+                  f"disc {ds(pr['disc'])}->{ds(po['disc'])} | valid {ds(pr.get('valid'))}->{ds(po.get('valid'))}")
     e.commit_json("rl_finetune_metrics.json", summary)
 
     fig, ax = plt.subplots(figsize=(8, 5))
