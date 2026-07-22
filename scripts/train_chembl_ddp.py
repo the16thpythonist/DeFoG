@@ -30,7 +30,20 @@ import numpy as np
 import torch
 import pytorch_lightning as pl
 from torch_geometric.loader import DataLoader
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, Timer
+
+
+class PerLinkTimer(Timer):
+    """A wall-clock cap that is PER-LINK, not cumulative across resumes.
+
+    Lightning's Timer checkpoints its elapsed time, so a chained link restores the
+    previous link's elapsed time and trips 'Time limit reached' immediately (once
+    the total exceeds max_time) -- i.e. it does zero training. Ignoring the restored
+    state gives each 12h-window link a fresh clock.
+    """
+
+    def load_state_dict(self, state_dict):
+        pass  # do not restore cumulative elapsed time -> per-link cap
 
 from experiments.utils import (
     build_encoders, smiles_to_pyg_data, make_generation_metrics_fn,
@@ -171,14 +184,16 @@ def train(args):
                               every_n_train_steps=args.ckpt_every_n_steps)
     callbacks = [EMACallback(decay=0.9999), monitor, sampler, ckpt_cb]
 
-    max_time = None
+    # Per-link wall-clock cap via PerLinkTimer (NOT Trainer max_time, which is
+    # cumulative across resumes and would make every chained link stop instantly).
     if args.max_time_hours:
         h = int(args.max_time_hours)
-        max_time = {"hours": h, "minutes": int(round((args.max_time_hours - h) * 60))}
+        m = int(round((args.max_time_hours - h) * 60))
+        callbacks.append(PerLinkTimer(duration={"hours": h, "minutes": m}, interval="step"))
 
     strategy = ("ddp_find_unused_parameters_true" if args.devices != 1 else "auto")
     trainer = pl.Trainer(
-        max_epochs=args.epochs, max_time=max_time, accelerator=args.accelerator,
+        max_epochs=args.epochs, accelerator=args.accelerator,
         devices=args.devices, num_nodes=args.num_nodes, strategy=strategy,
         enable_progress_bar=False, enable_checkpointing=True, logger=False,
         num_sanity_val_steps=0, callbacks=callbacks,
