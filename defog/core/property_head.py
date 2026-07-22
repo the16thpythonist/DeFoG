@@ -83,20 +83,64 @@ class PropertyHead(nn.Module):
 class LearnedPropertyEnergy:
     """FK energy from a trained :class:`PropertyHead`.
 
-    ``energy_fn(X1, E1, node_mask) -> (K,)`` = ``(head.predict(graph) - target) ** 2`` (lower
-    is better). Drop-in replacement for ``MoleculePropertyEnergy`` where the property has no
+    ``energy_fn(X1, E1, node_mask) -> (K,)`` = ``(head.predict(mol) - target) ** 2`` (lower is
+    better). Drop-in replacement for ``MoleculePropertyEnergy`` where the property has no
     closed-form RDKit function (or, uniformly, for any property).
+
+    Each predicted-clean graph is DECODED to a molecule (validity gate) and RE-ENCODED in the
+    head's native ``to_dense(smiles_to_pyg_data(...))`` format before scoring. This matters:
+    the head is trained on that encoding, and the model's raw argmax predicted-clean graph
+    (spurious diagonal edges, off-support classes) does NOT match it -- feeding the head the
+    raw graph makes it mispredict and FK steer the wrong way. Invalid / undecodable graphs get
+    ``invalid_energy`` (their FK weight -> 0), keeping the search on-manifold.
+
+    Args:
+        head: trained :class:`PropertyHead`.
+        target: desired (un-normalized) property value.
+        domain: object with ``.decode(pyg_data) -> Optional[Mol]`` (e.g. MoleculeDomain).
+        atom_encoder, bond_encoder: the domain's encoders (for the native re-encoding).
     """
 
-    def __init__(self, head: PropertyHead, target: float):
+    def __init__(self, head: PropertyHead, target: float, domain, atom_encoder, bond_encoder,
+                 invalid_energy: float = 1e3):
         self.head = head.eval()
         self.target = float(target)
+        self.domain = domain
+        self.ae, self.be = atom_encoder, bond_encoder
+        self.invalid = float(invalid_energy)
 
     def _desc(self):
         return f"LearnedPropertyEnergy(target={self.target})"
 
     @torch.no_grad()
     def __call__(self, X1, E1, node_mask):
-        dev = self.head.prop_mean.device
-        pred = self.head.predict(X1.to(dev), E1.to(dev), node_mask.to(dev))
-        return (pred.reshape(-1) - self.target) ** 2
+        from rdkit import Chem
+        from torch_geometric.data import Batch
+
+        from .data import dense_to_pyg, to_dense
+        from ..domains.molecule import smiles_to_pyg_data
+
+        n = node_mask.sum(-1)
+        datas = dense_to_pyg(X1, E1, None, node_mask, n)
+        out = X1.new_full((len(datas),), self.invalid)
+        reenc, idx = [], []
+        for i, d in enumerate(datas):
+            mol = self.domain.decode(d)
+            if mol is None:
+                continue
+            try:
+                rd = smiles_to_pyg_data(Chem.MolToSmiles(mol), self.ae, self.be)
+            except Exception:
+                rd = None
+            if rd is not None and getattr(rd, "x", None) is not None:
+                reenc.append(rd)
+                idx.append(i)
+        if reenc:
+            dev = self.head.prop_mean.device
+            batch = Batch.from_data_list(reenc).to(dev)
+            dense, mask = to_dense(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+            dense = dense.mask(mask)
+            preds = self.head.predict(dense.X, dense.E, mask).reshape(-1)
+            for j, i in enumerate(idx):
+                out[i] = (preds[j] - self.target) ** 2
+        return out
