@@ -256,6 +256,22 @@ class TrainingMonitorCallback(pl.Callback):
         self.last_figure: Optional[plt.Figure] = None
 
     # ------------------------------------------------------------------
+    # Checkpoint state (persist best-validity + history across resume)
+    # ------------------------------------------------------------------
+
+    def state_dict(self):
+        """Persist best-validity and the metric history so a resumed run keeps
+        the same best-checkpoint threshold and continuous training curves."""
+        return {"best_validity": self.best_validity, "history": dict(self.history)}
+
+    def load_state_dict(self, state_dict):
+        if "best_validity" in state_dict:
+            self.best_validity = state_dict["best_validity"]
+        hist = state_dict.get("history")
+        if hist:
+            self.history = defaultdict(list, {k: list(v) for k, v in hist.items()})
+
+    # ------------------------------------------------------------------
     # Lifecycle hooks
     # ------------------------------------------------------------------
 
@@ -529,6 +545,12 @@ class TrainingMonitorCallback(pl.Callback):
         # history counts real epochs only: curves start at epoch 1 and the
         # generation probe fires on round epochs (10, 20, 30, ...).
         if trainer.sanity_checking:
+            return
+        # DDP: the figure, the generation probe (sampling), and best-checkpoint
+        # saving are rank-0 only -- otherwise every rank samples and races to write
+        # the same archive / best_model.ckpt. Per-epoch accumulators are reset in
+        # on_train_epoch_start on ALL ranks, so this early return cannot leak them.
+        if not trainer.is_global_zero:
             return
 
         epoch_time = time.time() - self._epoch_start_time
@@ -1177,6 +1199,8 @@ class SampleVisualizationCallback(pl.Callback):
         # on round epochs (every_k_epochs then counts real epochs only).
         if trainer.sanity_checking:
             return
+        if not trainer.is_global_zero:  # DDP: render/track previews on rank 0 only
+            return
 
         self._val_epoch_count += 1
         if self._val_epoch_count % self.every_k_epochs != 0:
@@ -1279,7 +1303,10 @@ class EMACallback(pl.Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         for n, p in pl_module.named_parameters():
             if p.requires_grad and n in self.shadow:
-                self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+                s = self.shadow[n]
+                if s.device != p.device:  # after resume the shadow loads on CPU
+                    s = self.shadow[n] = s.to(p.device)
+                s.mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
 
     @torch.no_grad()
     def on_validation_start(self, trainer, pl_module):
@@ -1304,3 +1331,17 @@ class EMACallback(pl.Callback):
         for n, p in pl_module.named_parameters():
             if n in self.shadow:
                 p.data.copy_(self.shadow[n])
+
+    def state_dict(self):
+        """Persist the EMA shadow (and decay) so a resumed run continues the same
+        moving average instead of silently restarting it. Lightning saves this
+        under the checkpoint's callback states; stored on CPU to stay
+        device-agnostic (realigned to the param device in on_train_batch_end)."""
+        return {
+            "decay": self.decay,
+            "shadow": {n: t.detach().cpu() for n, t in self.shadow.items()},
+        }
+
+    def load_state_dict(self, state_dict):
+        self.decay = state_dict.get("decay", self.decay)
+        self.shadow = {n: t.clone() for n, t in state_dict.get("shadow", {}).items()}

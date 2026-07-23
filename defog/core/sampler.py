@@ -84,6 +84,14 @@ class Sampler:
         """Project/modify the final state after the loop. No-op in base."""
         return X, E
 
+    def _init_state(self, X, E, node_mask, n_nodes):
+        """Modify the freshly-sampled initial noise/state before the loop begins.
+        No-op in base. ``RolloutSampler`` overrides this to share the start state
+        (initial noise + graph size) across the members of an advantage group --
+        common random numbers, so the group-relative advantage isolates the effect
+        of the CTMC sampling stochasticity (eta) rather than the random start."""
+        return X, E, node_mask, n_nodes
+
     def _desc(self) -> str:
         return "Sampling"
 
@@ -221,6 +229,10 @@ class Sampler:
         node_mask, n_nodes, X, E, y, y_raw, use_cfg = model._prepare_generation(
             num_samples, num_nodes, size_dist, condition, self.guidance_scale, device
         )
+
+        # Hook: a rollout sampler may share the initial state within advantage groups
+        # (common random numbers). No-op in the base sampler.
+        X, E, node_mask, n_nodes = self._init_state(X, E, node_mask, n_nodes)
 
         X, E, y = self._run_loop(X, E, y, node_mask, use_cfg, show_progress, on_step=on_step)
 

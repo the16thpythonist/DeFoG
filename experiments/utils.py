@@ -20,6 +20,9 @@ from defog.domains.molecule import (  # noqa: F401  (re-export)
     mol_to_smiles,
     build_encoders,
     smiles_to_pyg_data,
+    molecular_metrics,
+    ring_sizes_ok,
+    property_distributions,
     BOND_RDKIT_TYPES,
     BOND_NAME_TO_RDKIT,
 )

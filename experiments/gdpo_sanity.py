@@ -131,8 +131,8 @@ MINIBATCH_SIZE: int = 16
 # --- eager gradient / advantage ---
 # :param REDUCTION: "sum" (true joint LL) | "mean".
 REDUCTION: str = "sum"
-# :param ADVANTAGE_MODE: "grpo" | "mean" | "none".
-ADVANTAGE_MODE: str = "grpo"
+# :param ADVANTAGE_MODE: "mean" (default, Dr. GRPO) | "grpo" | "none".
+ADVANTAGE_MODE: str = "mean"
 # :param POSITIVE_ONLY: RAFT-style clamp advantage>=0 (never push down bad endpoints).
 POSITIVE_ONLY: bool = False
 # :param LAMBDA_EDGE: weight of the edge (bond) term vs the node (atom-type) term.
@@ -143,10 +143,6 @@ LR: float = 2e-5
 # --- KL to reference (over-optimization guard) ---
 # :param KL_COEF: KL-to-reference strength (0 -> no reference, no KL). 0.2 = tuned value.
 KL_COEF: float = 0.2
-# :param KL_ANCHOR: "fixed" | "moving".
-KL_ANCHOR: str = "fixed"
-# :param ANCHOR_DECAY: EMA decay of the moving anchor.
-ANCHOR_DECAY: float = 0.99
 # :param KL_TARGET: adaptive KL target (None -> fixed KL_COEF).
 KL_TARGET: float = None
 # :param EMA_DECAY: deployment-weights EMA.
@@ -634,7 +630,7 @@ def experiment(e: Experiment) -> None:
             eta=e.ETA, omega=e.OMEGA, time_distortion=e.TIME_DISTORTION, size_dist=size_dist,
             advantage_mode=e.ADVANTAGE_MODE, reduction=e.REDUCTION, lambda_edge=e.LAMBDA_EDGE,
             positive_only=e.POSITIVE_ONLY,
-            kl_coef=e.KL_COEF, kl_anchor=e.KL_ANCHOR, anchor_decay=e.ANCHOR_DECAY, kl_target=e.KL_TARGET,
+            kl_coef=e.KL_COEF, kl_target=e.KL_TARGET,
             lr=e.LR, ema_decay=e.EMA_DECAY, device=device, seed=e.SEED + r,
         )
 

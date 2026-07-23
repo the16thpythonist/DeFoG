@@ -168,7 +168,7 @@ class TestTrainingMonitorCallback:
         fig = cb.last_figure
         assert isinstance(fig, plt.Figure)
         axes = fig.get_axes()
-        assert len(axes) == 20  # 5x4 grid
+        assert len(axes) == 21  # 5x4 grid (20 panels) + the LR twin-axis on panel 1
         plt.close(fig)
 
 

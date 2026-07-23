@@ -25,13 +25,18 @@ LSC=(0.0 0.3 1.0 3.0)
 echo "starting self-consistency ClogP sweep at $(date)"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
+# Pre-create the SHARED pycomex namespace dir so the 4 concurrent arms don't race
+# on os.mkdir(namespace_dir) in prepare_path() (the FileExistsError that killed the
+# lsc=0.3/1.0 arms). A pre-existing dir => pycomex skips the mkdir => no race.
+mkdir -p experiments/results/adapter_selfconsistency__zinc
+
 for i in 0 1 2 3; do
   CUDA_VISIBLE_DEVICES=$i python -u experiments/adapter_selfconsistency__zinc.py \
       --PROPERTY "'logp'" --LAMBDA_SC ${LSC[$i]} \
       --BASE_CKPT "'$BASE'" \
       > "sc_clogp_lsc${LSC[$i]}_${SLURM_JOB_ID}.out" 2>&1 &
   echo "launched lambda_sc=${LSC[$i]} on GPU $i (pid $!)"
-  sleep 8
+  sleep 15
 done
 
 wait
