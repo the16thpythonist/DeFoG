@@ -248,6 +248,57 @@ def evaluate(args):
     rprint(f"wrote {out}")
 
 
+def sweep(args):
+    """Single-GPU eta/omega sampling sweep on a checkpoint -> best sampling config.
+
+    The training probe used eta=5; the eta=0 eval is the harsh floor. This grids
+    the CTMC sampling knobs (eta = error-correction stochasticity, omega = target
+    guidance) at fixed time-distortion, scoring each with the full metric suite,
+    so we can pick the sampling config the released model ships with.
+    """
+    ae, ad, be, bd = build_encoders(ATOM_DECODER, BOND_TYPES)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = DeFoGModel.load(args.eval_ckpt.replace(".ckpt", "")).to(device).eval()
+    rprint(f"sweep on {args.eval_ckpt} ({device}); distortion={args.sweep_distortion} "
+           f"steps={args.eval_sample_steps} samples/config={args.sweep_samples}")
+
+    ref_desc = None
+    ref_path = os.path.join(args.data_dir, "chembl_ref_descriptors.npz")
+    if os.path.exists(ref_path):
+        with np.load(ref_path) as z:
+            ref_desc = {k: z[k] for k in z.files}
+    train_smiles = set(read_smiles(os.path.join(args.data_dir, "chembl_train.smiles")))
+
+    etas = [float(x) for x in args.sweep_etas.split(",")]
+    omegas = [float(x) for x in args.sweep_omegas.split(",")]
+    results = []
+    for eta in etas:
+        for omega in omegas:
+            samples, rem = [], args.sweep_samples
+            while rem > 0:
+                cur = min(args.eval_chunk, rem)
+                samples += model.sample(num_samples=cur, sample_steps=args.eval_sample_steps,
+                                        eta=eta, omega=omega, time_distortion=args.sweep_distortion,
+                                        device=device, show_progress=False)
+                rem -= cur
+            m = molecular_metrics(samples, ad, bd, reference_smiles=train_smiles,
+                                  reference_descriptors=ref_desc, compute_kl=True)
+            m = {"eta": eta, "omega": omega, **m}
+            results.append(m)
+            rprint(f"eta={eta:<6g} omega={omega:<6g} | val={m['validity']:.3f} san={m['sanity']:.3f} "
+                   f"conn={m['connected']:.3f} kl={m['kl_score']:.3f} nov={m['novelty']:.3f}")
+
+    out = os.path.join(os.path.dirname(args.eval_ckpt) or ".", "sweep_results.json")
+    with open(out, "w") as fh:
+        json.dump(results, fh, indent=2)
+    ranked = sorted(results, key=lambda r: (r["sanity"], r["validity"]), reverse=True)
+    rprint("=== top 5 by sanity (check kl_score/novelty aren't sacrificed) ===")
+    for r in ranked[:5]:
+        rprint(f"  eta={r['eta']:<6g} omega={r['omega']:<6g} san={r['sanity']:.3f} "
+               f"val={r['validity']:.3f} conn={r['connected']:.3f} kl={r['kl_score']:.3f} nov={r['novelty']:.3f}")
+    rprint(f"wrote {out}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-dir", default=os.path.join(_HERE, "data", "chembl"))
@@ -278,9 +329,18 @@ def main():
     p.add_argument("--num-eval-samples", type=int, default=1000)
     p.add_argument("--eval-sample-steps", type=int, default=500)
     p.add_argument("--eval-chunk", type=int, default=64)
+    # eta/omega sampling sweep
+    p.add_argument("--sweep", action="store_true")
+    p.add_argument("--sweep-etas", default="0,5,25,50,100")
+    p.add_argument("--sweep-omegas", default="0,0.05,0.1")
+    p.add_argument("--sweep-samples", type=int, default=500)
+    p.add_argument("--sweep-distortion", default="polydec")
     args = p.parse_args()
 
-    if args.eval_only:
+    if args.sweep:
+        assert args.eval_ckpt, "--sweep needs --eval-ckpt"
+        sweep(args)
+    elif args.eval_only:
         assert args.eval_ckpt, "--eval-only needs --eval-ckpt"
         evaluate(args)
     else:
