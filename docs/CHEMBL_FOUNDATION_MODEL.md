@@ -6,8 +6,11 @@ as a *frozen base* that downstream work (property adapters, guidance, RL
 fine-tuning, inpainting) builds on top of — so its categorical schema is a fixed
 public contract.
 
-- **Branch:** `feat/chembl-foundation`
-- **Checkpoint:** `ckpts/chembl_foundation_lr3e-4/best_model.ckpt` (EMA weights, ~epoch 39, 104 MB)
+- **Merged to:** `main` (developed on `feat/chembl-foundation`)
+- **Checkpoints:**
+  - **v2 (recommended):** `ckpts/chembl_foundation_v2_kl0.2.ckpt` — v1 + GDPO
+    structural-sanity RL (see "v2" below). validity 0.926 / sanity 0.908.
+  - **v1 (base):** `ckpts/chembl_foundation_lr3e-4/best_model.ckpt` (EMA, ~epoch 39, 104 MB).
 - **Architecture:** DeFoG graph transformer, 25,922,897 parameters
 
 ---
@@ -148,3 +151,54 @@ Key code: `scripts/prepare_chembl.py` (standardization), `scripts/train_chembl_d
 
 Preserved milestone checkpoints on JUPITER:
 `ckpts/chembl_foundation_snapshots/{link1_ep12,link2_final,link3_ep39}/`.
+
+---
+
+## v2 — GDPO structural-sanity RL improvement
+
+The v1 base leaves ~15% of generations invalid/non-sane. v2 closes most of that
+gap by **reward-aligning the base weights** with GDPO (Graph Diffusion Policy
+Optimization, eager policy gradient) toward a **binary structural-sanity reward**:
+
+```
+reward(mol) = 1.0  iff  valid  AND  connected ('.'-free)  AND  rings within a
+              ChEMBL-derived envelope (sizes ∈ [3,8], ring-system/spiro/bridgehead
+              bounds); else 0.0
+```
+
+The reward's optimum is fidelity to real molecules (every genuine ChEMBL molecule
+scores 1.0), so it has no degenerate "benzene-everywhere" optimum. Guards against
+reward-hacking / diversity collapse: a **KL-to-frozen-v1 penalty**, monitored
+**validity/uniqueness/novelty rails**, and **best-snapshot selection that can
+never ship worse than the input** (`experiments/gdpo_sanity.py`).
+
+**KL_COEF sweep** (4-GPU, one arm per GPU; K=128 rollouts, 100 iters, before/after
+on 2048 samples). Structural-violation rate (= 1 − sanity, GDPO envelope):
+
+| KL_COEF | violation 15.7% → | validity 86.8% → | outcome |
+|---|---|---|---|
+| 0.05 | 9.1% | 92.9% | collapsed mid-run; best-snapshot fell back to an early (iter-40) checkpoint |
+| 0.10 | 8.2% | 93.8% | strongest gain, but largest property drift |
+| **0.20** | **8.7%** | **93.2%** | **shipped — Pareto-best (gain with ~zero drift)** |
+| 0.50 | 13.2% | 89.1% | over-anchored, least gain |
+
+**v1 → v2 (KL=0.2), extended suite, η=0/ω=0, 1000 samples, 500 steps:**
+
+| Metric | v1 | v2 | Δ |
+|---|---|---|---|
+| validity | 0.845 | **0.926** | +0.081 |
+| sanity | 0.825 | **0.908** | +0.083 |
+| connected | 0.981 | 0.984 | +0.003 |
+| uniqueness | 1.000 | 1.000 | — |
+| novelty | 0.991 | 0.991 | — (held) |
+| kl_logp / tpsa / qed | 0.013 / 0.031 / 0.003 | 0.018 / 0.027 / 0.004 | ~flat |
+| kl_score | 0.985 | 0.984 | −0.001 (held) |
+
+v2 lifts validity/sanity ~+8 points while **preserving diversity (uniqueness/
+novelty) and the property-distribution match** (kl_score essentially unchanged).
+KL=0.1 reaches slightly higher validity (0.943) but at 4× the property drift
+(kl_score 0.974), so KL=0.2 is shipped. Same schema and sampling config as v1
+(η=0, ω=0.05, polydec, 500 steps) — v2 is a drop-in replacement.
+
+Reproduce: `run_chembl_gdpo_sweep_jupiter.sh` (4-GPU KL sweep) then
+`run_chembl_eval_jupiter.sh ckpts/chembl_foundation_v2_kl0.2.ckpt`.
