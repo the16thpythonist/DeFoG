@@ -138,8 +138,8 @@ def train(args):
     pl.seed_everything(args.seed, workers=True)
     ae, ad, be, bd = build_encoders(ATOM_DECODER, BOND_TYPES)
 
-    train_smiles = read_smiles(os.path.join(args.data_dir, "chembl_train.smiles"), args.max_train)
-    val_smiles = read_smiles(os.path.join(args.data_dir, "chembl_val.smiles"), args.max_val)
+    train_smiles = read_smiles(os.path.join(args.data_dir, f"{args.prefix}_train.smiles"), args.max_train)
+    val_smiles = read_smiles(os.path.join(args.data_dir, f"{args.prefix}_val.smiles"), args.max_val)
     rprint(f"train {len(train_smiles):,}  val {len(val_smiles):,}")
 
     train_loader = DataLoader(
@@ -152,7 +152,7 @@ def train(args):
         num_workers=args.num_workers, persistent_workers=args.num_workers > 0,
     ) if val_smiles else None
 
-    with open(os.path.join(args.data_dir, "chembl_stats.json")) as fh:
+    with open(os.path.join(args.data_dir, f"{args.prefix}_stats.json")) as fh:
         stats = json.load(fh)
     model = build_model(args, stats)
     rprint(f"params {sum(p.numel() for p in model.parameters()):,}  max_nodes {stats['max_nodes']}")
@@ -231,11 +231,11 @@ def evaluate(args):
         remaining -= cur
 
     ref_desc = None
-    ref_path = os.path.join(args.data_dir, "chembl_ref_descriptors.npz")
+    ref_path = os.path.join(args.data_dir, f"{args.prefix}_ref_descriptors.npz")
     if os.path.exists(ref_path):
         with np.load(ref_path) as z:
             ref_desc = {k: z[k] for k in z.files}
-    train_smiles = set(read_smiles(os.path.join(args.data_dir, "chembl_train.smiles")))
+    train_smiles = set(read_smiles(os.path.join(args.data_dir, f"{args.prefix}_train.smiles")))
     metrics = molecular_metrics(samples, ad, bd, reference_smiles=train_smiles,
                                 reference_descriptors=ref_desc, compute_kl=True)
     out = os.path.join(os.path.dirname(args.eval_ckpt) or ".", "eval_metrics.json")
@@ -263,11 +263,11 @@ def sweep(args):
            f"steps={args.eval_sample_steps} samples/config={args.sweep_samples}")
 
     ref_desc = None
-    ref_path = os.path.join(args.data_dir, "chembl_ref_descriptors.npz")
+    ref_path = os.path.join(args.data_dir, f"{args.prefix}_ref_descriptors.npz")
     if os.path.exists(ref_path):
         with np.load(ref_path) as z:
             ref_desc = {k: z[k] for k in z.files}
-    train_smiles = set(read_smiles(os.path.join(args.data_dir, "chembl_train.smiles")))
+    train_smiles = set(read_smiles(os.path.join(args.data_dir, f"{args.prefix}_train.smiles")))
 
     etas = [float(x) for x in args.sweep_etas.split(",")]
     omegas = [float(x) for x in args.sweep_omegas.split(",")]
@@ -302,6 +302,9 @@ def sweep(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-dir", default=os.path.join(_HERE, "data", "chembl"))
+    p.add_argument("--prefix", default="chembl",
+                   help="data-file prefix: reads {prefix}_train.smiles / {prefix}_stats.json "
+                        "/ {prefix}_ref_descriptors.npz (use 'union' for the ZINC∪ChEMBL set)")
     p.add_argument("--ckpt-dir", default=os.path.join(_HERE, "ckpts", "chembl_foundation"))
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--epochs", type=int, default=60)          # cosine horizon (fixed across links)
