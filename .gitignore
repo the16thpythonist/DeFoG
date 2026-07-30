@@ -112,6 +112,10 @@ celerybeat.pid
 # Environments
 .env
 .venv
+# Side envs: .venv_metrics (E1 metric suites, isolated from the training
+# env) and .venv_jupiter (aarch64 cluster env). uv self-ignores its venvs
+# but python -m venv does not, so name them explicitly.
+.venv_*
 env/
 venv/
 ENV/
