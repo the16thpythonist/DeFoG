@@ -1345,3 +1345,88 @@ class EMACallback(pl.Callback):
     def load_state_dict(self, state_dict):
         self.decay = state_dict.get("decay", self.decay)
         self.shadow = {n: t.clone() for n, t in state_dict.get("shadow", {}).items()}
+
+
+class BestValLossCheckpoint(pl.Callback):
+    """Save the model whenever a monitored validation metric reaches a new best.
+
+    ``TrainingMonitorCallback`` can already checkpoint on generation validity,
+    but that signal comes from a small unconditional sample probe (64 graphs by
+    default) and says nothing about the held-out data. When a run has a real
+    validation split, selecting on ``val/loss`` selects on the split -- which is
+    what an evaluation protocol that forbids touching test actually requires.
+
+    Hooks ``on_validation_epoch_end`` rather than ``on_validation_end``, and the
+    distinction is load-bearing: :class:`EMACallback` swaps its shadow weights in
+    at ``on_validation_start`` and swaps them back out at ``on_validation_end``.
+    ``on_validation_epoch_end`` fires strictly between the two, so the weights
+    saved here are the EMA weights no matter where this callback sits in the
+    list. Hooking ``on_validation_end`` instead would make the saved weights
+    depend on callback ordering -- EMA-averaged or raw depending on which
+    callback Lightning happened to call first.
+
+    Args:
+        checkpoint_dir: Directory to save into.
+        monitor: Metric key from ``trainer.callback_metrics``.
+        filename: Basename passed to ``pl_module.save`` (no extension).
+        mode: ``"min"`` (default) or ``"max"``.
+        verbose: Print a line on each improvement.
+    """
+
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        monitor: str = "val/loss",
+        filename: str = "best_model",
+        mode: str = "min",
+        verbose: bool = True,
+    ):
+        super().__init__()
+        assert mode in ("min", "max"), f"mode must be 'min' or 'max', got {mode!r}"
+        self.checkpoint_dir = checkpoint_dir
+        self.monitor = monitor
+        self.filename = filename
+        self.mode = mode
+        self.verbose = verbose
+        self.best = math.inf if mode == "min" else -math.inf
+        self.best_epoch: Optional[int] = None
+        self.saved_path: Optional[str] = None
+
+    def _is_better(self, value: float) -> bool:
+        return value < self.best if self.mode == "min" else value > self.best
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # The sanity-check pass runs on two batches and would otherwise write a
+        # "best" checkpoint from an untrained model before epoch 0.
+        if trainer.sanity_checking:
+            return
+        value = trainer.callback_metrics.get(self.monitor)
+        if value is None:
+            return
+        value = float(value)
+        if value != value:  # NaN
+            return
+        if not self._is_better(value):
+            return
+
+        self.best = value
+        self.best_epoch = int(trainer.current_epoch)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.saved_path = pl_module.save(os.path.join(self.checkpoint_dir, self.filename))
+        if self.verbose:
+            print(
+                f"[epoch {self.best_epoch}] new best {self.monitor}={value:.5f} "
+                f"-> saved {self.filename}"
+            )
+
+    def state_dict(self):
+        return {
+            "best": self.best,
+            "best_epoch": self.best_epoch,
+            "saved_path": self.saved_path,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.best = state_dict.get("best", self.best)
+        self.best_epoch = state_dict.get("best_epoch", self.best_epoch)
+        self.saved_path = state_dict.get("saved_path", self.saved_path)

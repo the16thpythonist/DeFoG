@@ -87,7 +87,7 @@ def build_encoders(atom_types, bond_types):
     return atom_encoder, atom_decoder, bond_encoder, bond_decoder
 
 
-def smiles_to_pyg_data(smiles: str, atom_encoder, bond_encoder):
+def smiles_to_pyg_data(smiles: str, atom_encoder, bond_encoder, kekulize: bool = False):
     """
     Convert a SMILES string to a PyG ``Data`` object (one-hot x and edge_attr).
 
@@ -95,6 +95,12 @@ def smiles_to_pyg_data(smiles: str, atom_encoder, bond_encoder):
         smiles: SMILES string.
         atom_encoder: {symbol: index}.
         bond_encoder: {RDKit BondType: 0-based index} (as from build_encoders).
+        kekulize: Convert aromatic bonds to alternating single/double before
+            encoding. Required whenever ``bond_encoder`` has no AROMATIC class:
+            without it every aromatic molecule hits the unknown-bond branch below
+            and returns None, which for a drug-like set silently discards ~93% of
+            the data. Off by default so existing aromatic-vocabulary callers are
+            unaffected.
 
     Returns:
         PyG Data with one-hot x (N, num_atom_types) and edge_attr
@@ -103,6 +109,16 @@ def smiles_to_pyg_data(smiles: str, atom_encoder, bond_encoder):
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
+
+    if kekulize:
+        try:
+            Chem.Kekulize(mol, clearAromaticFlags=True)
+        except (Chem.rdchem.KekulizeException, Chem.rdchem.AtomValenceException, ValueError):
+            # Defensive, not a live branch: MolFromSmiles above sanitizes, and
+            # sanitization already kekulizes, so anything that parsed can be
+            # kekulized. Kept so a future caller passing an unsanitized mol
+            # fails as "skipped" rather than as an exception mid-dataset.
+            return None
 
     num_atom_classes = len(atom_encoder)
     num_bond_classes = len(bond_encoder) + 1  # +1 for no-edge class
@@ -156,7 +172,12 @@ def _check_valency(mol):
         return False, atomid_valence
 
 
-def pyg_data_to_mol(data, atom_decoder: List[str], bond_decoder: List) -> Optional[Chem.Mol]:
+def pyg_data_to_mol(
+    data,
+    atom_decoder: List[str],
+    bond_decoder: List,
+    charge_correction: bool = True,
+) -> Optional[Chem.Mol]:
     """Convert a PyG ``Data`` (one-hot ``x``/``edge_attr``) to an RDKit molecule.
 
     Handles valence errors by adding formal charges to N, O, S. RDKit warnings
@@ -168,6 +189,11 @@ def pyg_data_to_mol(data, atom_decoder: List[str], bond_decoder: List) -> Option
         atom_decoder: class idx -> atom symbol, e.g. ["C", "N", "O"].
         bond_decoder: class idx -> RDKit BondType, index 0 = None (no bond),
             e.g. [None, BondType.SINGLE, BondType.DOUBLE, ...].
+        charge_correction: Repair over-valent N/O/S by assigning a +1 formal
+            charge (the "relaxed" reconstruction of Jo et al.). Setting it False
+            gives the strict, uncorrected reading -- several published ZINC
+            tables report both, and quoting a corrected number against someone
+            else's uncorrected one inflates the result.
     """
     try:
         RDLogger.DisableLog("rdApp.*")
@@ -218,6 +244,8 @@ def pyg_data_to_mol(data, atom_decoder: List[str], bond_decoder: List) -> Option
 
             mol.AddBond(i, j, bt)
 
+            if not charge_correction:
+                continue
             flag, atomid_valence = _check_valency(mol)
             if not flag and atomid_valence is not None and len(atomid_valence) == 2:
                 idx = atomid_valence[0]
@@ -618,6 +646,122 @@ def continuous_kl(ref, gen, num: int = 1000, eps: float = 1e-10) -> float:
         return float(entropy(P, Q))
     except Exception:
         return float("nan")
+
+
+# ===========================================================================
+# Protocol-conforming validity reporting (E1)
+# ===========================================================================
+# Three validity numbers, because the literature contains at least three and a
+# table that does not say which one it used is not comparable to anything
+# (docs/unconditional-protocol.md, trap 3):
+#
+#   relaxed_largest_frag  over-valent N/O/S repaired with a +1 formal charge,
+#                         then the largest connected fragment is taken. This is
+#                         the GDSS / DiGress / DeFoG lineage and the number that
+#                         belongs in the E1 table.
+#   strict_largest_frag   same, but with no charge repair -- the "without
+#                         valency correction" column several ZINC tables also
+#                         report. Always <= the relaxed number.
+#   whole_molecule        charge repair, but the entire graph must sanitize and a
+#                         disconnected result still counts. This is what
+#                         defog/ has historically reported, kept so old runs
+#                         remain interpretable against new ones.
+
+
+def largest_fragment_smiles(mol) -> Optional[str]:
+    """Canonical SMILES of the largest connected fragment, or None.
+
+    Mirrors ``src/analysis/rdkit_functions.py``: the *whole* molecule has to
+    sanitize first, and only then is the largest fragment extracted. Fragment-
+    first would be more permissive than the published convention -- a graph with
+    one broken component and one good one would score valid.
+    """
+    if mol is None:
+        return None
+    if mol_to_smiles(mol) is None:
+        return None
+    try:
+        RDLogger.DisableLog("rdApp.*")
+        frags = Chem.rdmolops.GetMolFrags(mol, asMols=True, sanitizeFrags=True)
+        largest = max(frags, default=mol, key=lambda m: m.GetNumAtoms())
+        return mol_to_smiles(largest)
+    except (Chem.rdchem.AtomValenceException, Chem.rdchem.KekulizeException,
+            Chem.rdchem.MolSanitizeException, ValueError, RuntimeError):
+        return None
+    finally:
+        RDLogger.EnableLog("rdApp.*")
+
+
+def validity_report(samples, atom_decoder, bond_decoder, *, reference_smiles=None) -> dict:
+    """All three validity conventions, plus both uniqueness/novelty denominators.
+
+    The headline basis is ``relaxed_largest_frag``; ``smiles`` holds that
+    convention's SMILES so FCD, scaffold similarity and novelty are all computed
+    over the same molecules the headline validity counted.
+
+    Uniqueness and novelty are reported twice. ``uniqueness`` / ``novelty`` are
+    fractions of valid and of unique respectively (the convention the GDSS/GruM
+    lineage uses for ZINC); ``v_u`` / ``v_u_n`` are the cumulative quantities
+    GuacaMol calls validity/uniqueness/novelty. They are inter-convertible but
+    they are not the same number, so both are emitted and the caller labels
+    which one the table uses.
+    """
+    n = len(samples)
+    relaxed, strict, whole = [], [], []
+    n_connected = 0
+
+    for sample in samples:
+        mol_relaxed = pyg_data_to_mol(sample, atom_decoder, bond_decoder,
+                                      charge_correction=True)
+        smi = largest_fragment_smiles(mol_relaxed)
+        if smi is not None:
+            relaxed.append(smi)
+
+        mol_strict = pyg_data_to_mol(sample, atom_decoder, bond_decoder,
+                                     charge_correction=False)
+        smi_strict = largest_fragment_smiles(mol_strict)
+        if smi_strict is not None:
+            strict.append(smi_strict)
+
+        smi_whole = mol_to_smiles(mol_relaxed) if mol_relaxed is not None else None
+        if smi_whole is not None and Chem.MolFromSmiles(smi_whole) is not None:
+            whole.append(smi_whole)
+            if "." not in smi_whole:
+                n_connected += 1
+
+    n_valid = len(relaxed)
+    unique = set(relaxed)
+    n_unique = len(unique)
+
+    out = {
+        "num_samples": n,
+        "num_valid": n_valid,
+        "num_unique": n_unique,
+        # -- the three conventions ------------------------------------------
+        "validity_relaxed_largest_frag": n_valid / n if n else 0.0,
+        "validity_strict_largest_frag": len(strict) / n if n else 0.0,
+        "validity_whole_molecule": len(whole) / n if n else 0.0,
+        # -- connectivity diagnostics (over whole-molecule valid) ------------
+        "connected": n_connected / len(whole) if whole else 0.0,
+        "disconnected": (len(whole) - n_connected) / len(whole) if whole else 0.0,
+        # -- per-valid convention -------------------------------------------
+        "uniqueness": n_unique / n_valid if n_valid else 0.0,
+        # -- cumulative (GuacaMol) convention --------------------------------
+        "v": n_valid / n if n else 0.0,
+        "v_u": n_unique / n if n else 0.0,
+        "validity_convention": "relaxed_largest_frag",
+        "smiles": relaxed,
+    }
+
+    if reference_smiles is not None:
+        ref = reference_smiles if isinstance(reference_smiles, (set, frozenset)) \
+            else set(reference_smiles)
+        n_novel = sum(1 for s in unique if s not in ref)
+        out["num_novel"] = n_novel
+        out["novelty"] = n_novel / n_unique if n_unique else 0.0
+        out["v_u_n"] = n_novel / n if n else 0.0
+
+    return out
 
 
 def molecular_metrics(
