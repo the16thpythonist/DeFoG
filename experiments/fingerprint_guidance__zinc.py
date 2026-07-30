@@ -135,7 +135,7 @@ PROBE_EVERY_K: int = 3
 PROBE_N_TARGETS: int = 2
 PROBE_N: int = 24
 PROBE_STEPS: int = 100
-PROBE_WEIGHT: float = 3.0
+PROBE_WEIGHT: float = 1.0   # steering weights must stay <= 1
 PROBE_BASELINE_N: int = 48
 
 SEED: int = 42

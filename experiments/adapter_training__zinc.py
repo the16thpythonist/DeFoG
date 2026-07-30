@@ -78,7 +78,13 @@ OMEGA: float = 0.0
 TIME_DISTORTION: str = "polydec"
 TARGET_PERCENTILES: list = [5, 95]
 LEVEL_NAMES: list = ["low", "high"]
-GUIDANCE_WEIGHTS: list = [1.0, 2.0, 4.0]
+# Steering weights must stay <= 1. The composition blends rate matrices as
+# log R_uncond + sum_i w_i (log R_cond_i - log R_uncond); with w > 1 the
+# unconditional coefficient 1 - sum(w_i) goes NEGATIVE, so the blend
+# extrapolates past the conditional instead of interpolating toward it, and
+# _stabilize's >1e5 clamp then silently drops rates. Empirically w=2 does not
+# work -- it degrades rather than steers harder.
+GUIDANCE_WEIGHTS: list = [0.25, 0.5, 1.0]
 N_PER_TARGET: int = 128
 N_BASELINE: int = 256
 EVAL_CHUNK: int = 32
@@ -88,7 +94,7 @@ COMPOSE_MODE: str = "product"    # single branch: product == mean
 PROBE_EVERY_K: int = 5
 PROBE_N: int = 32
 PROBE_STEPS: int = 100
-PROBE_WEIGHT: float = 2.0
+PROBE_WEIGHT: float = 1.0
 
 SEED: int = 42
 __DEBUG__: bool = False
