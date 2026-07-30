@@ -90,10 +90,14 @@ from .guidance import (
     tanimoto_similarity,
 )
 from .feynman_kac import FeynmanKacSampler, JointGuidanceSampler, predict_clean
-from .property_head import PropertyHead, LearnedPropertyEnergy
+from .property_head import PropertyHead, LearnedPropertyEnergy, fit_property_head
 from .rl import (
     GDPOTrainer,
     AdapterGDPOTrainer,
+    PropertyMatchReward,
+    HeadPropertyMatchReward,
+    head_predict_batch,
+    make_condition_sampler,
     RolloutSampler,
     RolloutBuffer,
     Reward,
@@ -165,6 +169,7 @@ __all__ = [
     "RewardRatio",
     "MoleculePropertyEnergy",
     "PropertyHead",
+    "fit_property_head",
     "LearnedPropertyEnergy",
     "build_guidance_network",
     "bregman_loss",
@@ -181,6 +186,10 @@ __all__ = [
     # GDPO reinforcement-learning fine-tuning (arXiv:2402.16302)
     "GDPOTrainer",
     "AdapterGDPOTrainer",
+    "PropertyMatchReward",
+    "HeadPropertyMatchReward",
+    "head_predict_batch",
+    "make_condition_sampler",
     "RolloutSampler",
     "RolloutBuffer",
     "Reward",

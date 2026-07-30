@@ -171,3 +171,60 @@ class LearnedPropertyEnergy:
             for j, i in enumerate(idx):
                 out[i] = (preds[j] - self.target) ** 2
         return out
+
+
+def fit_property_head(head, graphs, *, epochs: int = 60, lr: float = 1e-3, batch_size: int = 32,
+                      seed: int = 0, device: str = "cpu", grad_clip: float = 1.0,
+                      progress=None):
+    """Fit a :class:`PropertyHead` on its own, by grounding regression.
+
+    The head is normally trained jointly with an adapter
+    (:class:`defog.core.adapter.GroundedAdapterModule`), which is fine when the head is
+    a by-product of that run. It is NOT fine when the head's whole purpose is to be an
+    INDEPENDENT ruler — as in `molsmith adapter refine`, which fits a second head to score a
+    policy that was optimised against the first. That use needs a fit path with no adapter
+    anywhere near it, which is this.
+
+    ``graphs`` are PyG ``Data`` objects carrying the RAW target in ``.cond``, exactly as the
+    training pipeline builds them. Targets are normalised with the head's own buffers, so the
+    fitted head and its ``predict`` agree by construction.
+
+    ``seed`` seeds BOTH the parameter re-initialisation and the shuffling. Two heads fit on
+    the same data with different seeds differ in where they are wrong, which is the entire
+    point when one is checking the other.
+    """
+    import torch
+    from torch_geometric.loader import DataLoader
+
+    from .data import to_dense
+
+    generator = torch.Generator().manual_seed(seed)
+    torch.manual_seed(seed)
+    for module in head.modules():                 # re-init: an independent ruler must not
+        if hasattr(module, "reset_parameters"):   # inherit the head it is checking
+            module.reset_parameters()
+
+    head = head.to(device).train()
+    opt = torch.optim.AdamW(head.parameters(), lr=lr)
+    loader = DataLoader(graphs, batch_size=batch_size, shuffle=True, generator=generator)
+    history = []
+    for epoch in range(epochs):
+        total, seen = 0.0, 0
+        for batch in loader:
+            batch = batch.to(device)
+            dense, mask = to_dense(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+            dense = dense.mask(mask)
+            target = (batch.cond.view(-1).float() - head.prop_mean) / head.prop_std
+            predicted = head(dense.X.float(), dense.E.float(), mask)
+            loss = torch.nn.functional.mse_loss(predicted, target)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(head.parameters(), grad_clip)
+            opt.step()
+            total += float(loss.detach()) * target.numel()
+            seen += target.numel()
+        mean_loss = total / max(1, seen)
+        history.append(mean_loss)
+        if progress is not None and (epoch + 1) % 10 == 0:
+            progress(f"  head fit epoch {epoch + 1}/{epochs}  loss {mean_loss:.4f}")
+    return head.eval(), history

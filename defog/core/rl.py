@@ -793,3 +793,174 @@ class AdapterGDPOTrainer(GDPOTrainer):
             self.adapter.load_state_dict(backup)
             return out
         return self.adapter.save(path)
+
+
+# ===========================================================================
+# Conditional property rewards
+# ===========================================================================
+# Promoted verbatim from experiments/adapter_rl_finetune__zinc.py, where they were the
+# reward used to produce the shipped first-party adapters. They live here because they are
+# training-loop code, and because `molsmith adapter refine` needs them from the library
+# rather than from an experiment script.
+#
+# The CONNECTIVITY-FIRST tiering is the load-bearing part and must not be "simplified":
+#
+#     invalid (-10)  <  disconnected (-4)  <  connected [-clamp, 0]
+#
+# `disconnect_reward` sits strictly below `-prop_clamp`, so ANY connected molecule outranks
+# ANY disconnected one no matter how far off-target it is, while the property term still
+# gives a full gradient among connected molecules. Flatten this ordering and the policy
+# learns to hit the target with fragments, which score well on most property functions and
+# are not molecules.
+
+
+class PropertyMatchReward:
+    """Conditional reward from a closed-form property function. Ground truth.
+
+    ``prop_fn`` maps an RDKit Mol to a float. Returns ``-min(|prop - target| / scale, clamp)``
+    for connected molecules; see the tiering note above for the rest.
+    """
+
+    def __init__(self, atom_decoder, bond_decoder, prop_fn, scale=1.0,
+                 invalid_reward=-10.0, disconnect_reward=-4.0, prop_clamp=3.0):
+        self.ad, self.bd, self.prop_fn = atom_decoder, bond_decoder, prop_fn
+        self.scale, self.invalid = float(scale), float(invalid_reward)
+        self.disconnect, self.clamp = float(disconnect_reward), float(prop_clamp)
+
+    def __call__(self, X1, E1, node_mask, cond):
+        from rdkit import Chem
+
+        from ..domains.molecule import mol_to_smiles, pyg_data_to_mol
+
+        n = node_mask.sum(-1)
+        datas = dense_to_pyg(X1, E1, None, node_mask, n)
+        out = X1.new_full((len(datas),), self.invalid)
+        tgt = cond.reshape(-1).tolist()
+        for i, d in enumerate(datas):
+            mol = pyg_data_to_mol(d, self.ad, self.bd)
+            smi = mol_to_smiles(mol) if mol is not None else None
+            m = Chem.MolFromSmiles(smi) if smi is not None else None
+            if m is None:
+                continue                                   # invalid -> floor
+            if "." in smi:
+                out[i] = self.disconnect                   # disconnected -> flat penalty
+                continue
+            try:
+                out[i] = -min(abs(float(self.prop_fn(m)) - tgt[i]) / self.scale, self.clamp)
+            except Exception:
+                pass                                       # prop error -> invalid floor
+        return out
+
+
+def head_predict_batch(mols, head, atom_encoder, bond_encoder, device):
+    """The head's prediction for each RDKit Mol, via its NATIVE re-encoding.
+
+    SMILES -> smiles_to_pyg_data -> to_dense -> head.predict, exactly as
+    :class:`LearnedPropertyEnergy` does. This detour is not incidental: the head is trained on
+    that encoding, and feeding it the raw generated graph mispredicts. Returns a list aligned
+    to ``mols`` with None where re-encoding failed.
+    """
+    import torch
+    from torch_geometric.data import Batch
+
+    from rdkit import Chem
+
+    from ..domains.molecule import smiles_to_pyg_data
+    from .data import to_dense
+
+    reenc, idx = [], []
+    for i, m in enumerate(mols):
+        if m is None:
+            continue
+        try:
+            rd = smiles_to_pyg_data(Chem.MolToSmiles(m), atom_encoder, bond_encoder)
+        except Exception:
+            rd = None
+        if rd is not None and getattr(rd, "x", None) is not None:
+            reenc.append(rd)
+            idx.append(i)
+    out = [None] * len(mols)
+    if reenc:
+        batch = Batch.from_data_list(reenc).to(device)
+        dense, mask = to_dense(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+        dense = dense.mask(mask)
+        with torch.no_grad():
+            preds = head.predict(dense.X, dense.E, mask).reshape(-1).tolist()
+        for j, i in enumerate(idx):
+            out[i] = float(preds[j])
+    return out
+
+
+class HeadPropertyMatchReward:
+    """Conditional reward from a learned :class:`PropertyHead`. NOT ground truth.
+
+    Same tiering and scale as :class:`PropertyMatchReward`, with the property term supplied by
+    the head instead of a closed form. This is the only option for a property that cannot be
+    computed — and the reason `molsmith adapter refine` fits a second, independent head to
+    report results with: optimising a policy against a learned reward drives it toward that
+    reward's errors, so the same head cannot both define the objective and score it.
+    """
+
+    def __init__(self, head, atom_encoder, bond_encoder, atom_decoder, bond_decoder, device,
+                 scale=1.0, invalid_reward=-10.0, disconnect_reward=-4.0, prop_clamp=3.0):
+        self.head = head
+        self.ae, self.be = atom_encoder, bond_encoder
+        self.ad, self.bd = atom_decoder, bond_decoder
+        self.device = device
+        self.scale, self.invalid = float(scale), float(invalid_reward)
+        self.disconnect, self.clamp = float(disconnect_reward), float(prop_clamp)
+
+    def __call__(self, X1, E1, node_mask, cond):
+        from rdkit import Chem
+
+        from ..domains.molecule import mol_to_smiles, pyg_data_to_mol
+
+        n = node_mask.sum(-1)
+        datas = dense_to_pyg(X1, E1, None, node_mask, n)
+        out = X1.new_full((len(datas),), self.invalid)
+        tgt = cond.reshape(-1).tolist()
+        conn_mols, conn_idx = [], []
+        for i, d in enumerate(datas):
+            mol = pyg_data_to_mol(d, self.ad, self.bd)
+            smi = mol_to_smiles(mol) if mol is not None else None
+            m = Chem.MolFromSmiles(smi) if smi is not None else None
+            if m is None:
+                continue                                   # invalid -> floor
+            if "." in smi:
+                out[i] = self.disconnect                   # disconnected -> flat penalty
+                continue
+            conn_mols.append(m)
+            conn_idx.append(i)
+        if conn_mols:
+            preds = head_predict_batch(conn_mols, self.head, self.ae, self.be, self.device)
+            for j, i in enumerate(conn_idx):
+                p = preds[j]
+                if p is None:
+                    continue                               # re-encode failed -> invalid floor
+                out[i] = -min(abs(p - tgt[i]) / self.scale, self.clamp)
+        return out
+
+
+def make_condition_sampler(p_lo, p_hi, K, G, seed):
+    """``() -> (cond (K,1) RAW targets, groups (K,))`` for :class:`AdapterGDPOTrainer`.
+
+    ``G`` distinct targets drawn uniformly from ``[p_lo, p_hi]``, each repeated ``K // G``
+    times. The repetition is what GRPO's grouped advantage needs: rollouts sharing a target
+    are compared against each other, so the advantage is free of the target's own difficulty.
+    """
+    import torch
+
+    gen = torch.Generator().manual_seed(seed)
+    per = max(1, K // G)
+
+    def sampler():
+        targets = torch.rand(G, generator=gen) * (p_hi - p_lo) + p_lo
+        cond = targets.repeat_interleave(per).unsqueeze(-1)
+        groups = torch.arange(G).repeat_interleave(per)
+        if cond.size(0) < K:                       # pad to exactly K
+            extra = K - cond.size(0)
+            cond = torch.cat([cond, targets[:extra].unsqueeze(-1)])
+            groups = torch.cat([groups, torch.arange(extra)])
+        return cond[:K], groups[:K]
+
+    return sampler
