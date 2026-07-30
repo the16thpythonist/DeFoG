@@ -1195,6 +1195,37 @@ class DeFoGModel(pl.LightningModule):
 
         return cls(**model_kwargs)
 
+    @classmethod
+    def from_config(
+        cls,
+        hparams: dict,
+        state_dict: dict,
+        device: Optional[Union[str, torch.device]] = "cpu",
+    ) -> "DeFoGModel":
+        """
+        Rebuild a model from a hyper-parameter dict and a separately-stored state dict.
+
+        The counterpart to ``save``/``load`` for containers that keep tensors and
+        declarations in different files (e.g. safetensors plus a metadata document), and
+        therefore cannot round-trip a pickled checkpoint. ``load`` remains the path for
+        ``.ckpt`` files.
+
+        Both tensor-valued hyper-parameters (``node_marginals``, ``edge_marginals``,
+        ``node_counts``) and scalar ones must be present in ``hparams``; the caller is
+        responsible for recombining them if its container stores them separately.
+
+        Args:
+            hparams: keyword arguments for ``__init__``.
+            state_dict: the model's state dict.
+            device: device to load onto. Defaults to "cpu".
+
+        Returns:
+            Loaded DeFoGModel in eval mode.
+        """
+        model = cls(**hparams)
+        model.load_state_dict(state_dict)
+        return model.to(device).eval()
+
     def save(self, path: str) -> str:
         """
         Save the model to a checkpoint file.

@@ -59,6 +59,33 @@ class PropertyHead(nn.Module):
         """Un-normalized property prediction (bs,)."""
         return self.forward(X.float(), E.float(), node_mask) * self.prop_std + self.prop_mean
 
+    def config(self) -> dict:
+        """The architecture config needed to rebuild this head.
+
+        Exposed for out-of-band serialization: a container that stores tensors
+        separately from declarations cannot rely on ``save``/``load`` round-tripping a
+        pickled dict.
+        """
+        return {
+            "na": self.xin.in_features, "nb": self.ein.in_features,
+            "hid": self.xin.out_features, "layers": len(self.msg),
+            "prop_mean": float(self.prop_mean), "prop_std": float(self.prop_std),
+        }
+
+    @classmethod
+    def from_config(cls, config: dict, state_dict: dict, device="cpu") -> "PropertyHead":
+        """Rebuild a head from a ``config()`` dict and a separately-stored state dict.
+
+        ``strict=False`` matches :meth:`load`: state dicts written before the
+        prop_mean/prop_std buffers existed are still loadable, with those buffers
+        rebuilt from the config scalars.
+        """
+        head = cls(config["na"], config["nb"], hid=config.get("hid", 128),
+                   layers=config.get("layers", 3), prop_mean=config.get("prop_mean", 0.0),
+                   prop_std=config.get("prop_std", 1.0))
+        head.load_state_dict(state_dict, strict=False)
+        return head.to(device).eval()
+
     def save(self, path):
         torch.save({
             "state_dict": self.state_dict(),

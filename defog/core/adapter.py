@@ -42,6 +42,14 @@ from .guidance import _GuidanceModuleBase
 _STREAMS = ("X", "E", "y")
 _DIMKEY = {"X": "dx", "E": "de", "y": "dy"}
 
+# Accepted keys of AdaLNAdapter.__init__, used by from_config to ignore extras rather
+# than raise on a config written by a newer version.
+_CONFIG_KEYS = frozenset({
+    "cond_dim", "n_layers", "dims", "hidden", "time_conditioned", "streams",
+    "time_emb_dim", "cond_mean", "cond_std", "name", "cond_type",
+    "interior_ff", "interior_attn", "base_token",
+})
+
 
 # ===========================================================================
 # Modulation: per-layer FiLM params for a (possibly stacked) batch
@@ -261,6 +269,33 @@ class AdaLNAdapter(nn.Module):
                     name=self.name, cond_type=self.cond_type,
                     interior_ff=self.interior_ff, interior_attn=self.interior_attn,
                     base_token=self.base_token)
+
+    def config(self) -> dict:
+        """The architecture config needed to rebuild this adapter (public alias).
+
+        Exposed for out-of-band serialization -- e.g. a container that stores tensors
+        separately from declarations (safetensors + a metadata file) and therefore
+        cannot rely on ``save``/``load`` round-tripping a pickled dict.
+        """
+        return self._config()
+
+    @classmethod
+    def from_config(cls, config: dict, state_dict: dict, device="cpu") -> "AdaLNAdapter":
+        """Rebuild an adapter from a ``config()`` dict and a separately-stored state dict.
+
+        The counterpart to :meth:`config`, for callers that keep tensors and
+        declarations in different files. ``load`` remains the path for ``.ckpt``
+        checkpoints written by :meth:`save`.
+
+        Unknown config keys are ignored rather than raising, so a config written by a
+        newer version stays loadable as long as the tensors match.
+        """
+        cfg = {k: v for k, v in config.items() if k in _CONFIG_KEYS}
+        if "streams" in cfg:
+            cfg["streams"] = tuple(cfg["streams"])
+        a = cls(**cfg)
+        a.load_state_dict(state_dict)   # includes the cond_mean/cond_std buffers
+        return a.to(device)
 
     def save(self, path):
         if not path.endswith(".ckpt"):
