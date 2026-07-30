@@ -160,8 +160,17 @@ def main() -> int:
             "elapsed_s": round(elapsed, 1),
             "it_per_s": round(it_s, 3),
             "s_per_step": round(1 / it_s, 4),
-            "peak_gpu_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2)
-                           if device == "cuda" else None,
+            # BOTH numbers, because they differ by a lot and only one predicts
+            # OOM. max_memory_allocated counts live tensors; the caching
+            # allocator's RESERVED pool (plus CUDA context) is what nvidia-smi
+            # shows and what actually exhausts the card. On the first GuacaMol
+            # leg, allocated peaked at 38.6 GB while reserved transiently hit
+            # 93.7 GB of 95.6 -- reporting only the former made batch 128 look
+            # like it had 2.4x the headroom it really had.
+            "peak_gpu_allocated_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2)
+                                     if device == "cuda" else None,
+            "peak_gpu_reserved_gb": round(torch.cuda.max_memory_reserved() / 2**30, 2)
+                                    if device == "cuda" else None,
             "projected": {
                 "train_after_filter": train_filtered,
                 "steps_per_epoch": steps_per_epoch,

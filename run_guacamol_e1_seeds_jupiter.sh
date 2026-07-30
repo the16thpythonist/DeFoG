@@ -40,6 +40,16 @@ export PYTHONPATH="$PWD:$PYTHONPATH"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=8
 
+# Measured on leg 1 (job 1116480): the caching allocator's RESERVED pool spiked
+# to 93.7 GB of 95.6 before releasing and settling at ~70-72 GB. It survived,
+# but 4 GB of transient headroom is thin. expandable_segments lets the allocator
+# grow segments instead of hunting for a contiguous block, which is exactly the
+# failure mode a padded-to-72-atoms dense batch provokes.
+#
+# Purely an allocator strategy: no effect on numerics, the LR schedule or
+# resume, so it is safe to introduce partway through a chain.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 SEEDS=(42 43 44 45)
 EPOCHS=75
 BATCH_SIZE=128
