@@ -440,3 +440,72 @@ class AdapterModule(_GuidanceModuleBase):
                                     true_X=X1, true_E=E1, true_y=y0, node_mask=node_mask)
         self.log("adapter/loss", loss, prog_bar=True, on_epoch=True, batch_size=bs)
         return loss
+
+
+class GroundedAdapterModule(AdapterModule):
+    """Train an adapter AND a :class:`~defog.core.property_head.PropertyHead` in one run,
+    with the two objectives deliberately UNCOUPLED.
+
+    Two losses, one per module:
+
+    * ``L_denoise`` -- the base's own denoising CE, inherited verbatim from
+      :class:`AdapterModule`: the adapter becomes a conditional denoiser ``p(x1|x_t,c)``.
+    * ``L_ground`` -- ``MSE(head(true clean graph), normalized true property)``. A plain
+      supervised regression over REAL molecules.
+
+    **The head never sees the condition as an input, and no loss pushes the adapter through
+    the head.** That is the point, not an omission. A head fitted against the condition on
+    the adapter's own output can satisfy it by learning to detect *what the adapter was
+    aiming at* rather than *what the molecule is* -- and such a head is worthless as the
+    Feynman-Kac energy, because it would reward intent instead of achievement
+    (see :mod:`defog.core.property_head`). The soft-input self-consistency coupling that
+    couples them was tried and did not hold up; ``LearnedPropertyEnergy`` works because FK
+    feeds the head DISCRETE re-encoded graphs, which is a different input distribution from
+    the softmax tensors such a coupling would train on.
+
+    The normalization is read from the head's OWN ``prop_mean``/``prop_std`` buffers rather
+    than passed in separately, so the scale the head is trained at and the scale
+    ``PropertyHead.predict`` un-normalizes with cannot drift apart.
+
+    Args:
+        base: frozen unconditional ``DeFoGModel``.
+        adapter: the :class:`AdaLNAdapter` to train.
+        head: a ``PropertyHead`` constructed with ``prop_mean``/``prop_std`` of the data.
+        lr / lr_head: learning rates for the adapter and the head.
+        l10_lr_scale: smaller LR on the adapter's L10 (interior-attention) heads.
+        lambda_ground: weight on the grounding term.
+    """
+
+    def __init__(self, base, adapter, head, cond_attr: str = "cond",
+                 cond_drop_prob: float = 0.0, lr: float = 2e-4, lr_head: float = 1e-3,
+                 l10_lr_scale: float = 1.0, lambda_ground: float = 1.0):
+        super().__init__(base, adapter, cond_attr=cond_attr, cond_drop_prob=cond_drop_prob,
+                         lr=lr, l10_lr_scale=l10_lr_scale)
+        self.head = head
+        self.lr_head = float(lr_head)
+        self.lambda_ground = float(lambda_ground)
+
+    def configure_optimizers(self):
+        # Reuse the parent's adapter param groups (including the L10 validity guard) exactly,
+        # then attach the head as one more group. Rebuilding them here would risk the two
+        # drifting apart.
+        opt = super().configure_optimizers()
+        opt.add_param_group({"params": list(self.head.parameters()), "lr": self.lr_head})
+        return opt
+
+    def training_step(self, batch, batch_idx):
+        denoise = super().training_step(batch, batch_idx)
+
+        # _dense() is recomputed rather than threaded out of the parent's step: it is a
+        # to_dense() over one batch, negligible beside a 9-layer transformer forward, and the
+        # alternative is changing AdapterModule's contract for this subclass's benefit.
+        X1, E1, node_mask = self._dense(batch)
+        bs = X1.size(0)
+        c = getattr(batch, self.cond_attr).to(X1.device).view(bs, -1).float()
+        c_norm = (c.view(bs) - self.head.prop_mean) / self.head.prop_std
+
+        ground = torch.nn.functional.mse_loss(self.head(X1, E1, node_mask), c_norm)
+        loss = denoise + self.lambda_ground * ground
+        self.log_dict({"head/ground": ground, "train/loss": loss},
+                      prog_bar=True, on_epoch=True, batch_size=bs)
+        return loss

@@ -70,6 +70,7 @@ from .adapter import (
     AdapterComposition,
     AdapterRegistry,
     AdapterModule,
+    GroundedAdapterModule,
 )
 from .constraint import Constraint, SubgraphConstraint
 from .guidance import (
@@ -152,6 +153,7 @@ __all__ = [
     "AdapterComposition",
     "AdapterRegistry",
     "AdapterModule",
+    "GroundedAdapterModule",
     "RefinementSampler",
     # Constraints (inpainting)
     "Constraint",
