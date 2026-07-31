@@ -48,7 +48,7 @@ from pycomex.utils import file_namespace, folder_path
 
 from defog.core import (  # noqa: E402
     DeFoGModel, TrainingMonitorCallback, SampleVisualizationCallback, EMACallback,
-    BestValLossCheckpoint,
+    BestValLossCheckpoint, PerLinkTimer,
 )
 from defog.data import guacamol_reference as gmref  # noqa: E402
 from defog.domains import MoleculeDomain  # noqa: E402
@@ -280,12 +280,15 @@ def experiment(e: Experiment) -> None:
         callbacks = [EMACallback(decay=e.EMA_DECAY)] + callbacks
         e.log(f"EMA enabled (decay={e.EMA_DECAY})")
 
-    max_time = None
+    # PerLinkTimer, NOT Trainer(max_time=...): Lightning's Timer restores its
+    # elapsed time from the checkpoint, which makes the budget cumulative over
+    # the whole chain and leaves later links with nothing. See PerLinkTimer.
     if e.MAX_TIME_HOURS:
         hrs = int(e.MAX_TIME_HOURS)
         mins = int(round((e.MAX_TIME_HOURS - hrs) * 60))
-        max_time = {"hours": hrs, "minutes": mins}
-        e.log(f"Trainer max_time = {hrs}h{mins:02d}m")
+        callbacks.append(PerLinkTimer(duration={"hours": hrs, "minutes": mins}))
+        e.log(f"PerLinkTimer = {hrs}h{mins:02d}m for THIS link "
+              f"(per-link, not cumulative across the chain)")
 
     resume_path, enable_ckpt = e.RESUME_CKPT, False
     if e.CKPT_DIR:
@@ -302,7 +305,7 @@ def experiment(e: Experiment) -> None:
               + (f"RESUMING from {resume_path}" if resume_path else "fresh start"))
 
     trainer = pl.Trainer(
-        max_epochs=e.EPOCHS, max_time=max_time, accelerator="auto", devices=1,
+        max_epochs=e.EPOCHS, accelerator="auto", devices=1,
         enable_progress_bar=True, enable_checkpointing=enable_ckpt, logger=False,
         callbacks=callbacks,
     )

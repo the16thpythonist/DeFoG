@@ -41,6 +41,7 @@ from .callbacks import (
     SampleVisualizationCallback,
     EMACallback,
     BestValLossCheckpoint,
+    PerLinkTimer,
 )
 from .domain import GraphDomain, GenericGraphDomain, generation_metrics
 from .data import (
@@ -126,6 +127,7 @@ __all__ = [
     "SampleVisualizationCallback",
     "EMACallback",
     "BestValLossCheckpoint",
+    "PerLinkTimer",
     # Graph-domain adapters (decode / visualize / evaluate)
     "GraphDomain",
     "GenericGraphDomain",

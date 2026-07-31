@@ -1430,3 +1430,43 @@ class BestValLossCheckpoint(pl.Callback):
         self.best = state_dict.get("best", self.best)
         self.best_epoch = state_dict.get("best_epoch", self.best_epoch)
         self.saved_path = state_dict.get("saved_path", self.saved_path)
+
+
+class PerLinkTimer(pl.callbacks.Timer):
+    """A wall-clock budget for THIS process, not for the whole chained run.
+
+    ``Trainer(max_time=...)`` builds a Lightning ``Timer``, and that Timer
+    persists ``time_elapsed`` into the checkpoint and restores it on resume. In
+    a chained job that is almost never what is wanted: the budget becomes
+    cumulative across every link, so each successive link gets whatever the
+    previous ones left over, and once the total is spent every further link
+    exits immediately having trained nothing.
+
+    Measured on the ZINC E1 chain (jobs 1111877 / 1112033) with a 10h30m budget:
+
+        link 1  ran 1h22m of fit, then died to a filesystem fault
+        link 2  resumed, restored the elapsed time, and stopped after 9h08m
+        checkpoint state: time_elapsed.train = 37,562 s of a 37,800 s budget
+
+    leaving four minutes for link 3 and nothing for anything after it. The job
+    still reports COMPLETED, so the symptom is a chain that quietly stops making
+    progress rather than an error.
+
+    Dropping the restored value on load makes ``duration`` a per-link budget,
+    which is what chaining needs. Nothing else about Timer changes -- it still
+    stops training at an epoch boundary and lets the run checkpoint cleanly
+    instead of being killed by the scheduler.
+
+    Use INSTEAD of ``Trainer(max_time=...)``, not alongside it: passing both
+    gives two independent timers.
+    """
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        # Deliberately ignored. The parent would restore time_elapsed and make
+        # the budget cumulative across links; see the class docstring.
+        return
+
+    def state_dict(self) -> Dict[str, Any]:
+        # Still recorded, so a resumed run can report how much wall-clock the
+        # chain has consumed in total even though it does not act on it.
+        return super().state_dict()
