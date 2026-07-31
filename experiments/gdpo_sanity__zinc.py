@@ -70,7 +70,13 @@ RING_LO: int = 3
 RING_HI: int = 8
 
 # --- RL (defaults from gdpo_connectivity.py, which tuned them on this model) --
-ITERATIONS: int = 60          # cliff is ~60-80 at kl_coef=0.3; stay under it
+# :param ITERATIONS: Run 1139128 peaked at ~iteration 20 (sanity 0.961,
+#     disconnected 0.008) and then collapsed to sanity 0.14 by iteration 59. The
+#     "~60-80 cliff" quoted in gdpo_connectivity.py was measured at ETA=0; at
+#     ETA=25 the cliff arrived far earlier. 25 brackets the observed optimum
+#     without entering the degrading region -- and CKPT_EVERY/SELECT_BEST below
+#     mean the peak is captured even if it moves again.
+ITERATIONS: int = 25
 ROLLOUT_SIZE: int = 128
 SUBSAMPLE_STEPS: int = 12
 MINIBATCH_SIZE: int = 16
@@ -87,6 +93,21 @@ EMA_DECAY: float = 0.9
 #     collapsing the distribution.
 KL_COEF: float = 0.3
 
+# --- Checkpointing (never rely on the final iteration) ----------------------
+# :param CKPT_EVERY / SELECT_BEST / SELECT_WINDOW:
+#     Run 1139128 saved only the final model, so a genuinely good policy at
+#     iteration 20 was unrecoverable and the run had to be redone. EMA does not
+#     rescue that: at ema_decay=0.9 its memory is ~10 iterations, so the final
+#     EMA reflected the collapsed region. Periodic checkpoints plus a best-so-far
+#     make the peak survivable.
+#
+#     Selection uses a ROLLING MEAN of rollout sanity, not a single batch: at
+#     rollout_size 128 a single batch carries ~±2% noise, so unsmoothed selection
+#     would reward a lucky iteration rather than a genuinely better policy.
+CKPT_EVERY: int = 5
+SELECT_BEST: bool = True
+SELECT_WINDOW: int = 3
+
 # --- Rollout sampling -------------------------------------------------------
 # :param ROLLOUT_SAMPLE_STEPS / ROLLOUT_ETA / ROLLOUT_OMEGA:
 #     eta matches the DEPLOYED configuration (the E1 frozen eta=25) so the
@@ -94,8 +115,12 @@ KL_COEF: float = 0.3
 #     Steps are reduced to 100 for rollout cost; eval uses the full deployed 500.
 #     That step mismatch is a known approximation, which is why evaluation is
 #     done at the deploy config rather than the rollout config.
+#     Run 1139128 used ROLLOUT_ETA=25 to match deployment and diverged; the
+#     cliff estimate borrowed from gdpo_connectivity.py was measured at eta=0,
+#     and noisier rollouts raise gradient variance. Back to 0 -- one variable at
+#     a time.
 ROLLOUT_SAMPLE_STEPS: int = 100
-ROLLOUT_ETA: float = 25.0
+ROLLOUT_ETA: float = 0.0
 ROLLOUT_OMEGA: float = 0.0
 TIME_DISTORTION: str = "polydec"
 
@@ -238,11 +263,27 @@ def experiment(e: Experiment) -> None:
     e.log(f"training {e.ITERATIONS} iterations (kl_coef={e.KL_COEF}, lr={e.LR})")
 
     history = []
+    best = {"score": -1.0, "iter": None, "path": None}
 
     def on_iter(i, stats):
         row = {"iter": i, **{k: v for k, v in stats.items() if isinstance(v, (int, float))},
                **reward.last}
         history.append(row)
+
+        if e.CKPT_EVERY and i % e.CKPT_EVERY == 0:
+            trainer.save(os.path.join(e.OUT_CKPT_DIR, f"iter{i:03d}"), use_ema=True)
+
+        if e.SELECT_BEST:
+            window = [h.get("sanity_frac", 0.0) for h in history[-e.SELECT_WINDOW:]]
+            score = sum(window) / max(1, len(window))
+            # Require a full window so the first iteration cannot win on a
+            # one-batch fluke.
+            if len(window) >= e.SELECT_WINDOW and score > best["score"]:
+                best.update(score=score, iter=i,
+                            path=trainer.save(os.path.join(e.OUT_CKPT_DIR, "best_model"),
+                                              use_ema=True))
+                e.log(f"  it {i:3d} new best smoothed sanity={score:.3f} -> best_model")
+
         if i % 5 == 0 or i == e.ITERATIONS - 1:
             e.log(f"  it {i:3d} reward={row.get('reward_mean', float('nan')):.3f} "
                   f"sanity={reward.last.get('sanity_frac', float('nan')):.3f} "
@@ -250,11 +291,23 @@ def experiment(e: Experiment) -> None:
                   f"wonky={reward.last.get('wonky_ring_frac', float('nan')):.3f}")
 
     trainer.fit(e.ITERATIONS, on_iter=on_iter)
-    if trainer.ema is not None:
-        trainer.ema.copy_to(model)
-    out_path = model.save(os.path.join(e.OUT_CKPT_DIR, "rl_model"))
-    e.log(f"saved RL model -> {out_path}")
+    final_path = trainer.save(os.path.join(e.OUT_CKPT_DIR, "rl_model_final"), use_ema=True)
+    e.log(f"saved final-iteration model -> {final_path}")
     e.commit_json("history.json", history)
+
+    # Evaluate the SELECTED model, not the last one. The last iteration is only
+    # the best policy if the run never degraded, which is not the common case.
+    if e.SELECT_BEST and best["path"]:
+        e.log(f"loading best checkpoint (iter {best['iter']}, "
+              f"smoothed sanity {best['score']:.3f})")
+        model = DeFoGModel.load(os.path.join(e.OUT_CKPT_DIR, "best_model")).to(device)
+        out_path = best["path"]
+    else:
+        if trainer.ema is not None:
+            trainer.ema.copy_to(model)
+        out_path = final_path
+    e["selected"] = {"iter": best["iter"], "smoothed_sanity": best["score"],
+                     "path": out_path}
 
     # -- AFTER ---------------------------------------------------------------
     model.eval()
@@ -283,6 +336,8 @@ def experiment(e: Experiment) -> None:
 
     e.commit_json("summary.json", {
         "base_ckpt": e.BASE_CKPT, "out_ckpt": out_path, "seed": e.SEED,
+        "selected_iter": best["iter"], "selected_smoothed_sanity": best["score"],
+        "final_iteration_ckpt": final_path,
         "reward": "graded: valid + connected + rings_ok in [0,3]",
         "kl_coef": e.KL_COEF, "iterations": e.ITERATIONS, "lr": e.LR,
         "rollout": {"steps": e.ROLLOUT_SAMPLE_STEPS, "eta": e.ROLLOUT_ETA,
@@ -314,7 +369,9 @@ def experiment(e: Experiment) -> None:
 
 @experiment.testing
 def testing(e: Experiment):
-    e.ITERATIONS = 2
+    e.ITERATIONS = 4
+    e.CKPT_EVERY = 2
+    e.SELECT_WINDOW = 2
     e.ROLLOUT_SIZE = 8
     e.SUBSAMPLE_STEPS = 2
     e.MINIBATCH_SIZE = 4
