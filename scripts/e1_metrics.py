@@ -320,6 +320,20 @@ def compute_moses_suite(generated: List[str], reference: List[str],
     # is ~0.1, because test_scaffolds is built from scaffolds the training set
     # never contained. Emitting only one and labelling it "Scaf" is therefore a
     # 6x error waiting to happen, so both are always produced.
+    #
+    # WHICH ONE DEFOG REPORTS: the TestSF variants. Scoring their own published
+    # MOSES samples against their paper row (Table 9, 500 steps):
+    #
+    #     metric   published   ours/Test   ours/TestSF
+    #     SNN         0.55       0.590        0.555
+    #     Scaf        0.144      0.868        0.107
+    #     FCD         1.95       0.897        1.562
+    #
+    # SNN pins it to within 0.005 while Scaf/Test is off by 6x. Scaf and FCD do
+    # not match exactly because the archive samples are not the paper's run --
+    # the archive's own report gives validity 0.9166 against the paper's 0.928 --
+    # but the SCALE is unambiguous. Compare like with like: an E1 MOSES row must
+    # use the TestSF columns.
     if reference_scaffolds:
         sf = list(reference_scaffolds)
         out.update({
