@@ -45,6 +45,20 @@ mkdir -p "$OUT_DIR"
 echo "ZINC sampling sweep @ $(date); ckpt=$CKPT"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
+# CUDA PREFLIGHT. Job 1137640 landed on jpbo-001-48, where nvidia-smi listed all
+# four GH200s but torch._C._cuda_init() failed with "CUDA unknown error" on every
+# slice -- a node-level fault, since the identical pattern was running fine on
+# another node at the same moment. nvidia-smi succeeding is NOT evidence that
+# torch can use the GPU, so check the thing we actually depend on and fail fast
+# on a bad node instead of burning the allocation.
+python - <<'PY' || { echo "ERROR: CUDA preflight failed on $(hostname) -- bad node, resubmit"; exit 1; }
+import sys, torch
+if not torch.cuda.is_available():
+    print("torch.cuda.is_available() is False"); sys.exit(1)
+torch.zeros(8, device="cuda").sum().item()   # forces a real context init
+print("CUDA preflight OK:", torch.cuda.device_count(), "device(s)")
+PY
+
 for i in 0 1 2 3; do
     CUDA_VISIBLE_DEVICES=$i python -u scripts/sweep_sampling.py \
         --ckpt "$CKPT" --dataset zinc \
@@ -57,4 +71,14 @@ done
 
 wait
 echo "sweep finished at $(date)"
-echo "grid points completed: $(ls ${OUT_DIR}/*.json 2>/dev/null | wc -l) / 32"
+DONE=$(ls ${OUT_DIR}/*.json 2>/dev/null | wc -l)
+echo "grid points completed: ${DONE} / 32"
+
+# `wait` returns 0 even when every background arm died, so without this the job
+# reports COMPLETED 0:0 having produced nothing -- which is exactly how job
+# 1137640 looked. Make the exit code reflect reality.
+if [ "$DONE" -eq 0 ]; then
+    echo "ERROR: no grid points produced; arm tracebacks follow"
+    grep -hA5 "Traceback" zinc_sweep_slice*_${SLURM_JOB_ID}.out 2>/dev/null | head -20
+    exit 1
+fi
