@@ -38,8 +38,8 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
 for i in 0 1 2 3; do
     b=${BATCHES[$i]}
-    CUDA_VISIBLE_DEVICES=$i python -u scripts/probe_guacamol_throughput.py \
-        --batch-size ${b} --subset ${SUBSET} \
+    CUDA_VISIBLE_DEVICES=$i python -u scripts/probe_throughput.py \
+        --dataset guacamol --batch-size ${b} --subset ${SUBSET} \
         --out "guacamol_probe_bs${b}_${SLURM_JOB_ID}.json" \
         > "guacamol_probe_bs${b}_${SLURM_JOB_ID}.out" 2>&1 &
     echo "launched batch_size=${b} on GPU ${i} (pid $!)"
