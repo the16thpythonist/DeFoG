@@ -76,7 +76,7 @@ echo "RL finished at $(date)"
 # `wait` returns 0 even when every arm died; make the exit code honest.
 OK=0
 for s in "${SEEDS[@]}"; do
-    grep -q "saved RL model" "zinc_rl_seed${s}_${SLURM_JOB_ID}.out" 2>/dev/null && OK=$((OK+1))
+    grep -qE "saved final-iteration model|saved RL model" "zinc_rl_seed${s}_${SLURM_JOB_ID}.out" 2>/dev/null && OK=$((OK+1))
 done
 echo "arms that produced a model: ${OK} / 4"
 if [ "$OK" -lt 4 ]; then
