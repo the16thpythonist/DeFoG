@@ -53,6 +53,39 @@ if not hasattr(scipy, "histogram"):
     scipy.histogram = np.histogram
 
 
+def _install_molsets_shims() -> None:
+    """Three one-line restorations so molsets 0.3.1 (2020) runs on a modern stack.
+
+    Each replaces an alias its upstream removed, with the documented equivalent --
+    none of them changes what a metric computes. Applied here rather than in
+    site-packages so they survive a reinstall and stay visible.
+
+    Worth recording why molsets is usable at all: its setup.py pins
+    ``pomegranate==0.12.0``, which does not build on a current Python, and that
+    made it look unavailable. But ``pomegranate`` is imported by exactly one
+    file -- ``moses/baselines/hmm.py``, an HMM baseline model -- and
+    ``moses/__init__.py`` imports only dataset/metrics/utils. Installing with
+    ``--no-deps`` therefore gives the whole official metric suite.
+    """
+    import sys
+    import types
+
+    # 1. rdkit.six: a py2/3 compat shim RDKit removed. sascorer uses one symbol,
+    #    and six.iteritems(d) is iter(d.items()) on Python 3.
+    if "rdkit.six" not in sys.modules:
+        _six = types.ModuleType("rdkit.six")
+        _six.iteritems = lambda d: iter(d.items())
+        sys.modules["rdkit.six"] = _six
+
+    # 2. DataFrame.append: removed in pandas 2.0, and always concat underneath.
+    #    Shimmed rather than pinning pandas<2, which would drag numpy back to
+    #    1.x and break the torch/rdkit/FCD stack this env shares.
+    import pandas as pd
+
+    if not hasattr(pd.DataFrame, "append"):
+        pd.DataFrame.append = lambda self, other, **kw: pd.concat([self, other], **kw)
+
+
 # ===========================================================================
 # IO
 # ===========================================================================
@@ -233,53 +266,79 @@ def compute_nspdk(generated: List[str], reference: List[str],
 # Scaffold similarity
 # ===========================================================================
 def compute_scaffold_similarity(generated: List[str], reference: List[str]) -> Dict:
-    """Cosine similarity of Bemis-Murcko scaffold frequency vectors.
+    """Bemis-Murcko scaffold similarity, via MOSES's own ``ScafMetric``.
 
-    This is MOSES's ``ScafMetric`` definition. It is reimplemented rather than
-    imported because ``molsets`` pins ``pomegranate==0.12.0``, which does not
-    build on a current Python -- so the package the protocol would prefer is not
-    installable. Flagged as a deviation: the definition is simple and stated
-    here, but it is our code, not theirs.
+    Previously a local reimplementation, on the belief that ``molsets`` could not
+    be installed. That was wrong -- see :func:`_install_molsets_shims` -- so this
+    now calls the official implementation, which is what the protocol asks for.
 
     Higher is better.
     """
-    from rdkit import Chem, RDLogger
-    from rdkit.Chem.Scaffolds import MurckoScaffold
+    _install_molsets_shims()
+    from moses.metrics.metrics import ScafMetric
 
-    RDLogger.DisableLog("rdApp.*")
-
-    def scaffold_counts(smiles: List[str]) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
-        for s in smiles:
-            mol = Chem.MolFromSmiles(s)
-            if mol is None:
-                continue
-            try:
-                scaf = MurckoScaffold.MurckoScaffoldSmiles(mol=mol, includeChirality=False)
-            except Exception:
-                continue
-            if scaf:  # acyclic molecules yield '' and carry no scaffold
-                counts[scaf] = counts.get(scaf, 0) + 1
-        return counts
-
-    a, b = scaffold_counts(generated), scaffold_counts(reference)
-    keys = set(a) | set(b)
-    if not keys:
-        return {"scaffold_similarity": float("nan"),
-                "scaffold_note": "no scaffolds in either set"}
-
-    va = np.array([a.get(k, 0) for k in keys], dtype=float)
-    vb = np.array([b.get(k, 0) for k in keys], dtype=float)
-    denom = np.linalg.norm(va) * np.linalg.norm(vb)
-    sim = float(va.dot(vb) / denom) if denom > 0 else float("nan")
+    value = float(ScafMetric()(gen=list(generated), ref=list(reference)))
     return {
-        "scaffold_similarity": sim,
+        "scaffold_similarity": value,
         "scaffold_similarity_direction": "higher_is_better",
-        "scaffold_n_generated_unique": len(a),
-        "scaffold_n_reference_unique": len(b),
-        "scaffold_implementation": "local reimplementation of MOSES ScafMetric "
-                                   "(molsets uninstallable: pomegranate==0.12.0)",
+        "scaffold_implementation": "moses.metrics.metrics.ScafMetric (official)",
     }
+
+
+def compute_moses_suite(generated: List[str], reference: List[str],
+                        reference_scaffolds: Optional[List[str]] = None,
+                        device: str = "cpu") -> Dict:
+    """MOSES's own metric suite: Filters, SNN, Frag, Scaf, and FCD.
+
+    FCD is reported against BOTH held-out sets when ``reference_scaffolds`` is
+    given, because the protocol requires both and they are different numbers.
+    That is precisely the distinction ``src/datasets/moses_dataset.py`` destroys
+    by renaming ``test`` to "val" and ``test_scaffolds`` to "test".
+    """
+    _install_molsets_shims()
+    from moses.metrics.metrics import (FCDMetric, FragMetric, ScafMetric, SNNMetric,
+                                       fraction_passes_filters, fraction_unique,
+                                       fraction_valid)
+
+    gen, ref = list(generated), list(reference)
+    out = {
+        "moses_validity": float(fraction_valid(gen)),
+        "moses_unique": float(fraction_unique(gen)),
+        "moses_filters": float(fraction_passes_filters(gen)),
+        "moses_snn_test": float(SNNMetric(device=device)(gen=gen, ref=ref)),
+        "moses_frag_test": float(FragMetric(device=device)(gen=gen, ref=ref)),
+        "moses_scaf_test": float(ScafMetric(device=device)(gen=gen, ref=ref)),
+        "moses_fcd_test": float(FCDMetric(device=device)(gen=gen, ref=ref)),
+        "moses_fcd_direction": "lower_is_better",
+        "moses_implementation": "molsets 0.3.1 (official)",
+        "moses_n_reference": len(ref),
+    }
+
+    # MOSES computes EVERY one of these against both held-out sets and reports
+    # them as SNN/Test + SNN/TestSF, Scaf/Test + Scaf/TestSF, and so on. They
+    # are far apart -- Scaf/Test runs ~0.87 on a decent model while Scaf/TestSF
+    # is ~0.1, because test_scaffolds is built from scaffolds the training set
+    # never contained. Emitting only one and labelling it "Scaf" is therefore a
+    # 6x error waiting to happen, so both are always produced.
+    if reference_scaffolds:
+        sf = list(reference_scaffolds)
+        out.update({
+            "moses_snn_test_scaffolds": float(SNNMetric(device=device)(gen=gen, ref=sf)),
+            "moses_frag_test_scaffolds": float(FragMetric(device=device)(gen=gen, ref=sf)),
+            "moses_scaf_test_scaffolds": float(ScafMetric(device=device)(gen=gen, ref=sf)),
+            "moses_fcd_test_scaffolds": float(FCDMetric(device=device)(gen=gen, ref=sf)),
+            "moses_n_reference_scaffolds": len(sf),
+        })
+
+    # Reference size is load-bearing, not a convenience knob. Measured on
+    # DeFoG's own published samples, truncating the reference from 176,074 to
+    # 10,000 moved SNN 0.590 -> 0.454, Frag 0.997 -> 0.967, Scaf 0.868 -> 0.744
+    # and FCD 0.897 -> 4.155. Always score against the full split.
+    if len(ref) < 100000:
+        out["moses_reference_truncated_warning"] = (
+            f"reference has only {len(ref)} molecules; MOSES metrics are strongly "
+            f"reference-size dependent and published numbers use the full split")
+    return out
 
 
 # ===========================================================================
@@ -289,7 +348,9 @@ DATASET_METRICS = {
     # Per docs/unconditional-protocol.md section 3.
     "zinc": ["fcd", "nspdk", "scaffold"],
     "guacamol": ["kl", "fcd"],
-    "moses": ["fcd", "scaffold"],
+    # MOSES gets its own suite (Filters/SNN/Frag/Scaf + FCD against both
+    # held-out sets) rather than the generic metrics.
+    "moses": ["moses"],
 }
 
 
@@ -298,6 +359,9 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--generated", help="SMILES file or .json list of generated molecules")
     ap.add_argument("--reference", required=True, help="Reference split SMILES")
+    ap.add_argument("--reference-scaffolds", default=None,
+                    help="MOSES test_scaffolds SMILES; enables the second FCD the "
+                         "protocol requires alongside FCD-vs-test")
     ap.add_argument("--dataset", choices=sorted(DATASET_METRICS), default=None)
     ap.add_argument("--metrics", default=None,
                     help="Comma-separated subset of fcd,kl,nspdk,scaffold")
@@ -326,6 +390,9 @@ def main() -> int:
     else:
         generated = canonical(read_smiles(args.generated, args.limit))
 
+    ref_scaffolds = (canonical(read_smiles(args.reference_scaffolds, args.limit))
+                     if args.reference_scaffolds else None)
+
     which = (args.metrics.split(",") if args.metrics
              else DATASET_METRICS.get(args.dataset, ["fcd", "kl", "nspdk", "scaffold"]))
 
@@ -350,6 +417,10 @@ def main() -> int:
                                              subsample=args.nspdk_subsample))
             elif name == "scaffold":
                 results.update(compute_scaffold_similarity(generated, reference))
+            elif name == "moses":
+                results.update(compute_moses_suite(
+                    generated, reference, reference_scaffolds=ref_scaffolds,
+                    device=args.device))
             else:
                 print(f"  unknown metric {name!r}, skipped")
         except Exception as exc:  # surface, don't swallow: a missing metric must

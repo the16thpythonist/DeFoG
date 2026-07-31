@@ -36,8 +36,17 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
 
-from defog.data import zinc_reference
+from defog.data import guacamol_reference, moses_reference, zinc_reference
 from defog.domains.molecule import build_encoders, validity_report
+
+#: Each dataset decodes with its OWN vocabulary and bond set. Using ZINC's
+#: kekulized 3-bond decoder on MOSES samples (aromatic, 4 bonds) would silently
+#: mis-decode every aromatic ring, so the dataset must be named explicitly.
+VOCABULARIES = {
+    "zinc": (zinc_reference.ATOM_TYPES, zinc_reference.BOND_TYPES),
+    "guacamol": (guacamol_reference.ATOM_TYPES, guacamol_reference.BOND_TYPES),
+    "moses": (moses_reference.ATOM_TYPES, moses_reference.BOND_TYPES),
+}
 
 
 def dense_to_pyg(atom_types: torch.Tensor, edge_types: torch.Tensor, num_atom_classes: int,
@@ -84,6 +93,9 @@ def parse_report(path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--samples", required=True)
+    ap.add_argument("--dataset", choices=sorted(VOCABULARIES), default="zinc",
+                    help="Which vocabulary to decode with. Wrong choice silently "
+                         "mis-decodes rather than erroring.")
     ap.add_argument("--report", default=None)
     ap.add_argument("--folds", type=int, default=5,
                     help="DeFoG reports mean/std over num_sample_fold folds.")
@@ -93,9 +105,10 @@ def main() -> int:
                     help="Absolute agreement required, in metric units.")
     args = ap.parse_args()
 
-    _, atom_decoder, _, bond_decoder = build_encoders(
-        zinc_reference.ATOM_TYPES, zinc_reference.BOND_TYPES
-    )
+    atom_types, bond_types = VOCABULARIES[args.dataset]
+    _, atom_decoder, _, bond_decoder = build_encoders(atom_types, bond_types)
+    print(f"decoding as {args.dataset}: {len(atom_types)} atom types, "
+          f"bonds={bond_types}")
     n_atom_cls = len(atom_decoder)
     n_bond_cls = len(bond_decoder)
 
