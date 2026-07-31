@@ -59,6 +59,11 @@ def main() -> int:
     ap.add_argument("--time-distortion", default="polydec")
     ap.add_argument("--num-samples", type=int, required=True)
     ap.add_argument("--chunk", type=int, default=250)
+    ap.add_argument("--split", choices=("test", "validation"), default="test",
+                    help="Which held-out split to score against. Use 'validation' "
+                         "for anything that feeds a SELECTION decision -- picking a "
+                         "model by its test numbers is tuning on test, however "
+                         "defensible each individual pass looks.")
     ap.add_argument("--sweep-dir", default=None,
                     help="Where the frozen config was chosen; recorded for provenance")
     ap.add_argument("--out-dir", required=True)
@@ -69,16 +74,18 @@ def main() -> int:
     os.makedirs(args.out_dir, exist_ok=True)
 
     split = mod.load_reference_split()
-    # THE test split. Read here and nowhere else in the pipeline.
-    test_smiles = split.test_smiles
+    # The reference this run is scored against. Selection work must use
+    # validation; test is reserved for reporting a model that is already chosen.
+    test_smiles = split.test_smiles if args.split == "test" else split.val_smiles
     train_ref = set(split.train_smiles)
-    ref_path = os.path.join(args.out_dir, "_test_reference.smi")
+    ref_path = os.path.join(args.out_dir, f"_{args.split}_reference.smi")
     if not os.path.exists(ref_path):
         with open(ref_path, "w") as fh:
             fh.write("\n".join(test_smiles) + "\n")
-        print(f"wrote test reference ({len(test_smiles)}) -> {ref_path}", flush=True)
-    # MOSES additionally requires FCD against test_scaffolds.
-    if hasattr(split, "test_scaffolds_smiles"):
+        print(f"wrote {args.split} reference ({len(test_smiles)}) -> {ref_path}",
+              flush=True)
+    # MOSES additionally requires FCD against test_scaffolds (test split only).
+    if args.split == "test" and hasattr(split, "test_scaffolds_smiles"):
         sf_path = os.path.join(args.out_dir, "_test_scaffolds_reference.smi")
         if not os.path.exists(sf_path):
             with open(sf_path, "w") as fh:
@@ -118,7 +125,7 @@ def main() -> int:
         "dataset": args.dataset,
         "tag": args.tag,
         "ckpt": args.ckpt,
-        "split": "test",
+        "split": args.split,
         "sampling_config_frozen": True,
         "frozen_config": {
             "sample_steps": args.sample_steps, "eta": args.eta,
@@ -128,7 +135,7 @@ def main() -> int:
         "sweep_dir": args.sweep_dir,
         "num_samples": args.num_samples,
         "sample_seconds": round(sample_s, 1),
-        "n_test_reference": len(test_smiles),
+        "n_reference": len(test_smiles),
         "smiles_file": os.path.basename(smi_path),
         # Novelty is against TRAIN, as everywhere else.
         "novelty_reference": "train",
