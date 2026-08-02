@@ -46,7 +46,7 @@ for s in "${SEEDS[@]}"; do
     fi
 done
 
-mkdir -p experiments/results/gdpo_sanity__zinc
+mkdir -p experiments/results/gdpo_sanity
 echo "ZINC GDPO sanity RL @ $(date)"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
@@ -60,7 +60,8 @@ PY
 
 for i in 0 1 2 3; do
     s=${SEEDS[$i]}
-    CUDA_VISIBLE_DEVICES=$i python -u experiments/gdpo_sanity__zinc.py \
+    CUDA_VISIBLE_DEVICES=$i python -u experiments/gdpo_sanity.py \
+        --DATASET "'zinc'" \
         --SEED ${s} \
         --BASE_CKPT "'ckpts/zinc_e1_seed${s}/best_model'" \
         --OUT_CKPT_DIR "'ckpts/zinc_rl_seed${s}'" \

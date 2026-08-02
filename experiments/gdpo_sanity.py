@@ -1,50 +1,46 @@
 """
-GDPO structural-sanity fine-tune -- a SINGLE configuration, as a pycomex experiment.
+GDPO RL fine-tuning of an E1 base against the three structural failure modes.
 
-Discourages "weird artefact shapes" (odd ring sizes, oversized fused/spiro ring
-systems, too many rings) that a factorized generator hallucinates off the data
-manifold, by GDPO's eager policy gradient with a BINARY structural-sanity reward:
+Targets, measured on the E1 final test pass (4 seeds, n=10,000 each):
 
-    reward(mol) = 1.0  iff  mol is valid  AND  connected ('.'-free SMILES)  AND
-                            every structural feature is inside the training-set
-                            envelope (ring sizes in the observed set; #rings,
-                            largest fused/spiro ring-system, spiro & bridgehead
-                            counts all within the observed support);
-                = 0.0  otherwise.
+    validity (relaxed)  0.9854 +- 0.0049
+    disconnected        0.0615 +- 0.0219   <- worst deficit
+    wonky rings         0.0356 +- 0.0129   (any ring outside [3,8])
+    combined 'sanity'   0.9504
 
-The envelope is DERIVED FROM the reference SMILES (the model's training data), so
-by construction every real molecule scores 1.0 -- the reward rewards *fidelity to
-the manifold*, not *typicality within it*, and therefore does NOT collapse diversity
-(unlike a "how average are your rings" reward, whose optimum is benzene-everywhere).
-See docs / the design discussion for the fidelity-vs-typicality distinction.
+The E1 checkpoints are NOT touched. This writes to ``ckpts/zinc_rl_seed<N>/``
+and leaves ``ckpts/zinc_e1_seed<N>/`` frozen, so the E1 table row -- produced
+from those exact weights under a frozen sampling configuration -- stays
+reproducible. The RL model is a separate artifact and a separate claim.
 
-This STACKS on the connectivity fine-tune: the default base is a ``*_connectivity``
-checkpoint and the reward keeps connectivity in the objective (``valid & connected
-& sane``), so the earlier gain cannot regress. Best-snapshot selection is input-
-inclusive, so a stacking run can never ship a model worse than what it started from.
+**Reward: graded, not a single AND.** ``r = valid + connected + rings_ok``, each
+0/1, so r in {0,1,2,3}. A single sanity indicator would be the exact target, but
+95% of samples already satisfy it, leaving a near-constant reward and almost no
+group-relative advantage to learn from. The graded form separates the failing
+5% *and* distinguishes one-fault from two-fault samples. Invalid scores 0 rather
+than being decomposed, since connectivity and ring size are not assessable on a
+molecule that does not parse -- which also makes invalid strictly worse than any
+valid molecule, so there is no incentive to trade validity for either term.
 
-Headline metric: structural-violation rate down (= 1 - E[reward]); we also report
-the artifact rate among otherwise-good (valid&connected) molecules -- the literal
-"weird shape" rate. Fidelity cross-checks: ring-size histogram divergence to the
-dataset and FCD (Frechet ChemNet Distance, via ``fcd_torch``) should drop. Guard-
-rails: validity / uniqueness / novelty must not regress.
+**The failure mode this guards against** is reward hacking: sanity can be raised
+by collapsing onto a narrow, safe region of chemical space, which would wreck
+FCD while every targeted metric improves. Two defences: a KL penalty to the
+frozen base (``KL_COEF``), and SMILES dumped before and after so FCD/NSPDK can
+be scored externally. A run whose sanity improves while FCD degrades is a
+FAILURE, and the exported artifacts are what make that judgeable.
 
-Model-agnostic: the atom vocabulary is reconstructed from the checkpoint's
-atom_weights, so the same experiment runs on ZINC / GuacaMol / AqSolDB by changing
-CKPT_PATH + REFERENCE_SMILES. One run = one config; the SWEEP / fan-out is many
-submissions (one per dataset), not done here.
+Note ``ITERATIONS``: ``gdpo_connectivity.py`` records the over-optimisation
+cliff at roughly 60-80 iterations for ``kl_coef=0.3``. The default here stays
+below it.
 
 Usage:
-    python experiments/gdpo_sanity.py \
-        --CKPT_PATH "'~/Downloads/zinc_uncond_4e-4_connectivity.ckpt'" \
-        --REFERENCE_SMILES "'data/zinc_250k_rdkit.csv'"
-    python experiments/gdpo_sanity.py --__TESTING__ True
+    python experiments/gdpo_sanity__zinc.py --__TESTING__ True
+    python experiments/gdpo_sanity__zinc.py --SEED 42 \
+        --BASE_CKPT "'ckpts/zinc_e1_seed42/best_model'" \
+        --OUT_CKPT_DIR "'ckpts/zinc_rl_seed42'"
 """
-import os
 import json
-import time
-import hashlib
-from collections import Counter
+import os
 
 import numpy as np
 import torch
@@ -52,726 +48,351 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from rdkit import Chem, RDLogger
-from rdkit.Chem import Draw, GetPeriodicTable, rdMolDescriptors
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 
-from defog.core import DeFoGModel, GDPOTrainer
-from defog.core.data import dense_to_pyg
-from defog.domains import MoleculeDomain
-from defog.domains.molecule import build_encoders
-from experiments.guided_logp_demo import BOND_TYPES
+from defog.core import DeFoGModel, GDPOTrainer  # noqa: E402
+from defog.data import guacamol_reference as gmref  # noqa: E402
+from defog.data import moses_reference as mref  # noqa: E402
+from defog.data import zinc_reference as zref  # noqa: E402
+
+REFERENCES = {"zinc": zref, "guacamol": gmref, "moses": mref}
+from defog.domains import MoleculeDomain  # noqa: E402
+from defog.domains.molecule import build_encoders, ring_sizes_ok, validity_report  # noqa: E402
 
 RDLogger.DisableLog("rdApp.*")
+_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# == configuration ==========================================================
-# :param CKPT_PATH: pretrained DeFoG molecular checkpoint to fine-tune. Default is the
-#     ZINC connectivity-improved model -- this experiment STACKS sanity on top of it.
-CKPT_PATH: str = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
-# :param REFERENCE_SMILES: CSV (or .txt/.smi, one per line) of the model's TRAINING
-#     SMILES. Defines the structural envelope (support/quantile of ring & topology
-#     features) AND the FCD / ring-histogram / novelty reference. Must match the model.
-REFERENCE_SMILES: str = "data/zinc_250k_rdkit.csv"
-# :param SMILES_COLUMN: column name holding SMILES if REFERENCE_SMILES is a CSV.
-SMILES_COLUMN: str = "smiles"
-SEED: int = 0
+# ============================================================================
+# Parameters
+# ============================================================================
+# :param DATASET: Selects the reference module, and therefore the frozen
+#     vocabulary and bond set. Getting this wrong mis-decodes silently rather
+#     than erroring -- ZINC is kekulized with 9 elements, GuacaMol aromatic with
+#     12, MOSES aromatic with 8.
+DATASET: str = "zinc"
+BASE_CKPT: str = os.path.join(_PROJECT_DIR, "ckpts", "zinc_e1_seed42", "best_model")
+OUT_CKPT_DIR: str = os.path.join(_PROJECT_DIR, "ckpts", "zinc_rl_seed42")
+SEED: int = 42
 
-# --- sanity envelope (the reward definition) ---
-# :param ENVELOPE_QUANTILE: quantile of each COUNT feature (#rings, largest ring-
-#     system, spiro, bridgehead) used as its upper bound. 1.0 -> strict max = every
-#     real molecule passes (honors the "fidelity, no diversity cost" guarantee).
-#     <1.0 trims the tail to be stricter, at the cost of rejecting a small fraction
-#     of real molecules.
-ENVELOPE_QUANTILE: float = 1.0
-# :param RING_MIN_COUNT: a ring size is admitted to the allowed set only if it occurs
-#     at least this many times in the reference. 50 on the 249k ZINC set trims the
-#     size-9..24 macrocycle tail (each only a handful of molecules) to the drug-like
-#     set {3..8} at ~0.02% real-molecule rejection ("moderate" envelope). NOTE: this
-#     is an ABSOLUTE occurrence count, so it is dataset-size dependent -- revisit it
-#     on fan-out (GuacaMol ~1.4M, AqSolDB ~10k) to keep the same ~0.1%-of-molecules
-#     floor. 1 -> full observed support (permits the exotic tail).
-RING_MIN_COUNT: int = 50
-# :param REQUIRE_CONNECTED: include connectivity in the reward (valid & connected &
-#     sane). True keeps the stacked connectivity gain in the objective so it can't
-#     regress; False rewards sanity alone.
-REQUIRE_CONNECTED: bool = True
-# :param REFERENCE_LIMIT: cap on reference molecules parsed for the envelope/hist/
-#     novelty (None = all). Full set makes the max-bounds exact; subsample only to
-#     speed up quick tests.
-REFERENCE_LIMIT: int = None
+RING_LO: int = 3
+RING_HI: int = 8
 
-# --- fidelity cross-checks ---
-# :param COMPUTE_FCD: compute Frechet ChemNet Distance (needs ``fcd_torch``; if absent
-#     the experiment logs a skip and reports fcd=None instead of crashing).
-COMPUTE_FCD: bool = True
-# :param FCD_REF_SAMPLES: reference molecules sampled from REFERENCE_SMILES for FCD /
-#     ring-histogram / novelty comparison.
-FCD_REF_SAMPLES: int = 10000
-# :param RING_HIST_MAX: ring sizes 3..RING_HIST_MAX are binned individually; larger
-#     rings fall into one macrocycle overflow bin, for the ring-histogram divergence.
-RING_HIST_MAX: int = 12
-
-# --- training budget / rollout policy (tuned config from the connectivity work) ---
-# :param ROUNDS: re-anchoring rounds (1 = a plain single fine-tune).
-ROUNDS: int = 1
-# :param ITERATIONS: GDPO updates per round.
-ITERATIONS: int = 100
-# :param ROLLOUT_SIZE: K rollout molecules per iteration.
+# --- RL (defaults from gdpo_connectivity.py, which tuned them on this model) --
+# :param ITERATIONS: Run 1139128 peaked at ~iteration 20 (sanity 0.961,
+#     disconnected 0.008) and then collapsed to sanity 0.14 by iteration 59. The
+#     "~60-80 cliff" quoted in gdpo_connectivity.py was measured at ETA=0; at
+#     ETA=25 the cliff arrived far earlier. 25 brackets the observed optimum
+#     without entering the degrading region -- and CKPT_EVERY/SELECT_BEST below
+#     mean the peak is captured even if it moves again.
+ITERATIONS: int = 25
 ROLLOUT_SIZE: int = 128
-# :param SAMPLE_STEPS / ETA / OMEGA / TIME_DISTORTION: rollout (and matched eval) policy.
-SAMPLE_STEPS: int = 100
-ETA: float = 0.0
-OMEGA: float = 0.0
-TIME_DISTORTION: str = "polydec"
-# :param SUBSAMPLE_STEPS: noisy states per trajectory that enter the gradient.
 SUBSAMPLE_STEPS: int = 12
-# :param MINIBATCH_SIZE: trajectories per grad forward (bounds autograd memory).
 MINIBATCH_SIZE: int = 16
-
-# --- eager gradient / advantage ---
-# :param REDUCTION: "sum" (true joint LL) | "mean".
-REDUCTION: str = "sum"
-# :param ADVANTAGE_MODE: "mean" (default, Dr. GRPO) | "grpo" | "none".
-ADVANTAGE_MODE: str = "mean"
-# :param POSITIVE_ONLY: RAFT-style clamp advantage>=0 (never push down bad endpoints).
-POSITIVE_ONLY: bool = False
-# :param LAMBDA_EDGE: weight of the edge (bond) term vs the node (atom-type) term.
 LAMBDA_EDGE: float = 1.0
-# :param LR: AdamW learning rate.
+REDUCTION: str = "sum"
+ADVANTAGE_MODE: str = "mean"   # Dr. GRPO: mean baseline, no per-group std
+POSITIVE_ONLY: bool = False
 LR: float = 2e-5
-
-# --- KL to reference (over-optimization guard) ---
-# :param KL_COEF: KL-to-reference strength (0 -> no reference, no KL). 0.2 = tuned value.
-KL_COEF: float = 0.2
-# :param KL_TARGET: adaptive KL target (None -> fixed KL_COEF).
-KL_TARGET: float = None
-# :param EMA_DECAY: deployment-weights EMA.
+WEIGHT_DECAY: float = 1e-5
+GRAD_CLIP: float = 1.0
 EMA_DECAY: float = 0.9
+# :param KL_COEF: Strength of the pull toward the frozen base. Non-zero on
+#     purpose -- this is the primary defence against optimising sanity by
+#     collapsing the distribution.
+KL_COEF: float = 0.3
 
-# --- evaluation / checkpointing ---
-# :param EVAL_SAMPLES / EVAL_STEPS: fresh molecules for the COMPARED BEFORE/AFTER
-#     measurement. 500 steps = the default deploy point.
+# --- Checkpointing (never rely on the final iteration) ----------------------
+# :param CKPT_EVERY / SELECT_BEST / SELECT_WINDOW:
+#     Run 1139128 saved only the final model, so a genuinely good policy at
+#     iteration 20 was unrecoverable and the run had to be redone. EMA does not
+#     rescue that: at ema_decay=0.9 its memory is ~10 iterations, so the final
+#     EMA reflected the collapsed region. Periodic checkpoints plus a best-so-far
+#     make the peak survivable.
+#
+#     Selection uses a ROLLING MEAN of rollout sanity, not a single batch: at
+#     rollout_size 128 a single batch carries ~±2% noise, so unsmoothed selection
+#     would reward a lucky iteration rather than a genuinely better policy.
+CKPT_EVERY: int = 5
+SELECT_BEST: bool = True
+SELECT_WINDOW: int = 3
+
+# --- Rollout sampling -------------------------------------------------------
+# :param ROLLOUT_SAMPLE_STEPS / ROLLOUT_ETA / ROLLOUT_OMEGA:
+#     eta matches the DEPLOYED configuration (the E1 frozen eta=25) so the
+#     policy is optimised under the stochasticity it will actually be run with.
+#     Steps are reduced to 100 for rollout cost; eval uses the full deployed 500.
+#     That step mismatch is a known approximation, which is why evaluation is
+#     done at the deploy config rather than the rollout config.
+#     Run 1139128 used ROLLOUT_ETA=25 to match deployment and diverged; the
+#     cliff estimate borrowed from gdpo_connectivity.py was measured at eta=0,
+#     and noisier rollouts raise gradient variance. Back to 0 -- one variable at
+#     a time.
+ROLLOUT_SAMPLE_STEPS: int = 100
+ROLLOUT_ETA: float = 0.0
+ROLLOUT_OMEGA: float = 0.0
+TIME_DISTORTION: str = "polydec"
+
+# --- Evaluation (at the E1 FROZEN deploy config) ----------------------------
 EVAL_SAMPLES: int = 2048
 EVAL_STEPS: int = 500
-# :param ROUND_EVAL_SAMPLES: cheaper eval after each intermediate round.
-ROUND_EVAL_SAMPLES: int = 512
-# :param SELECT_EVAL_STEPS: cheap step count for RANKING snapshots (ordering holds).
-SELECT_EVAL_STEPS: int = 100
-# :param CKPT_EVERY: save a snapshot every N iters (0=off).
-CKPT_EVERY: int = 20
-# :param SELECT_BEST: after training, rank every snapshot + final (+ input) by the
-#     structural-violation rate (validity- and uniqueness-gated) and keep the best.
-SELECT_BEST: bool = True
-# :param SELECT_EVAL_SAMPLES: samples per snapshot during best-snapshot ranking.
-SELECT_EVAL_SAMPLES: int = 1024
-# :param SELECT_INCLUDE_INPUT: also rank the INPUT checkpoint, so a stacking run can
-#     never ship worse than what it started from. On by default (stacking).
-SELECT_INCLUDE_INPUT: bool = True
+# :param EVAL_ETA: The DEPLOYED eta for this dataset's frozen config. ZINC and
+#     MOSES froze eta=25; GuacaMol froze eta=75. Evaluating at the wrong one
+#     measures a policy nobody will run.
+EVAL_ETA: float = 25.0
+EVAL_OMEGA: float = 0.0
 
-# NOTE: __DEBUG__ must be False when submitting a sweep -- debug mode writes to a
-# single overwriteable folder, so parallel runs would clobber each other.
 __DEBUG__: bool = False
 __TESTING__: bool = False
 
 
-def atom_decoder_from_ckpt(model):
-    """Reconstruct the exact atom_decoder (class idx -> symbol) from the checkpoint's
-    atom_weights, so decoding matches the model regardless of dataset."""
-    weights = model.hparams.get("atom_weights")
-    if not weights:
-        raise ValueError("checkpoint has no atom_weights (molecular_features off)")
-    pt = GetPeriodicTable()
-    cand = ["H", "C", "N", "O", "F", "P", "S", "Cl", "Br", "I", "Na", "Si", "B", "Se", "K"]
-    tab = [(pt.GetAtomicWeight(pt.GetAtomicNumber(s)), s) for s in cand]
-    return [min(tab, key=lambda t: abs(t[0] - w))[1] for w in weights]
+class SanityReward:
+    """r = valid + connected + rings_ok, each 0/1 -> r in {0,1,2,3}.
 
-
-# ===========================================================================
-# Structural features + envelope
-# ===========================================================================
-def largest_ring_system(mol) -> int:
-    """Number of rings in the largest group of rings connected by shared atoms (a
-    fused OR spiro ring system). Detects oversized polycyclic 'blobs'. 0 if acyclic."""
-    rings = [set(r) for r in mol.GetRingInfo().AtomRings()]
-    n = len(rings)
-    if n == 0:
-        return 0
-    parent = list(range(n))
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            if rings[i] & rings[j]:
-                ra, rb = find(i), find(j)
-                if ra != rb:
-                    parent[ra] = rb
-    comp = Counter(find(i) for i in range(n))
-    return max(comp.values())
-
-
-def mol_features(mol) -> dict:
-    """Structural fingerprint of a (sanitized) RDKit mol used by the sanity envelope."""
-    sizes = [len(r) for r in mol.GetRingInfo().AtomRings()]
-    return {
-        "ring_sizes": sizes,
-        "num_rings": len(sizes),
-        "largest_ring_system": largest_ring_system(mol),
-        "num_spiro": rdMolDescriptors.CalcNumSpiroAtoms(mol),
-        "num_bridgehead": rdMolDescriptors.CalcNumBridgeheadAtoms(mol),
-    }
-
-
-class SanityEnvelope:
-    """Structural envelope derived from reference molecules. ``check(mol)`` returns
-    ``(ok, reason)``; a molecule is sane iff every feature is inside the envelope."""
-
-    def __init__(self, allowed_ring_sizes, max_num_rings, max_ring_system,
-                 max_spiro, max_bridgehead):
-        self.allowed_ring_sizes = set(int(s) for s in allowed_ring_sizes)
-        self.max_num_rings = int(max_num_rings)
-        self.max_ring_system = int(max_ring_system)
-        self.max_spiro = int(max_spiro)
-        self.max_bridgehead = int(max_bridgehead)
-
-    def check(self, mol):
-        f = mol_features(mol)
-        for s in f["ring_sizes"]:
-            if s not in self.allowed_ring_sizes:
-                return False, f"ring_size:{s}"
-        if f["num_rings"] > self.max_num_rings:
-            return False, "num_rings"
-        if f["largest_ring_system"] > self.max_ring_system:
-            return False, "ring_system"
-        if f["num_spiro"] > self.max_spiro:
-            return False, "spiro"
-        if f["num_bridgehead"] > self.max_bridgehead:
-            return False, "bridgehead"
-        return True, None
-
-    def to_dict(self):
-        return {
-            "allowed_ring_sizes": sorted(self.allowed_ring_sizes),
-            "max_num_rings": self.max_num_rings,
-            "max_ring_system": self.max_ring_system,
-            "max_spiro": self.max_spiro,
-            "max_bridgehead": self.max_bridgehead,
-        }
-
-    @classmethod
-    def from_dict(cls, d):
-        return cls(d["allowed_ring_sizes"], d["max_num_rings"], d["max_ring_system"],
-                   d["max_spiro"], d["max_bridgehead"])
-
-
-def _upper_bound(values, quantile):
-    """Upper bound for a count feature: strict max at quantile 1.0 (every reference
-    molecule passes), else the ceil of the requested quantile."""
-    if not values:
-        return 0
-    return int(np.ceil(np.quantile(np.asarray(values, dtype=float), quantile)))
-
-
-def build_envelope(mols_features, quantile=1.0, ring_min_count=1):
-    """Build a :class:`SanityEnvelope` from a list of per-molecule feature dicts."""
-    ring_counter = Counter()
-    for f in mols_features:
-        ring_counter.update(f["ring_sizes"])
-    allowed = {s for s, c in ring_counter.items() if c >= ring_min_count}
-    return SanityEnvelope(
-        allowed_ring_sizes=allowed,
-        max_num_rings=_upper_bound([f["num_rings"] for f in mols_features], quantile),
-        max_ring_system=_upper_bound([f["largest_ring_system"] for f in mols_features], quantile),
-        max_spiro=_upper_bound([f["num_spiro"] for f in mols_features], quantile),
-        max_bridgehead=_upper_bound([f["num_bridgehead"] for f in mols_features], quantile),
-    )
-
-
-def ring_size_histogram(smiles_iter, ring_hist_max=12):
-    """Normalized histogram of ring sizes aggregated over all rings in all molecules.
-    Bins are 3..ring_hist_max individually + one overflow bin for larger rings."""
-    bins = list(range(3, ring_hist_max + 1)) + ["overflow"]
-    idx = {b: i for i, b in enumerate(bins)}
-    h = np.zeros(len(bins), dtype=float)
-    for smi in smiles_iter:
-        m = Chem.MolFromSmiles(smi) if isinstance(smi, str) else smi
-        if m is None:
-            continue
-        for r in m.GetRingInfo().AtomRings():
-            s = len(r)
-            h[idx[s] if s <= ring_hist_max else idx["overflow"]] += 1.0
-    total = h.sum()
-    return (h / total) if total > 0 else h, bins
-
-
-def hist_divergence(p, q):
-    """Total-variation distance and mean-absolute error between two histograms."""
-    p, q = np.asarray(p, float), np.asarray(q, float)
-    tv = 0.5 * float(np.abs(p - q).sum())
-    mae = float(np.abs(p - q).mean())
-    return tv, mae
-
-
-def compute_fcd_score(ref_smiles, gen_smiles, device):
-    """FCD via fcd_torch (pure-PyTorch, MOSES standard). Returns None if unavailable
-    or if there are too few valid generated molecules."""
-    if not gen_smiles or len(gen_smiles) < 2:
-        return None
-    try:
-        from fcd_torch import FCD
-    except ImportError:
-        return None
-    try:
-        dev = "cuda" if (str(device).startswith("cuda") and torch.cuda.is_available()) else "cpu"
-        fcd = FCD(device=dev, n_jobs=min(8, os.cpu_count() or 1))
-        return float(fcd(list(ref_smiles), list(gen_smiles)))
-    except Exception:
-        return None
-
-
-def _read_reference_smiles(path, smiles_column, limit=None):
-    path = os.path.expanduser(path)
-    if path.lower().endswith(".csv"):
-        import csv
-        out = []
-        with open(path, newline="") as fh:
-            reader = csv.DictReader(fh)
-            col = smiles_column if smiles_column in (reader.fieldnames or []) else (reader.fieldnames or [None])[0]
-            for row in reader:
-                out.append(row[col])
-                if limit is not None and len(out) >= limit:
-                    break
-        return out
-    with open(path) as fh:
-        out = [ln.strip().split()[0] for ln in fh if ln.strip()]
-    return out[:limit] if limit is not None else out
-
-
-def prepare_reference(path, smiles_column, quantile, ring_min_count, limit,
-                      fcd_ref_samples, ring_hist_max, seed=0, cache_dir="data"):
-    """Parse the reference SMILES once and return
-    ``(envelope, ref_canonical_set, ref_ring_hist, ring_bins, fcd_ref_smiles)``.
-
-    The full bundle is cached to disk keyed on (path, mtime, quantile, ring_min_count,
-    limit) so repeat runs (sweeps / re-anchoring) skip the ~minutes-long parse.
+    Invalid short-circuits to 0: neither connectivity nor ring size can be
+    assessed on a molecule that does not parse, and scoring it below every valid
+    molecule removes any incentive to trade validity away for the other terms.
+    Records the last batch's category rates in ``self.last`` for the curve.
     """
-    rp = os.path.expanduser(path)
-    key = f"{os.path.abspath(rp)}|{os.path.getmtime(rp)}|q{quantile}|rmc{ring_min_count}|lim{limit}|fcd{fcd_ref_samples}|rh{ring_hist_max}"
-    cache_path = None
-    try:
-        os.makedirs(cache_dir, exist_ok=True)
-        # stable digest (NOT hash() -- str hashing is salted per process, so hash()
-        # would give a different filename each run and never hit the cache; worse,
-        # parallel arms would each rebuild and race on the write).
-        digest = hashlib.md5(key.encode()).hexdigest()[:16]
-        cache_path = os.path.join(cache_dir, f".sanity_ref_{digest}.json")
-        if os.path.exists(cache_path):
-            with open(cache_path) as fh:
-                blob = json.load(fh)
-            if blob.get("key") == key:
-                env = SanityEnvelope.from_dict(blob["envelope"])
-                return (env, set(blob["ref_canonical"]), np.asarray(blob["ring_hist"], float),
-                        blob["ring_bins"], blob["fcd_ref"])
-    except Exception:
-        cache_path = None
 
-    raw = _read_reference_smiles(rp, smiles_column, limit)
-    feats, canon = [], []
-    for smi in raw:
-        m = Chem.MolFromSmiles(smi)
-        if m is None:
-            continue
-        feats.append(mol_features(m))
-        canon.append(Chem.MolToSmiles(m))
-    if not feats:
-        raise ValueError(f"no parseable reference molecules in {path}")
-    envelope = build_envelope(feats, quantile=quantile, ring_min_count=ring_min_count)
-    ref_ring_hist, ring_bins = ring_size_histogram(canon, ring_hist_max)
-    rng = np.random.RandomState(seed)
-    fcd_ref = list(rng.choice(canon, size=min(fcd_ref_samples, len(canon)), replace=False))
-    ref_set = set(canon)
+    invalid = 0.0
 
-    if cache_path is not None:
-        try:
-            with open(cache_path, "w") as fh:
-                json.dump({"key": key, "envelope": envelope.to_dict(),
-                           "ref_canonical": sorted(ref_set), "ring_hist": ref_ring_hist.tolist(),
-                           "ring_bins": [str(b) for b in ring_bins], "fcd_ref": fcd_ref}, fh)
-        except Exception:
-            pass
-    return envelope, ref_set, ref_ring_hist, [str(b) for b in ring_bins], fcd_ref
-
-
-# ===========================================================================
-# Reward
-# ===========================================================================
-class StructuralSanityReward:
-    """valid & (connected) & sane = 1.0; else 0.0. ``sane`` = every structural feature
-    inside ``envelope``. Tracks the last batch's category / per-axis fractions in
-    ``self.last`` for training-curve logging."""
-
-    def __init__(self, domain, envelope, require_connected=True):
+    def __init__(self, domain, ring_lo=3, ring_hi=8):
         self.domain = domain
-        self.envelope = envelope
-        self.require_connected = bool(require_connected)
+        self.ring_lo, self.ring_hi = ring_lo, ring_hi
         self.last = {}
 
     def __call__(self, X1, E1, node_mask):
+        from defog.core.data import dense_to_pyg
+
         n = node_mask.sum(-1)
         datas = dense_to_pyg(X1, E1, None, node_mask, n)
-        out = torch.zeros(len(datas))
-        n_valid = n_disc = n_sane = 0
-        viol = Counter()
+        out = torch.empty(len(datas))
+        n_valid = n_conn = n_rings = n_full = 0
         for i, d in enumerate(datas):
-            smi = self.domain.identity(d)  # canonical SMILES iff genuinely valid, else None
+            smi = self.domain.identity(d)   # canonical SMILES iff genuinely valid
             if smi is None:
-                viol["invalid"] += 1
+                out[i] = 0.0
                 continue
             n_valid += 1
-            if self.require_connected and "." in smi:
-                viol["disconnected"] += 1
-                continue
+            connected = "." not in smi
             mol = Chem.MolFromSmiles(smi)
-            if mol is None:  # defensive: identity already round-trips, so this is rare
-                viol["invalid"] += 1
-                continue
-            ok, reason = self.envelope.check(mol)
-            if ok:
-                out[i] = 1.0
-                n_sane += 1
-            else:
-                axis = reason.split(":")[0]
-                viol[axis] += 1
+            rings_ok = mol is not None and ring_sizes_ok(mol, self.ring_lo, self.ring_hi)
+            n_conn += connected
+            n_rings += rings_ok
+            n_full += connected and rings_ok
+            out[i] = 1.0 + float(connected) + float(rings_ok)
         k = max(1, len(datas))
-        conn_valid = n_valid - viol["disconnected"] if self.require_connected else n_valid
         self.last = {
-            "sane_frac": n_sane / k,
             "valid_frac": n_valid / k,
-            "disconnected_frac": viol["disconnected"] / k,
-            "invalid_frac": viol["invalid"] / k,
-            # artifact = valid&connected but structurally out-of-envelope (the "weird shape" rate)
-            "artifact_frac_of_conn_valid": ((conn_valid - n_sane) / conn_valid) if conn_valid else 0.0,
-            "viol_ring_size": viol["ring_size"] / k,
-            "viol_num_rings": viol["num_rings"] / k,
-            "viol_ring_system": viol["ring_system"] / k,
-            "viol_spiro": viol["spiro"] / k,
-            "viol_bridgehead": viol["bridgehead"] / k,
+            "connected_frac": n_conn / k,
+            "rings_ok_frac": n_rings / k,
+            "sanity_frac": n_full / k,
+            "disconnected_frac": (n_valid - n_conn) / k,
+            "wonky_ring_frac": (n_valid - n_rings) / k,
         }
         return out
 
 
-# ===========================================================================
-# Evaluation
-# ===========================================================================
 @torch.no_grad()
-def evaluate_sanity(model, domain, envelope, ref_set, ref_ring_hist, fcd_ref,
-                    n_samples, sample_steps, size_dist, device, eta, omega,
-                    time_distortion, require_connected=True, ring_hist_max=12,
-                    compute_fcd=False, seed=0):
-    """Sample n_samples fresh molecules under the rollout policy and report the
-    structural-violation rate (headline), the artifact rate among valid&connected
-    molecules, validity / disconnected / uniqueness / novelty guardrails, ring-size
-    histogram divergence, and (optionally) FCD -- plus example mols for a grid."""
-    torch.manual_seed(seed)
-    mols, smis, tags = [], [], []
-    all_smis = []            # all valid SMILES (for uniqueness / novelty / FCD / ring-hist)
-    n_valid = n_disc = n_sane = 0
-    viol = Counter()
-    remaining, chunk = n_samples, 64
+def evaluate(model, atom_decoder, bond_decoder, n_samples, steps, eta, omega,
+             device, train_ref, chunk=256):
+    """Sample at the DEPLOY config and report every targeted metric plus SMILES.
+
+    The SMILES matter as much as the numbers: FCD and NSPDK are computed
+    externally in the metrics env, and they are what decide whether an
+    improvement in sanity came at the cost of distribution match.
+    """
+    samples, remaining = [], n_samples
     while remaining > 0:
-        k = min(chunk, remaining)
-        samples = model.sample(k, size_dist=size_dist, eta=eta, omega=omega,
-                               sample_steps=sample_steps, time_distortion=time_distortion,
-                               device=device, show_progress=False)
-        for d in samples:
-            smi = domain.identity(d)
-            if smi is None:
-                viol["invalid"] += 1
-                continue
-            n_valid += 1
-            all_smis.append(smi)
-            disconnected = "." in smi
-            if disconnected:
-                n_disc += 1
-            mol = Chem.MolFromSmiles(smi)
-            ok, reason = envelope.check(mol) if mol is not None else (False, "invalid")
-            sane = ok and not (require_connected and disconnected)
-            if sane:
-                n_sane += 1
-            else:
-                if require_connected and disconnected:
-                    viol["disconnected"] += 1
-                elif not ok:
-                    viol[reason.split(":")[0]] += 1
-            if len(mols) < 25:
-                mols.append(mol); smis.append(smi)
-                tags.append("" if sane else ("disc" if disconnected else (reason or "")))
-        remaining -= k
+        cur = min(chunk, remaining)
+        samples += model.sample(num_samples=cur, sample_steps=steps, eta=eta,
+                                omega=omega, device=device, show_progress=False)
+        remaining -= cur
 
-    f = lambda x: x / n_samples
-    conn_valid = n_valid - n_disc if require_connected else n_valid
-    uniq = set(all_smis)
-    gen_ring_hist, _ = ring_size_histogram(all_smis, ring_hist_max)
-    ring_tv, ring_mae = hist_divergence(gen_ring_hist, ref_ring_hist)
-    fcd = None
-    if compute_fcd:
-        fcd = compute_fcd_score(fcd_ref, all_smis, device)
-
-    result = {
-        "n": n_samples,
-        "valid_frac": f(n_valid),
-        "sane_frac_all": f(n_sane),                       # = E[reward]
-        "violation_frac_all": 1.0 - f(n_sane),            # HEADLINE (lower is better)
-        "disconnected_frac_all": f(n_disc),
-        "disconnected_frac_of_valid": (n_disc / n_valid) if n_valid else 0.0,
-        "artifact_frac_of_conn_valid": ((conn_valid - n_sane) / conn_valid) if conn_valid else 0.0,
-        "unique_frac_of_valid": (len(uniq) / n_valid) if n_valid else 0.0,
-        "novel_frac_of_valid": (len(uniq - ref_set) / n_valid) if (n_valid and ref_set) else 0.0,
-        "ring_tv": ring_tv, "ring_mae": ring_mae,
-        "fcd": fcd,
-        "viol": {ax: f(c) for ax, c in viol.items()},
-        "gen_ring_hist": gen_ring_hist.tolist(),
-    }
-    return result, mols, smis, tags
+    rep = validity_report(samples, atom_decoder, bond_decoder,
+                          reference_smiles=train_ref)
+    smiles = rep.pop("smiles")
+    n_wonky = sum(1 for s in smiles
+                  if (m := Chem.MolFromSmiles(s)) is not None and not ring_sizes_ok(m))
+    rep["wonky_ring_frac"] = n_wonky / max(1, len(smiles))
+    rep["sanity"] = sum(
+        1 for s in smiles
+        if "." not in s and (m := Chem.MolFromSmiles(s)) is not None and ring_sizes_ok(m)
+    ) / max(1, n_samples)
+    return rep, smiles
 
 
-def save_grid(mols, smis, tags, path):
-    if not mols:
-        return
-    legends = [(f"[{t}] " if t else "") + s[:22] for s, t in zip(smis, tags)]
-    Draw.MolsToGridImage([m for m in mols[:25] if m is not None][:len(mols)],
-                         molsPerRow=5, subImgSize=(240, 240),
-                         legends=legends[:25]).save(path)
-
-
-def save_curves(history, before_viol, path):
-    def smooth(x, w=7):
-        x = np.asarray(x, float)
-        return np.convolve(x, np.ones(w) / w, mode="valid") if len(x) >= w else x
-    rm = [h["reward_mean"] for h in history]
-    art = [h.get("artifact_frac_of_conn_valid", np.nan) for h in history]
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4.5))
-    a1.plot(rm, color="#bbb", lw=1, alpha=0.6)
-    a1.plot(range(len(smooth(rm))), smooth(rm), color="#2c7fb8", lw=2)
-    a1.set_xlabel("iteration"); a1.set_ylabel("rollout mean reward (1=valid&connected&sane)")
-    a1.set_title("reward (sane fraction)"); a1.grid(alpha=0.3)
-    a2.plot(art, color="#f4a582", lw=1, alpha=0.6)
-    a2.plot(range(len(smooth(art))), smooth(art), color="#d95f0e", lw=2)
-    a2.axhline(before_viol, color="k", ls="--", lw=1, label=f"before eval violation ({before_viol:.1%})")
-    a2.set_xlabel("iteration"); a2.set_ylabel("rollout artifact fraction (of valid&connected)")
-    a2.set_title("weird-shape fraction (rollout)"); a2.legend(fontsize=8); a2.grid(alpha=0.3)
-    fig.suptitle("GDPO structural-sanity fine-tune")
-    fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
-
-
-@Experiment(base_path=folder_path(__file__), namespace=file_namespace(__file__),
-            glob=globals())
+@Experiment(base_path=folder_path(__file__), namespace=file_namespace(__file__), glob=globals())
 def experiment(e: Experiment) -> None:
-    e.log(f"GDPO sanity: ckpt={os.path.basename(e.CKPT_PATH)} ref={os.path.basename(e.REFERENCE_SMILES)} "
-          f"K={e.ROLLOUT_SIZE} iters={e.ITERATIONS} kl_coef={e.KL_COEF} require_connected={e.REQUIRE_CONNECTED}")
-    from pytorch_lightning import seed_everything
-    seed_everything(e.SEED, workers=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    e.log("GDPO sanity RL on a ZINC E1 base")
+    torch.manual_seed(e.SEED)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = DeFoGModel.load(e.CKPT_PATH, device="cpu").to(device)
-    atom_types = atom_decoder_from_ckpt(model)
-    ae, ad, be, bd = build_encoders(atom_types, BOND_TYPES)
-    assert len(ad) == model.num_node_classes, \
-        f"atom decoder {len(ad)} != model node classes {model.num_node_classes}"
-    domain = MoleculeDomain(ad, bd)
-    size_dist = model.default_size_dist
-    e.log(f"atoms ({len(ad)}): {ad}")
+    if os.path.abspath(e.OUT_CKPT_DIR).rstrip("/").endswith(
+            os.path.basename(os.path.dirname(os.path.abspath(e.BASE_CKPT)))):
+        raise RuntimeError("OUT_CKPT_DIR would overwrite the E1 base; refusing.")
+    os.makedirs(e.OUT_CKPT_DIR, exist_ok=True)
 
-    # --- build the structural envelope from the training reference ---
-    t0 = time.time()
-    envelope, ref_set, ref_ring_hist, ring_bins, fcd_ref = prepare_reference(
-        e.REFERENCE_SMILES, e.SMILES_COLUMN, e.ENVELOPE_QUANTILE, e.RING_MIN_COUNT,
-        e.REFERENCE_LIMIT, e.FCD_REF_SAMPLES, e.RING_HIST_MAX, seed=e.SEED)
-    e["envelope"] = envelope.to_dict()
-    e["ring_bins"] = ring_bins
-    e["results/ref_ring_hist"] = ref_ring_hist.tolist()
-    e.log(f"reference: {len(ref_set)} mols, fcd_ref={len(fcd_ref)}, built in {time.time()-t0:.0f}s")
-    e.log(f"envelope: ring_sizes={sorted(envelope.allowed_ring_sizes)} max_rings={envelope.max_num_rings} "
-          f"max_ring_system={envelope.max_ring_system} max_spiro={envelope.max_spiro} "
-          f"max_bridgehead={envelope.max_bridgehead}")
+    mod = REFERENCES[e.DATASET]
+    e.log(f"dataset={e.DATASET}: {len(mod.ATOM_TYPES)} atom types, bonds={mod.BOND_TYPES}")
+    _, atom_decoder, _, bond_decoder = build_encoders(mod.ATOM_TYPES, mod.BOND_TYPES)
+    split = mod.load_reference_split()
+    train_ref = set(split.train_smiles)
+    # Validation only. The test split is not read here -- the E1 test pass
+    # already happened and this model is a separate artifact.
+    val_path = os.path.join(e.path, "validation_reference.smi")
+    with open(val_path, "w") as fh:
+        fh.write("\n".join(split.val_smiles) + "\n")
 
-    eval_kw = dict(eta=e.ETA, omega=e.OMEGA, time_distortion=e.TIME_DISTORTION,
-                   require_connected=e.REQUIRE_CONNECTED, ring_hist_max=e.RING_HIST_MAX)
+    model = DeFoGModel.load(e.BASE_CKPT).to(device)
+    e.log(f"loaded base {e.BASE_CKPT}")
+    domain = MoleculeDomain(atom_decoder, bond_decoder, reference_smiles=train_ref)
 
-    def full_eval(m, n, steps, seed, fcd):
-        return evaluate_sanity(m, domain, envelope, ref_set, ref_ring_hist, fcd_ref,
-                               n, steps, size_dist, device, compute_fcd=fcd, seed=seed, **eval_kw)
+    # -- BEFORE --------------------------------------------------------------
+    model.eval()
+    before, before_smiles = evaluate(model, atom_decoder, bond_decoder,
+                                     e.EVAL_SAMPLES, e.EVAL_STEPS, e.EVAL_ETA,
+                                     e.EVAL_OMEGA, device, train_ref)
+    with open(os.path.join(e.path, "before.smi"), "w") as fh:
+        fh.write("\n".join(before_smiles) + "\n")
+    e.log(f"BEFORE  validity={before['validity_relaxed_largest_frag']:.4f} "
+          f"disconnected={before['disconnected']:.4f} "
+          f"wonky_rings={before['wonky_ring_frac']:.4f} "
+          f"sanity={before['sanity']:.4f} uniq={before['uniqueness']:.4f}")
+    e["before"] = before
 
-    before, mols_b, smis_b, tags_b = full_eval(model, e.EVAL_SAMPLES, e.EVAL_STEPS, e.SEED, e.COMPUTE_FCD)
-    e["results/before"] = before
-    e.log(f"BEFORE: violation={before['violation_frac_all']:.1%} artifact(of conn&valid)="
-          f"{before['artifact_frac_of_conn_valid']:.1%} valid={before['valid_frac']:.1%} "
-          f"disc={before['disconnected_frac_all']:.1%} unique={before['unique_frac_of_valid']:.1%} "
-          f"novel={before['novel_frac_of_valid']:.1%} ring_tv={before['ring_tv']:.3f} fcd={before['fcd']}")
-    e.log(f"BEFORE violations by axis: {before['viol']}")
-    save_grid(mols_b, smis_b, tags_b, os.path.join(e.path, "grid_before.png"))
+    # -- TRAIN ---------------------------------------------------------------
+    reward = SanityReward(domain, e.RING_LO, e.RING_HI)
+    trainer = GDPOTrainer(
+        model, reward, rollout_size=e.ROLLOUT_SIZE,
+        sample_steps=e.ROLLOUT_SAMPLE_STEPS, eta=e.ROLLOUT_ETA,
+        omega=e.ROLLOUT_OMEGA, time_distortion=e.TIME_DISTORTION,
+        subsample_steps=e.SUBSAMPLE_STEPS, minibatch_size=e.MINIBATCH_SIZE,
+        lambda_edge=e.LAMBDA_EDGE, reduction=e.REDUCTION,
+        advantage_mode=e.ADVANTAGE_MODE, positive_only=e.POSITIVE_ONLY,
+        kl_coef=e.KL_COEF, lr=e.LR, weight_decay=e.WEIGHT_DECAY,
+        grad_clip=e.GRAD_CLIP, ema_decay=e.EMA_DECAY, device=device, seed=e.SEED,
+    )
+    e.log(f"training {e.ITERATIONS} iterations (kl_coef={e.KL_COEF}, lr={e.LR})")
 
-    reward = StructuralSanityReward(domain, envelope, require_connected=e.REQUIRE_CONNECTED)
-    ckpt_dir = os.path.join(e.path, "ckpts")
-    if e.CKPT_EVERY > 0:
-        os.makedirs(ckpt_dir, exist_ok=True)
     history = []
-    round_results = []
-    mols_a, smis_a, tags_a = mols_b, smis_b, tags_b
+    best = {"score": -1.0, "iter": None, "path": None}
 
-    for r in range(e.ROUNDS):
-        trainer = GDPOTrainer(
-            model, reward, rollout_size=e.ROLLOUT_SIZE, sample_steps=e.SAMPLE_STEPS,
-            subsample_steps=e.SUBSAMPLE_STEPS, minibatch_size=e.MINIBATCH_SIZE,
-            eta=e.ETA, omega=e.OMEGA, time_distortion=e.TIME_DISTORTION, size_dist=size_dist,
-            advantage_mode=e.ADVANTAGE_MODE, reduction=e.REDUCTION, lambda_edge=e.LAMBDA_EDGE,
-            positive_only=e.POSITIVE_ONLY,
-            kl_coef=e.KL_COEF, kl_target=e.KL_TARGET,
-            lr=e.LR, ema_decay=e.EMA_DECAY, device=device, seed=e.SEED + r,
-        )
+    def on_iter(i, stats):
+        row = {"iter": i, **{k: v for k, v in stats.items() if isinstance(v, (int, float))},
+               **reward.last}
+        history.append(row)
 
-        def on_iter(it, m, _r=r, _tr=trainer):
-            m = {**m, "round": _r, "iter": it, **reward.last}
-            history.append(m)
-            for key in ("reward_mean", "sane_frac", "artifact_frac_of_conn_valid", "valid_frac",
-                        "disconnected_frac", "invalid_frac", "kl", "kl_coef", "grad_norm"):
-                if key in m:
-                    e.track(key, float(m[key]))
-            if it % 5 == 0 or it == e.ITERATIONS - 1:
-                e.log(f"  r{_r} iter {it:3d} reward={m['reward_mean']:+.3f} sane={m.get('sane_frac',0):.2f} "
-                      f"artifact={m.get('artifact_frac_of_conn_valid',0):.2f} valid={m.get('valid_frac',0):.2f} "
-                      f"disc={m.get('disconnected_frac',0):.2f} gnorm={m['grad_norm']:.1f} klc={m.get('kl_coef',0):.3f}")
-            if e.CKPT_EVERY > 0 and (it + 1) % e.CKPT_EVERY == 0:
-                _tr.save(os.path.join(ckpt_dir, f"round{_r}_iter{it + 1:04d}.ckpt"))
-                e.commit_json("history.json", history)
+        if e.CKPT_EVERY and i % e.CKPT_EVERY == 0:
+            trainer.save(os.path.join(e.OUT_CKPT_DIR, f"iter{i:03d}"), use_ema=True)
 
-        trainer.fit(e.ITERATIONS, on_iter=on_iter)
+        if e.SELECT_BEST:
+            window = [h.get("sanity_frac", 0.0) for h in history[-e.SELECT_WINDOW:]]
+            score = sum(window) / max(1, len(window))
+            # Require a full window so the first iteration cannot win on a
+            # one-batch fluke.
+            if len(window) >= e.SELECT_WINDOW and score > best["score"]:
+                best.update(score=score, iter=i,
+                            path=trainer.save(os.path.join(e.OUT_CKPT_DIR, "best_model"),
+                                              use_ema=True))
+                e.log(f"  it {i:3d} new best smoothed sanity={score:.3f} -> best_model")
+
+        if i % 5 == 0 or i == e.ITERATIONS - 1:
+            e.log(f"  it {i:3d} reward={row.get('reward_mean', float('nan')):.3f} "
+                  f"sanity={reward.last.get('sanity_frac', float('nan')):.3f} "
+                  f"disc={reward.last.get('disconnected_frac', float('nan')):.3f} "
+                  f"wonky={reward.last.get('wonky_ring_frac', float('nan')):.3f}")
+
+    trainer.fit(e.ITERATIONS, on_iter=on_iter)
+    final_path = trainer.save(os.path.join(e.OUT_CKPT_DIR, "rl_model_final"), use_ema=True)
+    e.log(f"saved final-iteration model -> {final_path}")
+    e.commit_json("history.json", history)
+
+    # Evaluate the SELECTED model, not the last one. The last iteration is only
+    # the best policy if the run never degraded, which is not the common case.
+    if e.SELECT_BEST and best["path"]:
+        e.log(f"loading best checkpoint (iter {best['iter']}, "
+              f"smoothed sanity {best['score']:.3f})")
+        model = DeFoGModel.load(os.path.join(e.OUT_CKPT_DIR, "best_model")).to(device)
+        out_path = best["path"]
+    else:
         if trainer.ema is not None:
             trainer.ema.copy_to(model)
+        out_path = final_path
+    e["selected"] = {"iter": best["iter"], "smoothed_sanity": best["score"],
+                     "path": out_path}
 
-        last = (r == e.ROUNDS - 1)
-        n_eval = e.EVAL_SAMPLES if last else e.ROUND_EVAL_SAMPLES
-        rev, mols_a, smis_a, tags_a = full_eval(model, n_eval, e.EVAL_STEPS, e.SEED + 100 + r, e.COMPUTE_FCD and last)
-        round_results.append(rev)
-        e[f"results/round_{r}"] = rev
-        e.track("round_violation", float(rev["violation_frac_all"]))
-        e.track("round_valid", float(rev["valid_frac"]))
-        e.log(f"ROUND {r}: violation={rev['violation_frac_all']:.1%} artifact={rev['artifact_frac_of_conn_valid']:.1%} "
-              f"valid={rev['valid_frac']:.1%} unique={rev['unique_frac_of_valid']:.1%} (n={n_eval})")
+    # -- AFTER ---------------------------------------------------------------
+    model.eval()
+    after, after_smiles = evaluate(model, atom_decoder, bond_decoder,
+                                   e.EVAL_SAMPLES, e.EVAL_STEPS, e.EVAL_ETA,
+                                   e.EVAL_OMEGA, device, train_ref)
+    with open(os.path.join(e.path, "after.smi"), "w") as fh:
+        fh.write("\n".join(after_smiles) + "\n")
+    e["after"] = after
 
-    after = round_results[-1]
+    def delta(k):
+        return after[k] - before[k]
 
-    # --- best-snapshot selection: minimize the structural-violation rate, gated on
-    #     validity AND uniqueness (reject any collapse). Input-inclusive so a stacking
-    #     run can never ship worse than what it started from. ---
-    best_snapshot = None
-    if e.SELECT_BEST and e.CKPT_EVERY > 0:
-        import glob
-        cands = sorted(glob.glob(os.path.join(ckpt_dir, "*.ckpt")))
+    e.log("=" * 62)
+    e.log(f"{'metric':<28}{'before':>10}{'after':>10}{'delta':>12}")
+    for k, lab in [("validity_relaxed_largest_frag", "validity (relaxed)"),
+                   ("disconnected", "disconnected"),
+                   ("wonky_ring_frac", "wonky rings"),
+                   ("sanity", "sanity (all three)"),
+                   ("uniqueness", "uniqueness")]:
+        e.log(f"{lab:<28}{before[k]:>10.4f}{after[k]:>10.4f}{delta(k):>+12.4f}")
+    e.log("=" * 62)
+    e.log("FCD / NSPDK are NOT computed here. Score before.smi and after.smi "
+          "against validation_reference.smi with scripts/e1_metrics.py: a sanity "
+          "gain with degraded FCD is a FAILED run, not a successful one.")
 
-        def rank_eval(m):
-            rr, _, _, _ = full_eval(m, e.SELECT_EVAL_SAMPLES, e.SELECT_EVAL_STEPS, e.SEED + 200, False)
-            return rr
+    e.commit_json("summary.json", {
+        "dataset": e.DATASET,
+        "base_ckpt": e.BASE_CKPT, "out_ckpt": out_path, "seed": e.SEED,
+        "selected_iter": best["iter"], "selected_smoothed_sanity": best["score"],
+        "final_iteration_ckpt": final_path,
+        "reward": "graded: valid + connected + rings_ok in [0,3]",
+        "kl_coef": e.KL_COEF, "iterations": e.ITERATIONS, "lr": e.LR,
+        "rollout": {"steps": e.ROLLOUT_SAMPLE_STEPS, "eta": e.ROLLOUT_ETA,
+                    "omega": e.ROLLOUT_OMEGA},
+        "eval": {"steps": e.EVAL_STEPS, "eta": e.EVAL_ETA, "omega": e.EVAL_OMEGA,
+                 "n": e.EVAL_SAMPLES, "scored_against": "validation"},
+        "before": before, "after": after,
+        "delta": {k: delta(k) for k in
+                  ("validity_relaxed_largest_frag", "disconnected",
+                   "wonky_ring_frac", "sanity", "uniqueness")},
+        "e1_base_untouched": True,
+    })
 
-        # Gate validity/uniqueness at the SAME step count used for ranking. Validity is
-        # a few pp lower at SELECT_EVAL_STEPS than at EVAL_STEPS, so a floor taken from
-        # the 500-step before eval is too strict for 100-step ranking (it would reject
-        # non-collapsed snapshots). When the input is ranked, use ITS same-step scores as
-        # the reference; else fall back to the before eval.
-        best = None
-        if e.SELECT_INCLUDE_INPUT:
-            inp = DeFoGModel.load(e.CKPT_PATH, device="cpu").to(device)
-            ir = rank_eval(inp)
-            val_floor = ir["valid_frac"] - 0.02
-            uniq_floor = ir["unique_frac_of_valid"] - 0.02
-            e.log(f"  input: violation={ir['violation_frac_all']:.1%} valid={ir['valid_frac']:.1%} "
-                  f"unique={ir['unique_frac_of_valid']:.1%}")
-            best = (ir["violation_frac_all"], ir["valid_frac"], e.CKPT_PATH)
-            del inp
-            torch.cuda.empty_cache()
-        else:
-            val_floor = before["valid_frac"] - 0.02
-            uniq_floor = before["unique_frac_of_valid"] - 0.02
-        e.log(f"best-snapshot: ranking {len(cands)} snapshots + final at {e.SELECT_EVAL_STEPS} steps "
-              f"(val_floor={val_floor:.1%} uniq_floor={uniq_floor:.1%})")
-
-        def gated_better(rev, best):
-            if best is None:
-                return True
-            return (rev["valid_frac"] >= val_floor and rev["unique_frac_of_valid"] >= uniq_floor
-                    and rev["violation_frac_all"] < best[0])
-
-        for tag, path in [("final", None)] + [(os.path.basename(sp), sp) for sp in cands]:
-            if path is None:
-                rev = rank_eval(model)
-            else:
-                cm = DeFoGModel.load(path, device="cpu").to(device)
-                rev = rank_eval(cm)
-                del cm
-                torch.cuda.empty_cache()
-            e.log(f"  {tag}: violation={rev['violation_frac_all']:.1%} valid={rev['valid_frac']:.1%} "
-                  f"unique={rev['unique_frac_of_valid']:.1%}")
-            if gated_better(rev, best):
-                best = (rev["violation_frac_all"], rev["valid_frac"], path)
-        best_snapshot = os.path.basename(best[2]) if best[2] else "final"
-        e.log(f"best-snapshot: WINNER = {best_snapshot} (rank violation {best[0]:.1%}, valid {best[1]:.1%})")
-        if best[2] is not None:
-            model = DeFoGModel.load(best[2], device="cpu").to(device)
-        after, mols_a, smis_a, tags_a = full_eval(model, e.EVAL_SAMPLES, e.EVAL_STEPS, e.SEED + 1, e.COMPUTE_FCD)
-
-    e["results/after"] = after
-    save_grid(mols_a, smis_a, tags_a, os.path.join(e.path, "grid_after.png"))
-    save_curves(history, before["artifact_frac_of_conn_valid"], os.path.join(e.path, "reward_curve.png"))
-
-    summary = {
-        "violation_before": before["violation_frac_all"], "violation_after": after["violation_frac_all"],
-        "artifact_before": before["artifact_frac_of_conn_valid"], "artifact_after": after["artifact_frac_of_conn_valid"],
-        "valid_before": before["valid_frac"], "valid_after": after["valid_frac"],
-        "disc_before": before["disconnected_frac_all"], "disc_after": after["disconnected_frac_all"],
-        "unique_after": after["unique_frac_of_valid"], "novel_after": after["novel_frac_of_valid"],
-        "ring_tv_before": before["ring_tv"], "ring_tv_after": after["ring_tv"],
-        "fcd_before": before["fcd"], "fcd_after": after["fcd"],
-        "ratchet": [round(rr["violation_frac_all"], 4) for rr in round_results],
-        "best_snapshot": best_snapshot,
-        "envelope": envelope.to_dict(),
-        "ROUNDS": e.ROUNDS, "ITERATIONS": e.ITERATIONS, "KL_COEF": e.KL_COEF, "EVAL_STEPS": e.EVAL_STEPS,
-        "REQUIRE_CONNECTED": e.REQUIRE_CONNECTED, "ROLLOUT_SIZE": e.ROLLOUT_SIZE,
-    }
-    e["results/summary"] = summary
-    e.commit_json("summary.json", summary)
-    e.commit_json("history.json", history)
-    model.save(os.path.join(e.path, "gdpo_sane.ckpt"))
-    e.log(f"SUMMARY violation {summary['violation_before']:.1%} -> {summary['violation_after']:.1%} "
-          f"(best={summary['best_snapshot']}) | artifact {summary['artifact_before']:.1%} -> {summary['artifact_after']:.1%} "
-          f"| valid {summary['valid_before']:.1%} -> {summary['valid_after']:.1%} "
-          f"| disc {summary['disc_before']:.1%} -> {summary['disc_after']:.1%} "
-          f"| unique {summary['unique_after']:.1%} | ring_tv {summary['ring_tv_before']:.3f} -> {summary['ring_tv_after']:.3f} "
-          f"| fcd {summary['fcd_before']} -> {summary['fcd_after']}")
+    # -- curve ---------------------------------------------------------------
+    if history:
+        it = [h["iter"] for h in history]
+        fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4.5))
+        a1.plot(it, [h.get("reward_mean", np.nan) for h in history], lw=1.5)
+        a1.set_xlabel("iteration"); a1.set_ylabel("mean reward (0-3)")
+        a1.set_title("reward"); a1.grid(alpha=0.3)
+        for key, lab in [("sanity_frac", "sanity"), ("disconnected_frac", "disconnected"),
+                         ("wonky_ring_frac", "wonky rings")]:
+            a2.plot(it, [h.get(key, np.nan) for h in history], lw=1.5, label=lab)
+        a2.set_xlabel("iteration"); a2.set_ylabel("fraction of rollout")
+        a2.set_title("targeted failure modes"); a2.legend(fontsize=8); a2.grid(alpha=0.3)
+        fig.tight_layout()
+        e.commit_fig("rl_progress.png", fig)
 
 
 @experiment.testing
-def testing(e: Experiment) -> None:
-    e.ROUNDS = 1
+def testing(e: Experiment):
     e.ITERATIONS = 4
+    e.CKPT_EVERY = 2
+    e.SELECT_WINDOW = 2
     e.ROLLOUT_SIZE = 8
-    e.SAMPLE_STEPS = 20
     e.SUBSAMPLE_STEPS = 2
     e.MINIBATCH_SIZE = 4
-    e.CKPT_EVERY = 2
-    e.SELECT_BEST = True
-    e.SELECT_EVAL_SAMPLES = 16
+    e.ROLLOUT_SAMPLE_STEPS = 5
     e.EVAL_SAMPLES = 16
-    e.ROUND_EVAL_SAMPLES = 16
-    e.EVAL_STEPS = 20
-    e.SELECT_EVAL_STEPS = 20
-    e.REFERENCE_LIMIT = 2000
-    e.RING_MIN_COUNT = 1          # tiny reference -> keep full support so the smoke envelope is sensible
-    e.FCD_REF_SAMPLES = 256
-    e.COMPUTE_FCD = False
+    e.EVAL_STEPS = 5
 
 
 experiment.run_if_main()
