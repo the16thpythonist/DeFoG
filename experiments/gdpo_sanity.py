@@ -95,9 +95,25 @@ RING_HI: int = 8
 #     and could not see the distribution, so it optimised the first by
 #     destroying the second.
 #
-#     Keep ``ALPHA_FRAG + BETA_MMD < 1``. A valid molecule scores at least 1 on
-#     the sanity term, so a combined penalty of 1 or more could push a valid
-#     molecule below an invalid one and make the gradient point at invalidity.
+#     **BETA_MMD belongs well above 1.** The two terms live on very different
+#     scales. Measured on the four MOSES runs, the hack bought +0.157 of mean
+#     sanity reward while costing only +0.011 of MMD penalty, so the weight at
+#     which the trade becomes reward-neutral is
+#
+#         beta* = 0.157 / 0.011 ~= 14      (12.5 to 20.2 across the four seeds)
+#
+#     An earlier version of this comment said to keep ``ALPHA_FRAG + BETA_MMD <
+#     1``, reasoning that a penalty of 1 could push a valid molecule below an
+#     invalid one. That bound is wrong here, and following it would have
+#     guaranteed a null result. The MMD penalty is ``sim_sib - 2 * sim_ref``,
+#     and with sim_sib ~= 0.385 against 2 * sim_ref ~= 0.76 it is reliably
+#     *negative* -- subtracting it raises the reward, so the valid-above-invalid
+#     ordering holds for any non-negative beta. It could only turn positive
+#     under near-total collapse (sim_sib > 2 * sim_ref), which is the regime
+#     where a large penalty is the correct response anyway.
+#
+#     ALPHA_FRAG is different: the fragment penalty is a fraction in [0, 1] and
+#     is always subtracted, so the original bound does apply to it.
 #
 #     **ALPHA_FRAG should stay 0 on MOSES.** The offline gate
 #     (scripts/validate_rl_penalties.py, results in
@@ -283,6 +299,13 @@ class SanityReward:
         if self.alpha or self.beta:
             self.last["shaped_reward_mean"] = float(out.mean())
             self.last["shaped_reward_std"] = float(out.std())
+            # The valid-above-invalid ordering is now an empirical property
+            # rather than one a weight bound guarantees, so measure it instead
+            # of asserting it. If this ever reaches 0 the gradient has started
+            # preferring molecules that do not parse.
+            valid_idx = [i for i, s in enumerate(smiles) if s is not None]
+            self.last["min_valid_reward"] = (
+                float(out[valid_idx].min()) if valid_idx else float("nan"))
         return out
 
 
@@ -371,10 +394,11 @@ def experiment(e: Experiment) -> None:
         mmd_penalty = MMDPenalty(split.train_smiles, n_reference=e.MMD_N_REFERENCE,
                                  seed=0, kernel=e.MMD_KERNEL, log=e.log)
         e.log(f"MMD penalty: beta={e.BETA_MMD}, kernel={e.MMD_KERNEL}")
-    if e.ALPHA_FRAG + e.BETA_MMD >= 1.0:
-        e.log(f"WARNING: alpha+beta = {e.ALPHA_FRAG + e.BETA_MMD:.2f} >= 1. A valid "
-              f"molecule can now score below an invalid one, which points the "
-              f"gradient at invalidity. This is almost certainly not what you want.")
+    if e.ALPHA_FRAG >= 1.0:
+        e.log(f"WARNING: alpha={e.ALPHA_FRAG} >= 1. The fragment penalty is a "
+              f"fraction in [0,1] and is always subtracted, so a valid molecule "
+              f"can now score below an invalid one and the gradient points at "
+              f"invalidity.")
 
     reward = SanityReward(domain, e.RING_LO, e.RING_HI,
                           frag_penalty=frag_penalty, alpha=e.ALPHA_FRAG,
@@ -426,9 +450,9 @@ def experiment(e: Experiment) -> None:
         if i % 5 == 0 or i == e.ITERATIONS - 1:
             extra = ""
             if shaped:
-                extra = (f" frag={reward.last.get('frag_penalty_mean', float('nan')):.3f}"
-                         f" mmd={reward.last.get('mmd_penalty_mean', float('nan')):+.3f}"
-                         f" simsib={reward.last.get('mmd_sim_sibling', float('nan')):.3f}")
+                extra = (f" mmd={reward.last.get('mmd_penalty_mean', float('nan')):+.3f}"
+                         f" simsib={reward.last.get('mmd_sim_sibling', float('nan')):.3f}"
+                         f" minvalid={reward.last.get('min_valid_reward', float('nan')):+.2f}")
             e.log(f"  it {i:3d} reward={row.get('reward_mean', float('nan')):.3f} "
                   f"sanity={reward.last.get('sanity_frac', float('nan')):.3f} "
                   f"disc={reward.last.get('disconnected_frac', float('nan')):.3f} "
