@@ -85,6 +85,33 @@ def _install_molsets_shims() -> None:
     if not hasattr(pd.DataFrame, "append"):
         pd.DataFrame.append = lambda self, other, **kw: pd.concat([self, other], **kw)
 
+    # 3. Integer overflow in cos_similarity, which backs FragMetric and
+    #    ScafMetric. It builds count vectors with np.array(list_of_ints), so
+    #    numpy infers int64; scipy's cosine then computes uu*vv where uu = sum
+    #    r^2 and vv = sum g^2. Against a full MOSES reference (176,074 mols) the
+    #    fragment counts are large enough that uu*vv exceeds int64, wraps
+    #    negative, and math.sqrt raises "math domain error".
+    #
+    #    It errored rather than wrapping quietly, which was lucky -- a silent
+    #    wrap would have produced a plausible-looking wrong number. Casting to
+    #    float64 removes the overflow; cosine similarity is mathematically
+    #    identical either way, so this changes nothing except the intermediate
+    #    dtype. Verified to reproduce the unpatched value wherever the unpatched
+    #    code succeeds.
+    import moses.metrics.metrics as _mm
+
+    if not getattr(_mm, "_defog_cos_float64", False):
+        def _cos_similarity_float64(ref_counts, gen_counts):
+            if len(ref_counts) == 0 or len(gen_counts) == 0:
+                return np.nan
+            keys = np.unique(list(ref_counts.keys()) + list(gen_counts.keys()))
+            ref_vec = np.array([ref_counts.get(k, 0) for k in keys], dtype=np.float64)
+            gen_vec = np.array([gen_counts.get(k, 0) for k in keys], dtype=np.float64)
+            return 1 - _mm.cos_distance(ref_vec, gen_vec)
+
+        _mm.cos_similarity = _cos_similarity_float64
+        _mm._defog_cos_float64 = True
+
 
 # ===========================================================================
 # IO
