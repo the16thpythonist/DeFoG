@@ -52,6 +52,11 @@ from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 
 from defog.core import DeFoGModel, GDPOTrainer  # noqa: E402
+from defog.core.distribution_penalty import (  # noqa: E402
+    FragmentTypicalityPenalty,
+    FragmentVocabulary,
+    MMDPenalty,
+)
 from defog.data import guacamol_reference as gmref  # noqa: E402
 from defog.data import moses_reference as mref  # noqa: E402
 from defog.data import zinc_reference as zref  # noqa: E402
@@ -77,6 +82,57 @@ SEED: int = 42
 
 RING_LO: int = 3
 RING_HI: int = 8
+
+# --- Distribution-fidelity penalties (anti reward-hacking) ------------------
+# :param ALPHA_FRAG / BETA_MMD: Weights on the two penalty terms in
+#     ``r = sanity - ALPHA_FRAG * frag - BETA_MMD * mmd``. **Both default to 0.0,
+#     which makes this file behave exactly as it did before the penalties
+#     existed** -- the control arm of the sweep is the original code, not an
+#     approximation of it, and neither penalty object is even constructed.
+#
+#     Motivation: the MOSES run raised validity 0.885 -> 0.939 on 4/4 seeds
+#     while FCD went 0.863 -> 1.706 on 4/4 seeds. The reward could see validity
+#     and could not see the distribution, so it optimised the first by
+#     destroying the second.
+#
+#     Keep ``ALPHA_FRAG + BETA_MMD < 1``. A valid molecule scores at least 1 on
+#     the sanity term, so a combined penalty of 1 or more could push a valid
+#     molecule below an invalid one and make the gradient point at invalidity.
+#
+#     **ALPHA_FRAG should stay 0 on MOSES.** The offline gate
+#     (scripts/validate_rl_penalties.py, results in
+#     experiments/results/penalty_gate_moses.json) scored the fragment term at
+#     run-level AUC 0.048 against the known hacked policy -- far below 0.5,
+#     meaning it *prefers* the hacked samples and would accelerate the very
+#     failure it was added to prevent. The reason is structural: the hack
+#     narrowed toward simpler, more aliphatic molecules assembled from very
+#     common fragments, and a term that only punishes unusual fragments is
+#     blind to that by construction. It still separates real MOSES data from
+#     model output cleanly (0.032 vs 0.073), so it measures something real --
+#     just not this.
+ALPHA_FRAG: float = 0.0
+BETA_MMD: float = 0.0
+# :param MMD_KERNEL: 'descriptor' (RBF on standardised physicochemical
+#     descriptors) or 'tanimoto' (Morgan/ECFP4). The gate ranks descriptor
+#     first: run-level AUC 1.000 vs 0.998, and correlation with the hack axis
+#     (aromatic ring count) -0.49 vs -0.34, so it applies a markedly stronger
+#     per-sample push back along the axis the hack travelled. Binary
+#     fingerprints record which substructures are present, not how many, and
+#     this hack was a change in how many.
+MMD_KERNEL: str = "descriptor"
+# :param FRAG_MIN_COUNT: Occurrences in the train vocabulary below which a BRICS
+#     fragment counts as atypical. Trades off against how often ordinary
+#     molecules get penalised -- check ``coverage`` in the log, not this number.
+FRAG_MIN_COUNT: int = 5
+# :param FRAG_VOCAB_MOLECULES: Train molecules to decompose when building the
+#     vocabulary. BRICS runs at ~1.75 ms/molecule, so the full 1.58M MOSES rows
+#     would cost 45 min for a vocabulary whose common entries are settled long
+#     before that. Cached on disk and keyed by reference content.
+FRAG_VOCAB_MOLECULES: int = 250_000
+# :param MMD_N_REFERENCE: Reference molecules held as fingerprints for the MMD
+#     kernel. Fixed across iterations so the reward is comparable over the run;
+#     4096 keeps the per-iteration cost around 0.05 s against a ~30 s rollout.
+MMD_N_REFERENCE: int = 4096
 
 # --- RL (defaults from gdpo_connectivity.py, which tuned them on this model) --
 # :param ITERATIONS: Run 1139128 peaked at ~iteration 20 (sanity 0.961,
@@ -153,13 +209,32 @@ class SanityReward:
     assessed on a molecule that does not parse, and scoring it below every valid
     molecule removes any incentive to trade validity away for the other terms.
     Records the last batch's category rates in ``self.last`` for the curve.
+
+    Optionally subtracts distribution-fidelity penalties::
+
+        r = sanity - alpha * frag_penalty - beta * mmd_penalty
+
+    Both weights default to 0, in which case no penalty object is constructed
+    and the reward is bit-for-bit the original. The penalties are applied only
+    to molecules that decode: an invalid sample stays at exactly 0.0, so the
+    "invalid is strictly worst" ordering that the graded reward depends on
+    survives as long as ``alpha + beta < 1``.
+
+    The penalties score the whole decoded SMILES, disconnected components
+    included, rather than the largest fragment that the relaxed validity
+    convention reports. The sanity term already drives disconnection toward
+    zero, so the two representations converge on exactly the samples that end up
+    mattering.
     """
 
     invalid = 0.0
 
-    def __init__(self, domain, ring_lo=3, ring_hi=8):
+    def __init__(self, domain, ring_lo=3, ring_hi=8, *,
+                 frag_penalty=None, alpha=0.0, mmd_penalty=None, beta=0.0):
         self.domain = domain
         self.ring_lo, self.ring_hi = ring_lo, ring_hi
+        self.frag_penalty, self.alpha = frag_penalty, float(alpha)
+        self.mmd_penalty, self.beta = mmd_penalty, float(beta)
         self.last = {}
 
     def __call__(self, X1, E1, node_mask):
@@ -168,9 +243,11 @@ class SanityReward:
         n = node_mask.sum(-1)
         datas = dense_to_pyg(X1, E1, None, node_mask, n)
         out = torch.empty(len(datas))
+        smiles = []
         n_valid = n_conn = n_rings = n_full = 0
         for i, d in enumerate(datas):
             smi = self.domain.identity(d)   # canonical SMILES iff genuinely valid
+            smiles.append(smi)
             if smi is None:
                 out[i] = 0.0
                 continue
@@ -190,7 +267,22 @@ class SanityReward:
             "sanity_frac": n_full / k,
             "disconnected_frac": (n_valid - n_conn) / k,
             "wonky_ring_frac": (n_valid - n_rings) / k,
+            "sanity_reward_mean": float(out.mean()),
         }
+
+        # Penalties last, so ``sanity_frac`` above always means the raw targeted
+        # rate whatever the weights are -- the curve stays comparable across arms.
+        if self.frag_penalty is not None and self.alpha:
+            p = torch.as_tensor(self.frag_penalty(smiles), dtype=out.dtype)
+            out -= self.alpha * p
+            self.last.update(self.frag_penalty.last)
+        if self.mmd_penalty is not None and self.beta:
+            p = torch.as_tensor(self.mmd_penalty(smiles), dtype=out.dtype)
+            out -= self.beta * p
+            self.last.update(self.mmd_penalty.last)
+        if self.alpha or self.beta:
+            self.last["shaped_reward_mean"] = float(out.mean())
+            self.last["shaped_reward_std"] = float(out.std())
         return out
 
 
@@ -263,7 +355,30 @@ def experiment(e: Experiment) -> None:
     e["before"] = before
 
     # -- TRAIN ---------------------------------------------------------------
-    reward = SanityReward(domain, e.RING_LO, e.RING_HI)
+    # Penalty references come from TRAIN. Evaluation FCD is scored against
+    # VALIDATION, and that separation is the point: it leaves FCD an independent
+    # verdict rather than a quantity the policy has been steered toward.
+    frag_penalty = mmd_penalty = None
+    if e.ALPHA_FRAG:
+        vocab = FragmentVocabulary.build_or_load(
+            e.DATASET, split.train_smiles,
+            max_molecules=e.FRAG_VOCAB_MOLECULES, seed=0, log=e.log)
+        frag_penalty = FragmentTypicalityPenalty(vocab, min_count=e.FRAG_MIN_COUNT)
+        e.log(f"fragment penalty: {len(frag_penalty)} fragments at "
+              f"min_count={e.FRAG_MIN_COUNT}, occurrence coverage "
+              f"{vocab.coverage(e.FRAG_MIN_COUNT):.4f}, alpha={e.ALPHA_FRAG}")
+    if e.BETA_MMD:
+        mmd_penalty = MMDPenalty(split.train_smiles, n_reference=e.MMD_N_REFERENCE,
+                                 seed=0, kernel=e.MMD_KERNEL, log=e.log)
+        e.log(f"MMD penalty: beta={e.BETA_MMD}, kernel={e.MMD_KERNEL}")
+    if e.ALPHA_FRAG + e.BETA_MMD >= 1.0:
+        e.log(f"WARNING: alpha+beta = {e.ALPHA_FRAG + e.BETA_MMD:.2f} >= 1. A valid "
+              f"molecule can now score below an invalid one, which points the "
+              f"gradient at invalidity. This is almost certainly not what you want.")
+
+    reward = SanityReward(domain, e.RING_LO, e.RING_HI,
+                          frag_penalty=frag_penalty, alpha=e.ALPHA_FRAG,
+                          mmd_penalty=mmd_penalty, beta=e.BETA_MMD)
     trainer = GDPOTrainer(
         model, reward, rollout_size=e.ROLLOUT_SIZE,
         sample_steps=e.ROLLOUT_SAMPLE_STEPS, eta=e.ROLLOUT_ETA,
@@ -277,7 +392,17 @@ def experiment(e: Experiment) -> None:
     e.log(f"training {e.ITERATIONS} iterations (kl_coef={e.KL_COEF}, lr={e.LR})")
 
     history = []
-    best = {"score": -1.0, "iter": None, "path": None}
+    best = {"score": -float("inf"), "iter": None, "path": None}
+
+    # Selection must follow the objective. Selecting on raw sanity while
+    # training on the shaped reward would hand-pick the most reward-hacked
+    # checkpoint of the run -- the exact failure the penalties exist to prevent.
+    # With both weights at 0 this falls back to sanity_frac, so the control arm
+    # selects identically to every previous run.
+    shaped = bool(e.ALPHA_FRAG or e.BETA_MMD)
+    select_key = "shaped_reward_mean" if shaped else "sanity_frac"
+    e.log(f"checkpoint selection on rolling mean of '{select_key}' "
+          f"(window {e.SELECT_WINDOW})")
 
     def on_iter(i, stats):
         row = {"iter": i, **{k: v for k, v in stats.items() if isinstance(v, (int, float))},
@@ -288,7 +413,7 @@ def experiment(e: Experiment) -> None:
             trainer.save(os.path.join(e.OUT_CKPT_DIR, f"iter{i:03d}"), use_ema=True)
 
         if e.SELECT_BEST:
-            window = [h.get("sanity_frac", 0.0) for h in history[-e.SELECT_WINDOW:]]
+            window = [h.get(select_key, 0.0) for h in history[-e.SELECT_WINDOW:]]
             score = sum(window) / max(1, len(window))
             # Require a full window so the first iteration cannot win on a
             # one-batch fluke.
@@ -296,13 +421,18 @@ def experiment(e: Experiment) -> None:
                 best.update(score=score, iter=i,
                             path=trainer.save(os.path.join(e.OUT_CKPT_DIR, "best_model"),
                                               use_ema=True))
-                e.log(f"  it {i:3d} new best smoothed sanity={score:.3f} -> best_model")
+                e.log(f"  it {i:3d} new best smoothed {select_key}={score:.3f} -> best_model")
 
         if i % 5 == 0 or i == e.ITERATIONS - 1:
+            extra = ""
+            if shaped:
+                extra = (f" frag={reward.last.get('frag_penalty_mean', float('nan')):.3f}"
+                         f" mmd={reward.last.get('mmd_penalty_mean', float('nan')):+.3f}"
+                         f" simsib={reward.last.get('mmd_sim_sibling', float('nan')):.3f}")
             e.log(f"  it {i:3d} reward={row.get('reward_mean', float('nan')):.3f} "
                   f"sanity={reward.last.get('sanity_frac', float('nan')):.3f} "
                   f"disc={reward.last.get('disconnected_frac', float('nan')):.3f} "
-                  f"wonky={reward.last.get('wonky_ring_frac', float('nan')):.3f}")
+                  f"wonky={reward.last.get('wonky_ring_frac', float('nan')):.3f}{extra}")
 
     trainer.fit(e.ITERATIONS, on_iter=on_iter)
     final_path = trainer.save(os.path.join(e.OUT_CKPT_DIR, "rl_model_final"), use_ema=True)
@@ -313,15 +443,15 @@ def experiment(e: Experiment) -> None:
     # the best policy if the run never degraded, which is not the common case.
     if e.SELECT_BEST and best["path"]:
         e.log(f"loading best checkpoint (iter {best['iter']}, "
-              f"smoothed sanity {best['score']:.3f})")
+              f"smoothed {select_key} {best['score']:.3f})")
         model = DeFoGModel.load(os.path.join(e.OUT_CKPT_DIR, "best_model")).to(device)
         out_path = best["path"]
     else:
         if trainer.ema is not None:
             trainer.ema.copy_to(model)
         out_path = final_path
-    e["selected"] = {"iter": best["iter"], "smoothed_sanity": best["score"],
-                     "path": out_path}
+    e["selected"] = {"iter": best["iter"], "smoothed_score": best["score"],
+                     "select_key": select_key, "path": out_path}
 
     # -- AFTER ---------------------------------------------------------------
     model.eval()
@@ -351,9 +481,21 @@ def experiment(e: Experiment) -> None:
     e.commit_json("summary.json", {
         "dataset": e.DATASET,
         "base_ckpt": e.BASE_CKPT, "out_ckpt": out_path, "seed": e.SEED,
-        "selected_iter": best["iter"], "selected_smoothed_sanity": best["score"],
+        "selected_iter": best["iter"], "selected_smoothed_score": best["score"],
+        "select_key": select_key,
         "final_iteration_ckpt": final_path,
-        "reward": "graded: valid + connected + rings_ok in [0,3]",
+        "reward": ("graded: valid + connected + rings_ok in [0,3]"
+                   + (f" - {e.ALPHA_FRAG}*frag - {e.BETA_MMD}*mmd" if shaped else "")),
+        "penalties": {
+            "alpha_frag": e.ALPHA_FRAG, "beta_mmd": e.BETA_MMD,
+            "mmd_kernel": e.MMD_KERNEL,
+            "frag_min_count": e.FRAG_MIN_COUNT,
+            "frag_vocab_molecules": e.FRAG_VOCAB_MOLECULES,
+            "mmd_n_reference": e.MMD_N_REFERENCE,
+            "reference_split": "train",
+            "note": ("penalty reference is TRAIN; evaluation FCD is scored against "
+                     "VALIDATION, so FCD stays an independent verdict"),
+        },
         "kl_coef": e.KL_COEF, "iterations": e.ITERATIONS, "lr": e.LR,
         "rollout": {"steps": e.ROLLOUT_SAMPLE_STEPS, "eta": e.ROLLOUT_ETA,
                     "omega": e.ROLLOUT_OMEGA},

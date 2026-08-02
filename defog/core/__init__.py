@@ -113,6 +113,13 @@ from .rl import (
     group_advantage,
     EMA,
 )
+from .distribution_penalty import (
+    FragmentVocabulary,
+    FragmentTypicalityPenalty,
+    MMDPenalty,
+    brics_fragments,
+    morgan_fingerprints,
+)
 from .time_distortion import TimeDistorter
 from .transformer import GraphTransformer
 from .features import ExtraFeatures, RRWPFeatures
@@ -206,6 +213,12 @@ __all__ = [
     "kl_clean",
     "group_advantage",
     "EMA",
+    # Distribution-fidelity reward penalties (anti reward-hacking)
+    "FragmentVocabulary",
+    "FragmentTypicalityPenalty",
+    "MMDPenalty",
+    "brics_fragments",
+    "morgan_fingerprints",
     # Time distortion
     "TimeDistorter",
     # Neural network

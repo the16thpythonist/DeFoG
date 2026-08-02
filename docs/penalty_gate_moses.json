@@ -1,0 +1,175 @@
+{
+  "config": {
+    "rl_dir": "/tmp/claude-1000/-media-ssd2-Programming-DeFoG/09764790-1616-4cfa-b005-d12cc5d49fbd/scratchpad/moses_rl",
+    "dataset": "moses",
+    "vocab_molecules": 250000,
+    "min_count": 5,
+    "n_reference": 4096,
+    "kernels": [
+      "tanimoto",
+      "descriptor"
+    ],
+    "batch_size": 128,
+    "n_draws": 300,
+    "iterations": 25,
+    "mmd_max_samples": 7000,
+    "seed": 0,
+    "out": "/media/ssd2/Programming/DeFoG/experiments/results/penalty_gate_moses.json"
+  },
+  "known_fcd": {
+    "base": 0.863,
+    "rl": 1.706
+  },
+  "set_level": {
+    "base": {
+      "n": 7000,
+      "frag_penalty_mean": 0.07297284580498865,
+      "frag_penalty_max": 1.0,
+      "frag_scored_frac": 1.0,
+      "frag_unassessable_frac": 0.0,
+      "mmd2:tanimoto": 0.0008626387605902286,
+      "mmd2:descriptor": 0.0015386900078447896,
+      "tanimoto:mmd_penalty_mean": -0.13458925884743544,
+      "tanimoto:mmd_sim_ref": 0.13568106113656322,
+      "tanimoto:mmd_sim_sibling": 0.13677286342569098,
+      "tanimoto:mmd_valid_frac": 1.0,
+      "descriptor:mmd_penalty_mean": -0.37375969344871646,
+      "descriptor:mmd_sim_ref": 0.375740160050652,
+      "descriptor:mmd_sim_sibling": 0.37772062665258765,
+      "descriptor:mmd_valid_frac": 1.0
+    },
+    "rl": {
+      "n": 7000,
+      "frag_penalty_mean": 0.06720901360544217,
+      "frag_penalty_max": 1.0,
+      "frag_scored_frac": 1.0,
+      "frag_unassessable_frac": 0.0,
+      "mmd2:tanimoto": 0.0022577954811754397,
+      "mmd2:descriptor": 0.011828985335959608,
+      "tanimoto:mmd_penalty_mean": -0.13319410212685023,
+      "tanimoto:mmd_sim_ref": 0.1359618781113924,
+      "tanimoto:mmd_sim_sibling": 0.13872965409593455,
+      "tanimoto:mmd_valid_frac": 1.0,
+      "descriptor:mmd_penalty_mean": -0.36346939812060164,
+      "descriptor:mmd_sim_ref": 0.3721248972886932,
+      "descriptor:mmd_sim_sibling": 0.38078039645678474,
+      "descriptor:mmd_valid_frac": 1.0
+    },
+    "real": {
+      "n": 5000,
+      "frag_penalty_mean": 0.031781746031746036,
+      "frag_penalty_max": 1.0,
+      "frag_scored_frac": 1.0,
+      "frag_unassessable_frac": 0.0,
+      "mmd2:tanimoto": -2.1267368531474595e-05,
+      "mmd2:descriptor": -8.484008080461569e-05,
+      "tanimoto:mmd_penalty_mean": -0.13547316497655715,
+      "tanimoto:mmd_sim_ref": 0.13541850334101577,
+      "tanimoto:mmd_sim_sibling": 0.13536384170547444,
+      "tanimoto:mmd_valid_frac": 1.0,
+      "descriptor:mmd_penalty_mean": -0.37538322353736586,
+      "descriptor:mmd_sim_ref": 0.37877561931018117,
+      "descriptor:mmd_sim_sibling": 0.3821680150829965,
+      "descriptor:mmd_valid_frac": 1.0
+    }
+  },
+  "rollout_scale": {
+    "frag": {
+      "auc_single_batch": 0.37145555555555554,
+      "auc_run": 0.047711111111111114,
+      "auc_per_sample": 0.4920096224489796,
+      "hack_axis_corr": -0.059146510987044314,
+      "opposes_hack_axis": true,
+      "batch_means": {
+        "real": 0.03188704943783069,
+        "base": 0.07319344204695767,
+        "rl": 0.06698952132936507
+      },
+      "batch_stds": {
+        "real": 0.010156349590304875,
+        "base": 0.013029923962182449,
+        "rl": 0.013140528069364258
+      },
+      "passes": false
+    },
+    "mmd:tanimoto": {
+      "auc_single_batch": 0.6994111111111111,
+      "auc_run": 0.9976888888888888,
+      "auc_per_sample": 0.5244459183673469,
+      "hack_axis_corr": -0.3444516180200671,
+      "opposes_hack_axis": true,
+      "batch_means": {
+        "real": -0.13540564592716678,
+        "base": -0.13451765821524703,
+        "rl": -0.13323877116233154
+      },
+      "batch_stds": {
+        "real": 0.0015583793413300041,
+        "base": 0.001628492957278943,
+        "rl": 0.0018455845637665334
+      },
+      "passes": true
+    },
+    "mmd:descriptor": {
+      "auc_single_batch": 0.8197222222222222,
+      "auc_run": 1.0,
+      "auc_per_sample": 0.5345774081632653,
+      "hack_axis_corr": -0.4871097842072413,
+      "opposes_hack_axis": true,
+      "batch_means": {
+        "real": -0.3750115443799973,
+        "base": -0.37351275092191466,
+        "rl": -0.3636465352851977
+      },
+      "batch_stds": {
+        "real": 0.006651376716320225,
+        "base": 0.007150508454115613,
+        "rl": 0.008071587671158452
+      },
+      "passes": true
+    }
+  },
+  "per_seed": [
+    {
+      "dir": "02_08_2026__13_16__6YE8",
+      "frag_base": 0.06963088587390263,
+      "frag_rl": 0.07723436389481164,
+      "mmd:tanimoto_base": -0.13433115510412977,
+      "mmd:tanimoto_rl": -0.13387392860968675,
+      "mmd:descriptor_base": -0.37352647255959864,
+      "mmd:descriptor_rl": -0.3673626491818966
+    },
+    {
+      "dir": "02_08_2026__13_16__Mz7R",
+      "frag_base": 0.07095787244057426,
+      "frag_rl": 0.06425014106621525,
+      "mmd:tanimoto_base": -0.13472307473502346,
+      "mmd:tanimoto_rl": -0.1325226547927553,
+      "mmd:descriptor_base": -0.37390266983292647,
+      "mmd:descriptor_rl": -0.36077297617049436
+    },
+    {
+      "dir": "02_08_2026__13_16__j7LC",
+      "frag_base": 0.07872473279418478,
+      "frag_rl": 0.06722929597736399,
+      "mmd:tanimoto_base": -0.1345899806279982,
+      "mmd:tanimoto_rl": -0.132848408217754,
+      "mmd:descriptor_base": -0.3733177834863164,
+      "mmd:descriptor_rl": -0.36187626348385815
+    },
+    {
+      "dir": "02_08_2026__13_16__qBCa",
+      "frag_base": 0.07232093281510273,
+      "frag_rl": 0.061068277856030834,
+      "mmd:tanimoto_base": -0.1347002579528448,
+      "mmd:tanimoto_rl": -0.13282597421009418,
+      "mmd:descriptor_base": -0.3745185809758245,
+      "mmd:descriptor_rl": -0.3610924816532808
+    }
+  ],
+  "gate_passed": true,
+  "passing_terms": [
+    "mmd:tanimoto",
+    "mmd:descriptor"
+  ]
+}
