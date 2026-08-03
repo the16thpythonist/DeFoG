@@ -225,7 +225,8 @@ def _pen(reference, kernel="tanimoto"):
 
 # The estimator is written against the kernel interface, so every property that
 # is a property of the *estimator* must hold for both kernels.
-BOTH_KERNELS = pytest.mark.parametrize("kernel", ["tanimoto", "descriptor"])
+BOTH_KERNELS = pytest.mark.parametrize(
+    "kernel", ["tanimoto", "descriptor", "descriptor_whitened"])
 
 
 def test_sibling_term_excludes_the_self_comparison():
@@ -405,6 +406,94 @@ def test_descriptor_kernel_drops_unfeaturizable_molecules():
     k = DescriptorRBFKernel()
     feats = k.featurize([DIVERSE[0], None, "garbage((("])
     assert feats[0] is not None and feats[1] is None and feats[2] is None
+
+
+def test_whitening_decorrelates_the_reference():
+    """After whitening, the reference covariance should be ~identity.
+
+    That is the whole mechanism: correlated descriptors stop being counted as
+    independent axes, so a shift spread across a correlated cluster is seen at
+    its true joint size instead of as several individually-small shifts.
+    """
+    from defog.core.distribution_penalty import WhitenedDescriptorKernel
+
+    k = WhitenedDescriptorKernel(shrinkage=0.0)
+    feats = [f for f in k.featurize(DIVERSE + ALIEN) if f is not None]
+    k.fit(feats)
+    z = k._project(np.asarray(feats))
+    cov = np.cov(z, rowvar=False)
+    d = cov.shape[0]
+    # Only the directions the sample can actually resolve are constrained;
+    # with few molecules the rest are pinned by the eigenvalue floor.
+    rank = min(len(feats) - 1, d)
+    assert np.allclose(np.diag(cov)[:rank], 1.0, atol=0.35)
+    off = cov - np.diag(np.diag(cov))
+    assert np.abs(off).max() < 0.5
+
+
+def test_shrinkage_is_applied_and_keeps_the_transform_finite():
+    from defog.core.distribution_penalty import WhitenedDescriptorKernel
+
+    # Fewer molecules than descriptors -> singular covariance. Without
+    # shrinkage plus the eigenvalue floor this is where whitening blows up.
+    k = WhitenedDescriptorKernel(shrinkage=0.2)
+    feats = [f for f in k.featurize(DIVERSE[:4]) if f is not None]
+    k.fit(feats)
+    assert k.transform is not None
+    assert np.all(np.isfinite(k.transform))
+    g = k.gram(feats, feats)
+    assert np.all(np.isfinite(g)) and np.allclose(np.diag(g), 1.0)
+
+
+def test_whitened_kernel_is_registered_and_distinct():
+    from defog.core.distribution_penalty import KERNELS
+
+    assert KERNELS["descriptor_whitened"]().name == "descriptor_whitened"
+    plain = _pen(DIVERSE, "descriptor")(DIVERSE[:5])
+    white = _pen(DIVERSE, "descriptor_whitened")(DIVERSE[:5])
+    assert not np.allclose(plain, white)
+
+
+def test_whitening_shrinks_high_variance_shifts_and_amplifies_low_variance_ones():
+    """What whitening actually does -- the property, not the hoped-for effect.
+
+    Mahalanobis distance measures a shift in units of the reference's own
+    spread along that direction. So a shift ALONG a correlated cluster's shared
+    (high-variance) direction is shrunk, while a shift ACROSS it, into the
+    cluster's rigid low-variance direction, is amplified.
+
+    This is the test that corrected the reasoning behind adding this kernel. It
+    was introduced expecting it to up-weight a correlated polarity cluster; it
+    does the opposite, which is why it is not used for the MOSES hack -- that
+    hack rides the dominant direction, so whitening halves its magnitude.
+    """
+    from defog.core.distribution_penalty import DescriptorRBFKernel
+
+    rng = np.random.default_rng(0)
+    n, d = 800, 6
+    shared = rng.normal(size=(n, 1))
+    # Descriptors 0-2 share a dominant direction; 3-5 are independent.
+    ref = np.hstack([shared + 0.25 * rng.normal(size=(n, 3)),
+                     rng.normal(size=(n, 3))])
+
+    along = ref.copy()
+    along[:, :3] -= 0.5             # moves with the cluster (high variance)
+    across = ref.copy()
+    across[:, 0] -= 0.5             # breaks the cluster (low variance)
+    across[:, 1] += 0.5
+
+    sims = {}
+    for whiten in (False, True):
+        k = DescriptorRBFKernel(descriptors=tuple(f"d{i}" for i in range(d)),
+                                whiten=whiten, shrinkage=0.05)
+        k.fit(list(ref))
+        # Lower mean similarity to the reference = judged more distant.
+        sims[whiten] = (k.gram(list(along), list(ref)).mean(),
+                        k.gram(list(across), list(ref)).mean())
+
+    # Whitening makes the across-cluster shift relatively MORE distant than the
+    # along-cluster one, i.e. its similarity ratio across/along drops.
+    assert (sims[True][1] / sims[True][0]) < (sims[False][1] / sims[False][0])
 
 
 def test_descriptor_kernel_sees_a_composition_shift_that_tanimoto_misses():

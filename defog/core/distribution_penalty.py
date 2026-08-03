@@ -443,11 +443,15 @@ class DescriptorRBFKernel:
 
     name = "descriptor"
 
-    def __init__(self, descriptors: Sequence[str] = DESCRIPTORS):
+    def __init__(self, descriptors: Sequence[str] = DESCRIPTORS, *,
+                 whiten: bool = False, shrinkage: float = 0.1):
         self.descriptors = tuple(descriptors)
+        self.whiten = whiten
+        self.shrinkage = shrinkage
         self._funcs = None
         self.mean: Optional[np.ndarray] = None
         self.scale: Optional[np.ndarray] = None
+        self.transform: Optional[np.ndarray] = None
         self.gamma: Optional[float] = None
 
     def featurize(self, smiles: Sequence[Optional[str]]) -> List:
@@ -475,7 +479,7 @@ class DescriptorRBFKernel:
         return out
 
     def fit(self, reference_features) -> None:
-        """Learn the standardisation and bandwidth from the reference set."""
+        """Learn the standardisation (or whitening) and bandwidth from the reference."""
         ref = np.asarray([f for f in reference_features if f is not None])
         if ref.size == 0:
             raise ValueError("no reference molecule produced descriptors")
@@ -484,22 +488,91 @@ class DescriptorRBFKernel:
         # A constant descriptor carries no information; scaling it by ~0 would
         # turn float noise into a huge distance, so it is neutralised instead.
         self.scale = np.where(std > 1e-8, std, 1.0)
-        z = (ref - self.mean) / self.scale
+
+        if self.whiten:
+            # Standardise first so the covariance is a correlation matrix and
+            # the shrinkage target (the identity) is meaningful regardless of
+            # each descriptor's natural units.
+            zs = (ref - self.mean) / self.scale
+            cov = np.cov(zs, rowvar=False)
+            d = cov.shape[0]
+            # Ledoit-Wolf-style shrinkage toward a scaled identity. Whitening
+            # divides by sqrt(eigenvalue), so the near-null directions of a
+            # correlated descriptor set would otherwise be amplified into pure
+            # noise -- shrinkage is what keeps that from dominating the metric.
+            cov = (1.0 - self.shrinkage) * cov + \
+                self.shrinkage * (np.trace(cov) / d) * np.eye(d)
+            evals, evecs = np.linalg.eigh(cov)
+            evals = np.maximum(evals, 1e-8)
+            self.transform = evecs @ np.diag(evals ** -0.5) @ evecs.T
+        else:
+            self.transform = None
+
+        z = self._project(ref)
         sub = z[:2000]
         d2 = np.maximum(((sub[:, None, :] - sub[None, :, :]) ** 2).sum(-1), 0.0)
         median = np.median(d2[np.triu_indices(len(sub), k=1)]) if len(sub) > 1 else 1.0
         self.gamma = 1.0 / max(median, 1e-8)
 
+    def _project(self, x) -> np.ndarray:
+        z = (np.asarray(x) - self.mean) / self.scale
+        return z if self.transform is None else z @ self.transform
+
     def gram(self, a, b) -> np.ndarray:
         if self.mean is None:
             raise RuntimeError("DescriptorRBFKernel.fit must run before gram")
-        A = (np.asarray(a) - self.mean) / self.scale
-        B = (np.asarray(b) - self.mean) / self.scale
+        A, B = self._project(a), self._project(b)
         d2 = ((A[:, None, :] - B[None, :, :]) ** 2).sum(-1)
         return np.exp(-self.gamma * d2)
 
 
-KERNELS = {"tanimoto": TanimotoKernel, "descriptor": DescriptorRBFKernel}
+class WhitenedDescriptorKernel(DescriptorRBFKernel):
+    """Descriptor RBF on a *whitened* (Mahalanobis) distance.
+
+    **Do not use this for the MOSES validity hack -- it is measurably worse
+    than the plain descriptor kernel for that failure.** Kept because it is the
+    right tool for the opposite situation, and because the measurement below is
+    worth not having to repeat.
+
+    It was added on the theory that per-axis standardisation under-weights a
+    correlated cluster by presenting it as several individually-small shifts.
+    That theory was wrong, and the reason is worth stating plainly: whitening
+    divides by the spread *along each principal direction*, so it shrinks
+    shifts along high-variance directions and amplifies shifts along
+    low-variance ones.
+
+    Decomposing the measured hack (base -> unpenalised RL mean shift) in the
+    reference covariance eigenbasis, essentially all the loading sits on the
+    top eigenvalues (3.26, 2.54, 1.80, 1.50, 1.28):
+
+        ||shift||^2  standardised (Euclidean)  = 0.349
+        ||shift||^2  whitened (Mahalanobis)    = 0.173     -> 0.50x
+
+    So whitening HALVES the signal here. Chemically that is coherent: the hack
+    travels along the dominant polarity/aromaticity axis of drug-like space --
+    the direction real molecules vary most -- so it is genuinely *less
+    surprising* in Mahalanobis terms even though FCD still penalises it. The
+    lesson generalises: whiten when a hack hides in a rigid, low-variance
+    direction; standardise when it rides the dominant one.
+
+    The residual it was meant to fix was also *not* evidence of missing
+    descriptors: every residual axis is already in the set, and the standardised
+    kernel's own MMD^2 still read 3.7x base, so it could see the gap. Widening
+    the descriptor set would not have helped either.
+    """
+
+    name = "descriptor_whitened"
+
+    def __init__(self, descriptors: Sequence[str] = DESCRIPTORS,
+                 shrinkage: float = 0.1):
+        super().__init__(descriptors, whiten=True, shrinkage=shrinkage)
+
+
+KERNELS = {
+    "tanimoto": TanimotoKernel,
+    "descriptor": DescriptorRBFKernel,
+    "descriptor_whitened": WhitenedDescriptorKernel,
+}
 
 
 # ===========================================================================
