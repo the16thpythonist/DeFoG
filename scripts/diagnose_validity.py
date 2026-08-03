@@ -84,6 +84,9 @@ def main():
     ap.add_argument("--omega", type=float, default=0.0)
     ap.add_argument("--chunk", type=int, default=256)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--dump-smiles", default=None,
+                    help="write the valid canonical SMILES here, for external "
+                         "FCD/NSPDK scoring in the metrics environment")
     args = ap.parse_args()
 
     import importlib
@@ -132,11 +135,16 @@ def main():
     counts = collections.Counter()
     details = collections.Counter()
     ring_sizes = collections.Counter()
+    smiles_out = []
     for data in samples:
         mol = pyg_data_to_mol(data, atom_decoder, bond_decoder,
                               charge_correction=True)
         cat, detail = classify(mol)
         counts[cat] += 1
+        if cat in ("ok", "disconnected"):
+            probe = Chem.Mol(mol)
+            Chem.SanitizeMol(probe)
+            smiles_out.append(Chem.MolToSmiles(probe))
         if detail:
             details[detail] += 1
         # Ring census on whatever RDKit could read, sanitized or not -- a
@@ -174,6 +182,14 @@ def main():
         print("\nring sizes among failing molecules:")
         for size, c in sorted(ring_sizes.items()):
             print(f"  {size}-ring: {c}")
+
+    if smiles_out:
+        uniq = len(set(smiles_out)) / len(smiles_out)
+        print(f"\nuniqueness among valid: {uniq:.4f}  (n={len(smiles_out)})")
+
+    if args.dump_smiles:
+        Path(args.dump_smiles).write_text("\n".join(smiles_out) + "\n")
+        print(f"wrote {len(smiles_out)} SMILES -> {args.dump_smiles}")
 
     if args.out:
         Path(args.out).write_text(json.dumps({
