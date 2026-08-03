@@ -116,9 +116,13 @@ def main():
         # distribution is the follow-up question.
         if mol is not None and cat in ("kekulize", "valence"):
             try:
-                ri = Chem.Mol(mol).GetRingInfo()
-                Chem.FastFindRings(Chem.Mol(mol))
-                for r in ri.AtomRings():
+                # FastFindRings must run BEFORE GetRingInfo: on an unsanitized
+                # molecule ring perception has not happened, and reading
+                # RingInfo first returns uninitialised garbage (it reported a
+                # "177404-ring" the first time this ran).
+                probe = Chem.Mol(mol)
+                Chem.FastFindRings(probe)
+                for r in probe.GetRingInfo().AtomRings():
                     ring_sizes[len(r)] += 1
             except Exception:                       # noqa: BLE001
                 pass
