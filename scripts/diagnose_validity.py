@@ -74,6 +74,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--dataset", required=True, choices=sorted(REFERENCES))
+    ap.add_argument("--representation", default=None,
+                    help="MOSES only: 'aromatic_v1' (default) or 'kekulized_v2'. "
+                         "Must match what the checkpoint was trained with -- the "
+                         "wrong one mis-decodes silently rather than erroring.")
     ap.add_argument("--n", type=int, default=1024)
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--eta", type=float, default=25.0)
@@ -84,12 +88,36 @@ def main():
 
     import importlib
     mod = importlib.import_module(f"defog.data.{REFERENCES[args.dataset]}")
-    _, atom_decoder, _, bond_decoder = build_encoders(mod.ATOM_TYPES, mod.BOND_TYPES)
-    print(f"{args.dataset}: atoms={list(mod.ATOM_TYPES)} bonds={list(mod.BOND_TYPES)}")
+
+    rep = None
+    if args.representation is not None:
+        if not hasattr(mod, "get_representation"):
+            sys.exit(f"--representation is not supported for {args.dataset}")
+        rep = mod.get_representation(args.representation)
+        atom_types, bond_types = list(rep.atom_types), list(rep.bond_types)
+    else:
+        atom_types, bond_types = list(mod.ATOM_TYPES), list(mod.BOND_TYPES)
+    _, atom_decoder, _, bond_decoder = build_encoders(atom_types, bond_types)
+    print(f"{args.dataset}: atoms={atom_types} bonds={bond_types}"
+          + (f" [representation={rep.name}]" if rep else ""))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = DeFoGModel.load(args.ckpt).to(device)
     model.eval()
+
+    # Decoding with the wrong vocabulary produces plausible-looking garbage
+    # rather than an error, so check the channel counts before trusting any
+    # number this script prints.
+    dims = getattr(model, "output_dims", None) or {}
+    if dims:
+        n_x, n_e = int(dims.get("X", -1)), int(dims.get("E", -1))
+        if n_x != len(atom_types) or n_e != len(bond_types) + 1:
+            sys.exit(
+                f"VOCABULARY MISMATCH: checkpoint has {n_x} atom / {n_e} edge "
+                f"classes, but the selected vocabulary implies "
+                f"{len(atom_types)} / {len(bond_types) + 1}. Pass the "
+                f"--representation the checkpoint was trained with.")
+        print(f"vocabulary check OK: {n_x} atom classes, {n_e} edge classes")
     print(f"loaded {args.ckpt} on {device}; sampling {args.n} at "
           f"steps={args.steps} eta={args.eta}")
 
@@ -150,6 +178,8 @@ def main():
     if args.out:
         Path(args.out).write_text(json.dumps({
             "ckpt": args.ckpt, "dataset": args.dataset, "n": total,
+            "representation": (rep.name if rep else None),
+            "atom_types": atom_types, "bond_types": bond_types,
             "config": {"steps": args.steps, "eta": args.eta, "omega": args.omega},
             "counts": dict(counts), "top_messages": details.most_common(20),
             "ring_sizes_in_failures": dict(ring_sizes),

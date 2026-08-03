@@ -64,8 +64,26 @@ VAL_SIZE: int = 5000
 SPLIT_SEED: int = 42
 
 # --- Representation (protocol trap 6) ---
-ATOM_TYPES: list = list(mref.ATOM_TYPES)   # C N S O F Cl Br H
-BOND_TYPES: list = list(mref.BOND_TYPES)   # SINGLE DOUBLE TRIPLE AROMATIC
+# :param REPRESENTATION: Selects the graph vocabulary and the kekulize flag
+#     together, from defog.data.moses_reference.REPRESENTATIONS.
+#
+#     "aromatic_v1"  -- 8 atom types (incl. a never-used H), aromatic bonds.
+#                       What every MOSES artifact before 2026-08-03 used.
+#                       Default, so those checkpoints stay reproducible.
+#     "kekulized_v2" -- 7 atom types (H dropped), kekulized bonds.
+#
+#     The case for v2 is measured, not aesthetic. On the v1 base, 118 of 120
+#     hard validity failures are kekulization errors and exactly one is a
+#     valence error. An AROMATIC bond class is a promise about the whole ring
+#     system that RDKit checks by kekulizing, and the model makes it per-edge
+#     without being able to keep it. Dropping the class makes that failure
+#     impossible by construction; ZINC trains kekulized and reaches ~0.99
+#     validity against MOSES's ~0.90.
+#
+#     Changing this changes the channel count, so a checkpoint only decodes
+#     correctly under the representation it was trained with. The value is
+#     recorded in provenance and the model dims are asserted against it below.
+REPRESENTATION: str = "aromatic_v1"
 
 # :param GRAPH_CACHE_DIR:
 #     1.58M molecules is more than GuacaMol; re-encoding on every chained link
@@ -132,10 +150,16 @@ __DEBUG__: bool = False
 __TESTING__: bool = False
 
 
-def _cache_path(cache_dir, provenance, atom_types, bond_types):
+def _cache_path(cache_dir, provenance, rep):
+    """Cache key covers the vocabulary AND the kekulize flag.
+
+    Both belong in the key: a kekulized cache and an aromatic cache of the same
+    molecules are different tensors, and reusing one for the other would train
+    on silently mis-encoded data.
+    """
     key = "|".join([provenance.get("train_sha256", "?"),
-                    ",".join(atom_types), ",".join(bond_types),
-                    f"kekulize={mref.KEKULIZE}"])
+                    ",".join(rep.atom_types), ",".join(rep.bond_types),
+                    f"kekulize={rep.kekulize}"])
     return os.path.join(cache_dir,
                         "moses_graphs_%s.pt" % hashlib.sha256(key.encode()).hexdigest()[:16])
 
@@ -144,6 +168,12 @@ def _cache_path(cache_dir, provenance, atom_types, bond_types):
 def experiment(e: Experiment) -> None:
     e.log("MOSES UNCONDITIONAL -- E1 protocol")
     pl.seed_everything(e.SEED, workers=True)
+
+    rep = mref.get_representation(e.REPRESENTATION)
+    e.log(f"representation '{rep.name}': {len(rep.atom_types)} atom types "
+          f"{rep.atom_types}, bonds {rep.bond_types}, kekulize={rep.kekulize}")
+    if rep.note:
+        e.log(f"  ({rep.note})")
 
     # -- Official split -----------------------------------------------------
     split = mref.load_reference_split(
@@ -159,8 +189,7 @@ def experiment(e: Experiment) -> None:
     cache_file = None
     if e.GRAPH_CACHE_DIR:
         os.makedirs(e.GRAPH_CACHE_DIR, exist_ok=True)
-        cache_file = _cache_path(e.GRAPH_CACHE_DIR, split.provenance,
-                                 e.ATOM_TYPES, e.BOND_TYPES)
+        cache_file = _cache_path(e.GRAPH_CACHE_DIR, split.provenance, rep)
 
     if cache_file and os.path.exists(cache_file):
         e.log(f"loading encoded graphs from cache {os.path.basename(cache_file)}")
@@ -170,10 +199,8 @@ def experiment(e: Experiment) -> None:
     else:
         e.log("encoding train split (slow; will be cached)")
         train_graphs, train_smiles, n_skip = mref.build_graphs(
-            split.train_smiles, atom_types=e.ATOM_TYPES, bond_types=e.BOND_TYPES,
-            progress=True)
-        val_graphs, _, _ = mref.build_graphs(
-            split.val_smiles, atom_types=e.ATOM_TYPES, bond_types=e.BOND_TYPES)
+            split.train_smiles, representation=rep, progress=True)
+        val_graphs, _, _ = mref.build_graphs(split.val_smiles, representation=rep)
         if cache_file:
             tmp = cache_file + ".partial"
             torch.save({"train_graphs": train_graphs, "train_smiles": train_smiles,
@@ -184,10 +211,11 @@ def experiment(e: Experiment) -> None:
     e.log(f"train graphs {len(train_graphs)} (skipped {n_skip}) | val {len(val_graphs)}")
     if n_skip > 0.001 * max(1, len(split.train_smiles)):
         e.log(f"WARNING: {n_skip} molecules failed to encode; expected ~0 under the "
-              f"frozen 8-element vocabulary.")
+              f"'{rep.name}' vocabulary.")
     e["provenance/encoding"] = {
-        "atom_types": list(e.ATOM_TYPES), "bond_types": list(e.BOND_TYPES),
-        "aromatic": mref.AROMATIC, "kekulize": mref.KEKULIZE,
+        "representation": rep.name, "representation_note": rep.note,
+        "atom_types": list(rep.atom_types), "bond_types": list(rep.bond_types),
+        "aromatic": rep.aromatic, "kekulize": rep.kekulize,
         "filter_roundtrip": False,   # configs/dataset/moses.yaml: filter: False
         "n_train_graphs": len(train_graphs), "n_val_graphs": len(val_graphs),
         "n_skipped": n_skip,
@@ -206,8 +234,8 @@ def experiment(e: Experiment) -> None:
         n_heads=e.N_HEADS, dropout=e.DROPOUT, noise_type=e.NOISE_TYPE,
         extra_features_type=e.EXTRA_FEATURES_TYPE, rrwp_steps=e.RRWP_STEPS,
         molecular_features=e.MOLECULAR_FEATURES,
-        atom_valencies=[e.ATOM_VALENCY[a] for a in e.ATOM_TYPES],
-        atom_weights=[e.ATOM_WEIGHT_TABLE[a] for a in e.ATOM_TYPES],
+        atom_valencies=[e.ATOM_VALENCY[a] for a in rep.atom_types],
+        atom_weights=[e.ATOM_WEIGHT_TABLE[a] for a in rep.atom_types],
         max_atom_weight=e.MAX_ATOM_WEIGHT,
         lr=e.LEARNING_RATE, weight_decay=e.WEIGHT_DECAY,
         lambda_edge=e.LAMBDA_EDGE, train_time_distortion=e.TRAIN_TIME_DISTORTION,
@@ -215,6 +243,18 @@ def experiment(e: Experiment) -> None:
         sample_steps=e.SAMPLE_STEPS, eta=e.ETA, omega=e.OMEGA,
         sample_time_distortion=e.SAMPLE_TIME_DISTORTION,
     )
+    # The model infers its channel counts from the data, so a mismatch here
+    # means the encoded graphs do not match the declared vocabulary. That would
+    # not raise anywhere downstream -- it would just decode to the wrong atoms
+    # for the rest of the checkpoint's life -- so assert it while it is cheap.
+    if not rep.matches_model(model):
+        raise RuntimeError(
+            f"model classes {getattr(model, 'output_dims', {})} do not match "
+            f"representation '{rep.name}' ({len(rep.atom_types)} atom types, "
+            f"{len(rep.bond_types)} bond types + 1 no-bond). A stale graph cache "
+            f"is the usual cause.")
+    e.log(f"representation check OK: model dims agree with '{rep.name}'")
+
     e["model/num_params"] = sum(p.numel() for p in model.parameters())
     e.log(f"Model params: {e['model/num_params']:,}")
     e["provenance/size_distribution"] = {
@@ -224,7 +264,7 @@ def experiment(e: Experiment) -> None:
     }
 
     # -- Train --------------------------------------------------------------
-    _, atom_decoder, _, bond_decoder = build_encoders(e.ATOM_TYPES, e.BOND_TYPES)
+    _, atom_decoder, _, bond_decoder = rep.encoders()
 
     def probe_metrics(samples):
         rep = validity_report(samples, atom_decoder, bond_decoder,

@@ -79,15 +79,16 @@ import experiments.training__moses_e1 as exp
 
 split = mr.load_reference_split()
 os.makedirs(exp.GRAPH_CACHE_DIR, exist_ok=True)
-path = exp._cache_path(exp.GRAPH_CACHE_DIR, split.provenance,
-                       exp.ATOM_TYPES, exp.BOND_TYPES)
+# Representation must match what the arms below run with, or they will rebuild
+# a different cache and this warm-up was wasted work.
+rep = mr.get_representation(os.environ.get("REPRESENTATION") or exp.REPRESENTATION)
+print("warming cache for representation:", rep.name, flush=True)
+path = exp._cache_path(exp.GRAPH_CACHE_DIR, split.provenance, rep)
 if os.path.exists(path):
     print("cache already present:", os.path.basename(path), flush=True)
 else:
-    tr_g, tr_s, n_skip = mr.build_graphs(
-        split.train_smiles, atom_types=exp.ATOM_TYPES, bond_types=exp.BOND_TYPES)
-    va_g, _, _ = mr.build_graphs(
-        split.val_smiles, atom_types=exp.ATOM_TYPES, bond_types=exp.BOND_TYPES)
+    tr_g, tr_s, n_skip = mr.build_graphs(split.train_smiles, representation=rep)
+    va_g, _, _ = mr.build_graphs(split.val_smiles, representation=rep)
     tmp = path + ".partial"
     torch.save({"train_graphs": tr_g, "train_smiles": tr_s,
                 "val_graphs": va_g, "n_skipped": n_skip}, tmp)

@@ -80,6 +80,103 @@ BOND_TYPES: List[str] = ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
 AROMATIC = True
 KEKULIZE = False
 
+
+# ===========================================================================
+# Representations
+# ===========================================================================
+@dataclass(frozen=True)
+class Representation:
+    """How MOSES molecules are encoded as graphs.
+
+    This is a *model-side* choice, not an evaluation choice -- the E1 protocol
+    scores SMILES, so changing it does not affect comparability with published
+    baselines. It does change the channel count, which means a checkpoint and
+    the representation it was trained under must travel together: decoding with
+    the wrong one mis-decodes silently rather than raising. ``matches_model``
+    exists to turn that into an error.
+    """
+
+    name: str
+    atom_types: List[str]
+    bond_types: List[str]
+    kekulize: bool
+    note: str = ""
+
+    @property
+    def aromatic(self) -> bool:
+        return "AROMATIC" in self.bond_types
+
+    def encoders(self):
+        from defog.domains.molecule import build_encoders
+
+        return build_encoders(list(self.atom_types), list(self.bond_types))
+
+    def matches_model(self, model) -> bool:
+        """True iff the model's node/edge class counts fit this vocabulary.
+
+        Reads ``output_dims``, not ``input_dims``: the latter is padded with
+        RRWP/molecular/time features, so it does not equal the vocabulary size.
+        Edge classes carry an extra 'no bond' class at index 0, which is why the
+        bond comparison is off by one.
+        """
+        try:
+            dims = getattr(model, "output_dims", None) or {}
+            n_x, n_e = int(dims["X"]), int(dims["E"])
+        except Exception:                                   # noqa: BLE001
+            return True          # cannot tell -> do not block the caller
+        return n_x == len(self.atom_types) and n_e == len(self.bond_types) + 1
+
+
+#: The representation every MOSES artifact before 2026-08-03 was trained under.
+#: Kept as the default so existing checkpoints (moses_e1_seed*, moses_rl*,
+#: moses_rlpen*) keep decoding correctly.
+AROMATIC_V1 = Representation(
+    name="aromatic_v1",
+    atom_types=list(ATOM_TYPES),
+    bond_types=list(BOND_TYPES),
+    kekulize=KEKULIZE,
+    note="original: 8 atom types including a never-used H, aromatic bonds",
+)
+
+#: Kekulized, with the dead hydrogen class removed. Two measured motivations:
+#:
+#: 1. 118 of 120 hard validity failures on the aromatic base are kekulization
+#:    errors and exactly one is a valence error (scripts/diagnose_validity.py).
+#:    An AROMATIC bond class is a promise about the whole ring system that RDKit
+#:    checks by kekulizing; the model asserts it per-edge and cannot keep it.
+#:    Removing the class makes that failure impossible by construction. ZINC
+#:    trains this way and reaches ~0.99 validity.
+#: 2. 'H' never appears as an atom in MOSES. Verified across a random 200,000
+#:    train molecules AND all 220 whose SMILES literally contain "[H]" -- RDKit
+#:    folds those into implicit hydrogen counts, so the graph never holds one.
+#:    (Those 220 are almost all imino tautomers, 214 exocyclic N-H double-bonded
+#:    to an aromatic ring; the amino/imino distinction lives in bond order,
+#:    which the graph does carry, so nothing is lost by dropping the class.)
+#:
+#: Encoding is lossless: 50,000 random train molecules and all 220 "[H]" cases
+#: round-trip to identical canonical SMILES, with zero encode failures.
+KEKULIZED_V2 = Representation(
+    name="kekulized_v2",
+    atom_types=["C", "N", "S", "O", "F", "Cl", "Br"],
+    bond_types=["SINGLE", "DOUBLE", "TRIPLE"],
+    kekulize=True,
+    note="kekulized bonds, dead H class removed (7 atom types)",
+)
+
+REPRESENTATIONS = {r.name: r for r in (AROMATIC_V1, KEKULIZED_V2)}
+DEFAULT_REPRESENTATION = "aromatic_v1"
+
+
+def get_representation(name=None) -> Representation:
+    if name is None:
+        name = DEFAULT_REPRESENTATION
+    if isinstance(name, Representation):
+        return name
+    if name not in REPRESENTATIONS:
+        raise ReferenceDataError(
+            f"unknown MOSES representation {name!r}; have {sorted(REPRESENTATIONS)}")
+    return REPRESENTATIONS[name]
+
 DEFAULT_VAL_SIZE = 5000
 DEFAULT_SPLIT_SEED = 42
 
@@ -297,18 +394,33 @@ def build_graphs(
     *,
     atom_types: Optional[List[str]] = None,
     bond_types: Optional[List[str]] = None,
+    representation=None,
     progress: bool = False,
 ):
-    """SMILES -> PyG graphs against the frozen MOSES vocabulary.
+    """SMILES -> PyG graphs against a MOSES vocabulary.
 
     ``configs/dataset/moses.yaml`` sets ``filter: False``, so unlike GuacaMol
     there is no round-trip filter here. Returns ``(graphs, kept_smiles,
     n_skipped)``; skips are reported rather than swallowed.
+
+    ``representation`` selects the vocabulary *and* the kekulize flag together,
+    which is the point: those two must agree or every aromatic molecule silently
+    fails to encode. Passing ``atom_types``/``bond_types`` explicitly still
+    works for backwards compatibility, but then the kekulize flag is inferred
+    from whether the bond set contains AROMATIC rather than assumed -- the old
+    code read a module-level constant, which was correct only for the default.
     """
     from defog.domains.molecule import build_encoders, smiles_to_pyg_data
 
-    atom_types = list(atom_types if atom_types is not None else ATOM_TYPES)
-    bond_types = list(bond_types if bond_types is not None else BOND_TYPES)
+    if representation is not None:
+        rep = get_representation(representation)
+        atom_types = list(rep.atom_types)
+        bond_types = list(rep.bond_types)
+        kekulize = rep.kekulize
+    else:
+        atom_types = list(atom_types if atom_types is not None else ATOM_TYPES)
+        bond_types = list(bond_types if bond_types is not None else BOND_TYPES)
+        kekulize = "AROMATIC" not in bond_types
     atom_encoder, _, bond_encoder, _ = build_encoders(atom_types, bond_types)
 
     iterator = smiles_list
@@ -319,7 +431,7 @@ def build_graphs(
 
     graphs, kept, skipped = [], [], 0
     for smi in iterator:
-        data = smiles_to_pyg_data(smi, atom_encoder, bond_encoder, kekulize=KEKULIZE)
+        data = smiles_to_pyg_data(smi, atom_encoder, bond_encoder, kekulize=kekulize)
         if data is None:
             skipped += 1
             continue
