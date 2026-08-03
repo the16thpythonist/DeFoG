@@ -340,7 +340,7 @@ def evaluate(model, atom_decoder, bond_decoder, n_samples, steps, eta, omega,
 
 @Experiment(base_path=folder_path(__file__), namespace=file_namespace(__file__), glob=globals())
 def experiment(e: Experiment) -> None:
-    e.log("GDPO sanity RL on a ZINC E1 base")
+    e.log(f"GDPO sanity RL on a {e.DATASET} E1 base")
     torch.manual_seed(e.SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
