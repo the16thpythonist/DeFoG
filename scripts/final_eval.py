@@ -42,7 +42,8 @@ from defog.core import DeFoGModel
 from defog.data import guacamol_reference as gmref
 from defog.data import moses_reference as mref
 from defog.data import zinc_reference as zref
-from defog.domains.molecule import build_encoders, validity_report
+from defog.data import vocabulary
+from defog.domains.molecule import validity_report
 
 REFERENCES = {"zinc": zref, "guacamol": gmref, "moses": mref}
 
@@ -51,6 +52,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True, help="Checkpoint WITHOUT .ckpt suffix")
     ap.add_argument("--dataset", required=True, choices=sorted(REFERENCES))
+    ap.add_argument("--representation", default=None,
+                    help="MOSES only: 'aromatic_v1' (default) or 'kekulized_v2'. "
+                         "Must match what the checkpoint was trained with; a "
+                         "mismatch is refused rather than silently mis-decoded.")
     ap.add_argument("--tag", required=True, help="e.g. seed42; names the outputs")
     # No defaults on purpose -- see the module docstring.
     ap.add_argument("--sample-steps", type=int, required=True)
@@ -70,7 +75,6 @@ def main() -> int:
     args = ap.parse_args()
 
     mod = REFERENCES[args.dataset]
-    _, atom_decoder, _, bond_decoder = build_encoders(mod.ATOM_TYPES, mod.BOND_TYPES)
     os.makedirs(args.out_dir, exist_ok=True)
 
     split = mod.load_reference_split()
@@ -96,6 +100,10 @@ def main() -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = DeFoGModel.load(args.ckpt).to(device).eval()
     print(f"loaded {args.ckpt} on {device}", flush=True)
+    (_atoms, _bonds, atom_decoder, bond_decoder,
+     _rep, _msg) = vocabulary.resolve_and_check(mod, model, args.representation)
+    print(f"{_msg} | atoms={_atoms} bonds={_bonds}"
+          + (f" [representation={_rep.name}]" if _rep else ""), flush=True)
     print(f"FROZEN CONFIG: steps={args.sample_steps} eta={args.eta} "
           f"omega={args.omega} distortion={args.time_distortion} "
           f"n={args.num_samples}", flush=True)

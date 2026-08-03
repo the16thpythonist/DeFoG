@@ -40,8 +40,8 @@ import torch  # noqa: E402
 from rdkit import Chem, RDLogger  # noqa: E402
 
 from defog.core import DeFoGModel  # noqa: E402
-from defog.core.data import dense_to_pyg  # noqa: E402
-from defog.domains.molecule import build_encoders, pyg_data_to_mol  # noqa: E402
+from defog.data import vocabulary  # noqa: E402
+from defog.domains.molecule import pyg_data_to_mol  # noqa: E402
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -92,35 +92,21 @@ def main():
     import importlib
     mod = importlib.import_module(f"defog.data.{REFERENCES[args.dataset]}")
 
-    rep = None
-    if args.representation is not None:
-        if not hasattr(mod, "get_representation"):
-            sys.exit(f"--representation is not supported for {args.dataset}")
-        rep = mod.get_representation(args.representation)
-        atom_types, bond_types = list(rep.atom_types), list(rep.bond_types)
-    else:
-        atom_types, bond_types = list(mod.ATOM_TYPES), list(mod.BOND_TYPES)
-    _, atom_decoder, _, bond_decoder = build_encoders(atom_types, bond_types)
-    print(f"{args.dataset}: atoms={atom_types} bonds={bond_types}"
-          + (f" [representation={rep.name}]" if rep else ""))
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = DeFoGModel.load(args.ckpt).to(device)
     model.eval()
 
     # Decoding with the wrong vocabulary produces plausible-looking garbage
-    # rather than an error, so check the channel counts before trusting any
-    # number this script prints.
-    dims = getattr(model, "output_dims", None) or {}
-    if dims:
-        n_x, n_e = int(dims.get("X", -1)), int(dims.get("E", -1))
-        if n_x != len(atom_types) or n_e != len(bond_types) + 1:
-            sys.exit(
-                f"VOCABULARY MISMATCH: checkpoint has {n_x} atom / {n_e} edge "
-                f"classes, but the selected vocabulary implies "
-                f"{len(atom_types)} / {len(bond_types) + 1}. Pass the "
-                f"--representation the checkpoint was trained with.")
-        print(f"vocabulary check OK: {n_x} atom classes, {n_e} edge classes")
+    # rather than an error, so this refuses rather than reporting numbers that
+    # describe nothing.
+    try:
+        (atom_types, bond_types, atom_decoder, bond_decoder,
+         rep, msg) = vocabulary.resolve_and_check(mod, model, args.representation)
+    except vocabulary.VocabularyMismatch as exc:
+        sys.exit(f"VOCABULARY MISMATCH: {exc}")
+    print(f"{args.dataset}: atoms={atom_types} bonds={bond_types}"
+          + (f" [representation={rep.name}]" if rep else ""))
+    print(msg)
     print(f"loaded {args.ckpt} on {device}; sampling {args.n} at "
           f"steps={args.steps} eta={args.eta}")
 
