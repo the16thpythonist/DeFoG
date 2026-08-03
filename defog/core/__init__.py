@@ -97,6 +97,7 @@ from .guidance import (
 )
 from .feynman_kac import FeynmanKacSampler, JointGuidanceSampler, predict_clean
 from .property_head import PropertyHead, LearnedPropertyEnergy, fit_property_head
+from .spectrum import Band, SpectrumEnergy, band_masses
 from .rl import (
     GDPOTrainer,
     AdapterGDPOTrainer,
@@ -191,6 +192,10 @@ __all__ = [
     "ExactGuidance",
     "CompositeGuidance",
     "MultiPropertyEnergy",
+    # Vibrational-spectrum steering
+    "Band",
+    "SpectrumEnergy",
+    "band_masses",
     "GuidanceModule",
     "AmortizedPropertyGuidanceModule",
     "LatentGuidanceModule",
