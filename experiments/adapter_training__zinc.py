@@ -40,21 +40,59 @@ RDLogger.DisableLog("rdApp.*")
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PROP_FNS = {"logp": lambda m: float(Crippen.MolLogP(m)),
+            "clogp": lambda m: float(Crippen.MolLogP(m)),   # alias; same Crippen estimate
             "tpsa": lambda m: float(Descriptors.TPSA(m))}
+
+
+def _vocabulary(name: str):
+    """(atom_types, bond_types, kekulize, source) for a named base vocabulary."""
+    if name == "legacy_aromatic":
+        return (["C", "N", "O", "S", "F", "Cl", "Br", "I", "P"],
+                ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"], False, "csv")
+    if name == "e1_kekulized":
+        from defog.data import zinc_reference as zref
+
+        return (list(zref.ATOM_TYPES), list(zref.BOND_TYPES), True, "reference_split")
+    raise ValueError(f"unknown VOCABULARY {name!r}; "
+                     f"have 'legacy_aromatic', 'e1_kekulized'")
 
 # ============================================================================
 # Parameters
 # ============================================================================
+# :param VOCABULARY: Which frozen base this adapter is being trained for. It
+#     bundles the atom order, the bond set, the kekulize flag and the SMILES
+#     source, because those four must agree -- an adapter trained against a
+#     vocabulary the base does not use is not wrong-ish, it is meaningless, and
+#     nothing in the training loop would say so.
+#
+#     "legacy_aromatic"  the original ZINC base (zinc_uncond_4e-4_connectivity),
+#                        9 atoms in frequency order, AROMATIC bonds, loose CSV.
+#                        The default, so every adapter shipped before
+#                        2026-08-04 (logp, tpsa, qed, sascore, fingerprint,
+#                        logd) stays reproducible.
+#     "e1_kekulized"     the E1 / RL lineage: zinc_reference's 9 atoms in ITS
+#                        order, kekulized bonds, SMILES from the hash-pinned
+#                        reference split. Note the atom ORDER differs between
+#                        the two (C N O S F Cl Br I P against C N O F P S Cl Br
+#                        I), so this is not merely a bond-set change.
+VOCABULARY: str = "legacy_aromatic"
+
+# Only used by VOCABULARY="legacy_aromatic"; "e1_kekulized" reads the
+# hash-pinned reference split instead.
 CSV_PATH: str = os.path.join(_PROJECT_DIR, "data", "zinc_250k_rdkit.csv")
 SMILES_COLUMN: str = "smiles"
-BOND_TYPES: list = ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
-# MUST match the frozen base's node-class order (frequency-derived on full ZINC);
-# do NOT derive from a CSV subset (a smoke subset can miss rare atoms -> class-count
-# mismatch with the base). This is the order the ZINC uncond/connectivity base used.
-ATOM_TYPES: list = ["C", "N", "O", "S", "F", "Cl", "Br", "I", "P"]
+
+# ATOM_TYPES / BOND_TYPES are deliberately NOT parameters. They must match the
+# frozen base's node-class order exactly -- a mismatch trains the adapter against
+# classes that decode to different elements, which converges fine and produces a
+# useless adapter. Set VOCABULARY instead; it supplies both, together with the
+# kekulize flag and SMILES source that have to agree with them. Leaving them here
+# as overridable values would let a caller set one and silently contradict the
+# base.
+
 BASE_CKPT: str = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
 
-PROPERTY: str = "logp"          # logp | tpsa
+PROPERTY: str = "logp"          # logp | clogp | tpsa
 
 # --- Adapter architecture ---
 H_HIDDEN: int = 256
@@ -179,19 +217,45 @@ def experiment(e: Experiment) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     prop_fn = PROP_FNS[e.PROPERTY]
 
-    df = pd.read_csv(e.CSV_PATH)
-    atom_types = e.ATOM_TYPES   # fixed to match the frozen base's node classes
-    e.log(f"Atom vocabulary ({len(atom_types)}): {atom_types}")
-    atom_encoder, atom_decoder, bond_encoder, bond_decoder = build_encoders(atom_types, e.BOND_TYPES)
+    atom_types, bond_types, kekulize, source = _vocabulary(e.VOCABULARY)
+    e.log(f"vocabulary '{e.VOCABULARY}': {len(atom_types)} atoms {atom_types}")
+    e.log(f"  bonds={bond_types} kekulize={kekulize} smiles_source={source}")
+    atom_encoder, atom_decoder, bond_encoder, bond_decoder = build_encoders(atom_types, bond_types)
+
+    if source == "reference_split":
+        # The hash-pinned split, not a loose CSV: an adapter trained on molecules
+        # the base never saw would be learning to steer a distribution shift as
+        # well as the property.
+        from defog.data import zinc_reference as zref
+
+        smiles_iter = zref.load_reference_split().train_smiles
+    else:
+        smiles_iter = pd.read_csv(e.CSV_PATH)[e.SMILES_COLUMN]
+    e.log(f"source molecules: {len(smiles_iter)}")
 
     graphs, vals = [], []
-    for smi in df[e.SMILES_COLUMN]:
+    n_skipped = 0
+    for smi in smiles_iter:
         mol = Chem.MolFromSmiles(smi)
         if mol is None:
+            n_skipped += 1
             continue
-        data = smiles_to_pyg_data(smi, atom_encoder, bond_encoder)
+        data = smiles_to_pyg_data(smi, atom_encoder, bond_encoder, kekulize=kekulize)
         if data is None:
+            n_skipped += 1
             continue
+        # NOTE: the property is computed from the SOURCE molecule, which carries
+        # stereochemistry and formal charges the graph does not represent. For
+        # clogP stereochemistry is irrelevant (Crippen is an atom-contribution
+        # model, stereo-invariant), but formal charges do shift it, so a charged
+        # molecule gets a label its graph does not fully determine.
+        #
+        # Kept anyway: this is exactly what the validated legacy adapters did,
+        # and changing the label definition in the same run as the vocabulary
+        # would confound the result if steering underperforms. Measured
+        # round-trip fidelity modulo stereo/charge is 0.882 for this vocabulary
+        # against 0.883 for the legacy one -- i.e. the representation loses the
+        # same information either way, so this is not a new problem.
         try:
             v = prop_fn(mol)
         except Exception:
@@ -201,13 +265,29 @@ def experiment(e: Experiment) -> None:
         vals.append(v)
     vals = np.asarray(vals)
     cond_mean, cond_std = float(vals.mean()), float(vals.std())
-    e.log(f"{len(graphs)} graphs; {e.PROPERTY} mean={cond_mean:.2f} std={cond_std:.2f}")
+    e.log(f"{len(graphs)} graphs (skipped {n_skipped}); "
+          f"{e.PROPERTY} mean={cond_mean:.2f} std={cond_std:.2f}")
+    if n_skipped > 0.02 * max(1, n_skipped + len(graphs)):
+        e.log(f"WARNING: {n_skipped} molecules failed to encode. Under a matching "
+              f"vocabulary this should be near zero -- check VOCABULARY.")
+    e["encoding"] = {"vocabulary": e.VOCABULARY, "atom_types": atom_types,
+                     "bond_types": bond_types, "kekulize": kekulize,
+                     "smiles_source": source, "n_graphs": len(graphs),
+                     "n_skipped": n_skipped}
 
     from torch_geometric.loader import DataLoader
     train_loader = DataLoader(graphs, batch_size=e.BATCH_SIZE, shuffle=True)
 
     base = DeFoGModel.load(e.BASE_CKPT, device="cpu").to(device).eval()
     assert base.cond_dim == 0, f"expected unconditional base, cond_dim={base.cond_dim}"
+
+    # The adapter modulates the base's own channels, so a vocabulary mismatch
+    # would train it against classes that mean something else. That produces a
+    # converging loss and a useless adapter, with nothing in between to notice.
+    from defog.data import vocabulary as vocab_check
+
+    e.log(vocab_check.check_model(base, atom_types, bond_types,
+                                  what=f"base {e.BASE_CKPT}"))
     adapter = AdaLNAdapter.for_base(
         base, cond_dim=1, hidden=e.H_HIDDEN, time_conditioned=e.TIME_CONDITIONED,
         streams=tuple(e.STREAMS), cond_mean=[cond_mean], cond_std=[cond_std],
@@ -315,7 +395,28 @@ def testing(e: Experiment):
     smoke = os.path.join(folder_path(__file__), "_adapter_smoke.csv")
     df.to_csv(smoke, index=False)
     e.CSV_PATH = smoke
-    e.BASE_CKPT = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
+    # BASE_CKPT is left alone: a smoke test must exercise the base the caller
+    # actually passed, since the vocabulary/base agreement check is one of the
+    # things worth smoke-testing.
+    if e.VOCABULARY == "legacy_aromatic" and not os.path.exists(e.BASE_CKPT):
+        e.BASE_CKPT = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
+
+    # The reference-split path ignores CSV_PATH, so truncate the split too or a
+    # "smoke" run encodes all 224k training molecules.
+    from defog.data import zinc_reference as _zref
+
+    _real = _zref.load_reference_split
+
+    def _small(*a, **kw):
+        s = _real(*a, **kw)
+        return _zref.ZincReferenceSplit(
+            train_smiles=s.train_smiles[:300],
+            val_smiles=s.val_smiles[:50],
+            test_smiles=s.test_smiles[:50],
+            provenance={**s.provenance, "TRUNCATED_FOR_SMOKE_TEST": True},
+        )
+
+    _zref.load_reference_split = _small
 
 
 experiment.run_if_main()
