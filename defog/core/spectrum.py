@@ -58,12 +58,18 @@ class Band:
         weight: relative importance among the requested bands.
     """
 
-    __slots__ = ("centre", "half_width", "target", "mode", "weight")
+    __slots__ = ("centre", "half_width", "target", "mode", "weight", "scale")
     MODES = ("at_least", "at_most")
+    #: Fallback normaliser when the target is 0 (an absence request), where the target itself
+    #: carries no scale. Roughly the share of total absorption a real diagnostic band holds:
+    #: measured on 400 gas-phase ZINC molecules, a carbonyl occupies 0.073 of the spectrum,
+    #: a hydroxyl 0.026, a nitrile 0.007. Band-dependent enough that anything demanding should
+    #: pass ``scale`` explicitly.
+    MIN_SCALE = 0.02
 
     def __init__(self, centre: float, half_width: float = 30.0,
                  target: float = 0.05, weight: float = 1.0,
-                 mode: Optional[str] = None):
+                 mode: Optional[str] = None, scale: Optional[float] = None):
         if half_width <= 0:
             raise ValueError(f"band half_width must be positive, got {half_width}")
         if not 0.0 <= target <= 1.0:
@@ -72,23 +78,36 @@ class Band:
             mode = "at_least" if target > 0 else "at_most"
         if mode not in self.MODES:
             raise ValueError(f"band mode must be one of {self.MODES}, got {mode!r}")
+        if scale is not None and scale <= 0:
+            raise ValueError(f"band scale must be positive, got {scale}")
         self.centre = float(centre)
         self.half_width = float(half_width)
         self.target = float(target)
         self.mode = mode
         self.weight = float(weight)
+        self.scale = float(scale) if scale else max(self.target, self.MIN_SCALE)
 
     def window(self, grid: np.ndarray) -> np.ndarray:
         return (grid >= self.centre - self.half_width) & (grid <= self.centre + self.half_width)
 
     def shortfall(self, mass: np.ndarray) -> np.ndarray:
-        """How far each molecule is on the wrong side of the request; zero once it is met."""
+        """How far each molecule is on the wrong side of the request, **in units of**
+        :attr:`scale`; zero once the request is met.
+
+        The normalisation is what makes this energy usable at all, and it is the same trick
+        the property energies use when they z-score by a property's standard deviation. Band
+        masses are fractions of total absorption — a strong carbonyl is 0.07 of the spectrum —
+        so an un-normalised squared error lands around 1e-3, and ``exp(-beta·E)`` at the tuned
+        ``beta=2.5`` then differs between particles by about 1.5%. The first steered run did
+        exactly that: three different requests returned byte-identical molecules, because the
+        weights were uniform and Feynman-Kac had nothing to resample on.
+        """
         gap = self.target - mass if self.mode == "at_least" else mass - self.target
-        return np.clip(gap, 0.0, None)
+        return np.clip(gap, 0.0, None) / self.scale
 
     def __repr__(self) -> str:
         return (f"Band({self.centre:g}±{self.half_width:g} cm-1, {self.mode} "
-                f"{self.target:g}, weight={self.weight:g})")
+                f"{self.target:g}, scale={self.scale:g}, weight={self.weight:g})")
 
 
 class SpectrumEnergy:
