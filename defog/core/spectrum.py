@@ -150,7 +150,11 @@ class SpectrumEnergy:
         """Energy per predicted spectrum, shape ``(n,)``. Separated from :meth:`__call__` so
         the scoring can be tested, and inspected in a UI, without a graph batch."""
         spectra = np.asarray(spectra, dtype=float)
-        spectra = np.clip(spectra, 0.0, None)
+        # NaN means "this phase cannot report here" -- a real predictor output, not a bug: a
+        # nujol mull masks the paraffin's own bands and a CCl4 solution its solvent windows.
+        # Treated as no absorption rather than propagated, because one NaN reaching the FK
+        # weights turns every particle's weight into NaN and takes the whole run with it.
+        spectra = np.clip(np.nan_to_num(spectra, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
         totals = spectra.sum(axis=1, keepdims=True)
         # A spectrum with no absorption anywhere carries no information about any band; it
         # scores as maximally wrong rather than dividing by zero.
