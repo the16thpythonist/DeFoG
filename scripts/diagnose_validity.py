@@ -83,6 +83,13 @@ def main():
     ap.add_argument("--eta", type=float, default=25.0)
     ap.add_argument("--omega", type=float, default=0.0)
     ap.add_argument("--chunk", type=int, default=256)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Torch seed for sampling. Set it to make a run "
+                         "reproducible, or to draw a controlled REPLICATE of the "
+                         "same model -- two seeds on one checkpoint measure the "
+                         "sampling noise directly, which is the only honest way "
+                         "to know whether a difference between two models means "
+                         "anything.")
     ap.add_argument("--out", default=None)
     ap.add_argument("--dump-smiles", default=None,
                     help="write the valid canonical SMILES here, for external "
@@ -91,6 +98,12 @@ def main():
 
     import importlib
     mod = importlib.import_module(f"defog.data.{REFERENCES[args.dataset]}")
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        print(f"sampling seed {args.seed}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = DeFoGModel.load(args.ckpt).to(device)
@@ -182,6 +195,7 @@ def main():
             "ckpt": args.ckpt, "dataset": args.dataset, "n": total,
             "representation": (rep.name if rep else None),
             "atom_types": atom_types, "bond_types": bond_types,
+            "sampling_seed": args.seed,
             "config": {"steps": args.steps, "eta": args.eta, "omega": args.omega},
             "counts": dict(counts), "top_messages": details.most_common(20),
             "ring_sizes_in_failures": dict(ring_sizes),
