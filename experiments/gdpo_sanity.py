@@ -76,6 +76,13 @@ _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #     than erroring -- ZINC is kekulized with 9 elements, GuacaMol aromatic with
 #     12, MOSES aromatic with 8.
 DATASET: str = "zinc"
+# :param REPRESENTATION: MOSES only -- "aromatic_v1" (dataset default) or
+#     "kekulized_v2". Must match what the base was trained with. Leaving it None
+#     uses the dataset module's own ATOM_TYPES/BOND_TYPES, which is correct for
+#     ZINC and GuacaMol and for aromatic MOSES bases. The value is checked
+#     against the checkpoint's channel counts at startup, so a wrong setting
+#     fails immediately rather than mis-decoding silently.
+REPRESENTATION: str = None
 BASE_CKPT: str = os.path.join(_PROJECT_DIR, "ckpts", "zinc_e1_seed42", "best_model")
 OUT_CKPT_DIR: str = os.path.join(_PROJECT_DIR, "ckpts", "zinc_rl_seed42")
 SEED: int = 42
@@ -350,8 +357,6 @@ def experiment(e: Experiment) -> None:
     os.makedirs(e.OUT_CKPT_DIR, exist_ok=True)
 
     mod = REFERENCES[e.DATASET]
-    e.log(f"dataset={e.DATASET}: {len(mod.ATOM_TYPES)} atom types, bonds={mod.BOND_TYPES}")
-    _, atom_decoder, _, bond_decoder = build_encoders(mod.ATOM_TYPES, mod.BOND_TYPES)
     split = mod.load_reference_split()
     train_ref = set(split.train_smiles)
     # Validation only. The test split is not read here -- the E1 test pass
@@ -362,6 +367,22 @@ def experiment(e: Experiment) -> None:
 
     model = DeFoGModel.load(e.BASE_CKPT).to(device)
     e.log(f"loaded base {e.BASE_CKPT}")
+
+    # Resolve the vocabulary against the checkpoint rather than assuming the
+    # dataset default. MOSES now ships two representations with different
+    # channel counts (8 atom / 5 edge aromatic against 7 / 4 kekulized), and
+    # decoding with the wrong one does not raise -- it yields plausible
+    # molecules made of the wrong elements, which would then flow into the
+    # reward, the checkpoint selection and every reported number.
+    from defog.data import vocabulary
+
+    atom_types, bond_types, atom_decoder, bond_decoder, rep, msg = \
+        vocabulary.resolve_and_check(mod, model, e.REPRESENTATION,
+                                     what=f"base {e.BASE_CKPT}")
+    e.log(f"dataset={e.DATASET}: {len(atom_types)} atom types {atom_types}")
+    e.log(f"  bonds={bond_types}"
+          + (f" [representation={rep.name}]" if rep else " [dataset default]"))
+    e.log(f"  {msg}")
     domain = MoleculeDomain(atom_decoder, bond_decoder, reference_smiles=train_ref)
 
     # -- BEFORE --------------------------------------------------------------
@@ -504,6 +525,8 @@ def experiment(e: Experiment) -> None:
 
     e.commit_json("summary.json", {
         "dataset": e.DATASET,
+        "representation": (rep.name if rep else "dataset_default"),
+        "atom_types": list(atom_types), "bond_types": list(bond_types),
         "base_ckpt": e.BASE_CKPT, "out_ckpt": out_path, "seed": e.SEED,
         "selected_iter": best["iter"], "selected_smoothed_score": best["score"],
         "select_key": select_key,
