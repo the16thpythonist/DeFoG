@@ -77,6 +77,34 @@ def _vocabulary(name: str):
 #                        I), so this is not merely a bond-set change.
 VOCABULARY: str = "legacy_aromatic"
 
+# :param PROPERTY_FROM: Which molecule the conditioning label describes.
+#
+#     "source"   the input SMILES, exactly as it appears in the dataset.
+#     "decoded"  the molecule the GRAPH actually represents, i.e. encode ->
+#                decode -> measure.
+#
+#     These differ because a DeFoG graph stores atoms and bonds but NOT formal
+#     charges or stereochemistry. 33% of ZINC carries a formal charge, and
+#     protonated amines and carboxylates are precisely what make a molecule
+#     low-logP -- so stripping the charge moves clogP up, and only at the low
+#     end. Measured on ZINC train:
+#
+#         5th pct:   source -0.90   graph +0.73   error +1.64   92.5% charged
+#         95th pct:  source +4.90   graph +4.90   error -0.00    7.0% charged
+#
+#     Under "source" the adapter is trained on (graph, label) pairs where the
+#     low-end labels describe something the graph is not, so asking it for -0.1
+#     yields ~1.4. That is not a broken adapter -- the training graphs labelled
+#     -0.1 genuinely are ~+0.7 -- it is a miscalibrated target scale.
+#
+#     "decoded" does NOT give the model new reach. It cannot generate clogP
+#     -0.1; that region needs charges the representation cannot express. What
+#     it does is make the declared range honest (~0.8 to 4.9 rather than -0.1
+#     to 4.5), so a requested target means what it says.
+#
+#     Default is "source" so the six already-shipped adapters stay reproducible.
+PROPERTY_FROM: str = "source"
+
 # Only used by VOCABULARY="legacy_aromatic"; "e1_kekulized" reads the
 # hash-pinned reference split instead.
 CSV_PATH: str = os.path.join(_PROJECT_DIR, "data", "zinc_250k_rdkit.csv")
@@ -217,9 +245,16 @@ def experiment(e: Experiment) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     prop_fn = PROP_FNS[e.PROPERTY]
 
+    if e.PROPERTY_FROM not in ("source", "decoded"):
+        raise ValueError(f"PROPERTY_FROM must be 'source' or 'decoded', "
+                         f"got {e.PROPERTY_FROM!r}")
     atom_types, bond_types, kekulize, source = _vocabulary(e.VOCABULARY)
     e.log(f"vocabulary '{e.VOCABULARY}': {len(atom_types)} atoms {atom_types}")
     e.log(f"  bonds={bond_types} kekulize={kekulize} smiles_source={source}")
+    e.log(f"  property_from={e.PROPERTY_FROM}"
+          + ("  (label describes the GRAPH, charges dropped)"
+             if e.PROPERTY_FROM == "decoded"
+             else "  (label describes the SOURCE SMILES, charges included)"))
     atom_encoder, atom_decoder, bond_encoder, bond_decoder = build_encoders(atom_types, bond_types)
 
     if source == "reference_split":
@@ -244,20 +279,20 @@ def experiment(e: Experiment) -> None:
         if data is None:
             n_skipped += 1
             continue
-        # NOTE: the property is computed from the SOURCE molecule, which carries
-        # stereochemistry and formal charges the graph does not represent. For
-        # clogP stereochemistry is irrelevant (Crippen is an atom-contribution
-        # model, stereo-invariant), but formal charges do shift it, so a charged
-        # molecule gets a label its graph does not fully determine.
-        #
-        # Kept anyway: this is exactly what the validated legacy adapters did,
-        # and changing the label definition in the same run as the vocabulary
-        # would confound the result if steering underperforms. Measured
-        # round-trip fidelity modulo stereo/charge is 0.882 for this vocabulary
-        # against 0.883 for the legacy one -- i.e. the representation loses the
-        # same information either way, so this is not a new problem.
+        # Label the SOURCE molecule or the one the graph actually represents.
+        # See PROPERTY_FROM: the two differ by up to 1.6 log units at the low
+        # end of clogP, because the graph drops formal charges.
+        target_mol = mol
+        if e.PROPERTY_FROM == "decoded":
+            decoded = pyg_data_to_mol(data, atom_decoder, bond_decoder)
+            smi_back = mol_to_smiles(decoded) if decoded is not None else None
+            target_mol = Chem.MolFromSmiles(smi_back) if smi_back else None
+            if target_mol is None:
+                # Cannot measure what the graph is, so cannot label it honestly.
+                n_skipped += 1
+                continue
         try:
-            v = prop_fn(mol)
+            v = prop_fn(target_mol)
         except Exception:
             continue
         data.cond = torch.tensor([[v]], dtype=torch.float)   # (1,1) RAW scalar condition
@@ -273,7 +308,7 @@ def experiment(e: Experiment) -> None:
     e["encoding"] = {"vocabulary": e.VOCABULARY, "atom_types": atom_types,
                      "bond_types": bond_types, "kekulize": kekulize,
                      "smiles_source": source, "n_graphs": len(graphs),
-                     "n_skipped": n_skipped}
+                     "n_skipped": n_skipped, "property_from": e.PROPERTY_FROM}
 
     from torch_geometric.loader import DataLoader
     train_loader = DataLoader(graphs, batch_size=e.BATCH_SIZE, shuffle=True)
