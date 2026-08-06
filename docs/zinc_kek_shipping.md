@@ -10,6 +10,7 @@ aromatic base, so its eight adapters keep working.
 | `molsmith/zinc-kek@1.0.0` | base | — | `4633ac4fa321` |
 | `molsmith/clogp@1.0.0` | adapter | `molsmith/zinc-kek` | `11184acb369d` |
 | `molsmith/clogp@1.1.0` | adapter | `molsmith/zinc-kek` | `5b5fb1539dd4` |
+| `molsmith/fingerprint@2.0.0` | adapter | `molsmith/zinc-kek` | `757a14b7e770` |
 
 Source checkpoint: `ckpts/zinc_rl2_seed42/best_model` -- the 2-round sanity-RL
 model, chosen over the E1 base for validity 0.9959 vs 0.9929, disconnected
@@ -146,3 +147,74 @@ The declared range moves from [-1.84, 6.75] to [-0.65, 6.30]. That is the fix,
 not a regression: the model cannot generate clogP -0.1, because that region
 needs charges the representation cannot express, and v1.0 advertised reach it
 did not have. v1.0.0 stays installed for reproducibility.
+
+
+## Fingerprint adapter (molsmith/fingerprint@2.0.0)
+
+zinc-kek had no fingerprint steering at all: `molsmith/fingerprint@1.0.0` is
+bound to the old aromatic base, whose schema differs in both bond set and atom
+order. Trained with `FP_FROM="decoded"` for the same reason as clogp@1.1.0 --
+Morgan bits encode formal charges, a graph does not store them, and 32% of ZINC
+carries one:
+
+    neutral molecules (68%)   Tanimoto(source, decoded) = 1.0000
+    charged molecules (32%)                              = 0.6813
+    overall                                              = 0.8990
+
+Unlike clogP, stereochemistry is irrelevant here, so the damage is confined
+entirely to charged molecules.
+
+Four LR arms, mean Tanimoto to target at guidance weight 1.0, decoded targets:
+
+| arm | LR | lift over baseline | validity |
+|---|---|---:|---:|
+| lr1 | 1e-4 | +0.162 | 0.9818 |
+| lr2 | 2e-4 | +0.157 | 0.9774 |
+| lr3 | 3e-4 | +0.175 | 0.9748 |
+| **lr4 (shipped)** | **4e-4** | **+0.173** | **0.9826** |
+
+lr3 had the nominally best lift, but its extra 0.002 is inside noise while its
+0.008 validity deficit is not -- so lr4 ships. That is exactly why validity was
+declared a guard in advance rather than picking on the headline number.
+
+Baseline (unconditional) Tanimoto to a held-out target is ~0.150; steering takes
+it to ~0.323. The old aromatic-base adapter achieved +0.12 on a different base,
+so this is at least not worse, though the two are not strictly comparable.
+
+**The charge ceiling turned out not to bind.** Scoring the same generated
+molecules against both conventions gives +0.173 (decoded) against +0.154
+(source) -- a gap of 0.019, far smaller than the 0.10 the 0.899 ceiling would
+imply. The reason is that achieved similarity (~0.32) is nowhere near the
+ceiling (~0.90), so the ceiling is not the limiting factor at this performance
+level. Worth knowing: the relabelling was still the correct convention and cost
+nothing, but its practical effect here is much smaller than it was for clogP.
+
+**CLI gap, unrelated to the adapter:** `molsmith sample --target` accepts a
+FLOAT only, so the CLI cannot drive a fingerprint adapter. The library API
+(`SamplingConfig(fingerprint=FingerprintTarget(reference_smiles=...))`) does,
+and that is the path the web tier uses.
+
+## GuacaMol: same defect, an order of magnitude smaller
+
+Ran the same failure diagnostic on the GuacaMol E1 base, 4 seeds, n=2048:
+
+| category | mean |
+|---|---:|
+| ok (valid AND connected) | 0.9412 |
+| **disconnected** | **0.0406** |
+| kekulize | 0.0125 |
+| valence | 0.0055 |
+
+Kekulization is 68.5% of *hard* failures, so GuacaMol has the same defect MOSES
+did -- but only 1.25 points of it, against MOSES's 10.8. A kekulized GuacaMol
+would take relaxed validity from ~0.980 to ~0.993, for a retrain comparable in
+cost to MOSES's 30 node-hours. **Not recommended for validity alone.**
+
+Two things this did NOT settle:
+
+* **The MOSES anomaly stands.** Same encoding, same dominant failure mode, but
+  MOSES had 9x the damage. Whatever made MOSES unusually prone to
+  unkekulizable output is still unidentified.
+* **GuacaMol's real problem is disconnection**, at 0.0406 -- three times its
+  kekulize rate and 69% of everything that is not "ok". Kekulizing would not
+  touch it, and the earlier GuacaMol sanity-RL run moved it not at all.
