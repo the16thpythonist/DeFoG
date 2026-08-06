@@ -22,6 +22,7 @@ Usage:
 import os
 import json
 import random
+import sys
 
 import numpy as np
 import pandas as pd
@@ -47,10 +48,46 @@ _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ============================================================================
 # Parameters
 # ============================================================================
+# :param VOCABULARY: Which frozen base this adapter targets. Bundles atom order,
+#     bond set, kekulize flag and SMILES source, because those four must agree
+#     -- see adapter_training__zinc.py for the same selector.
+#     "legacy_aromatic" is the original ZINC base; "e1_kekulized" is the E1/RL
+#     lineage behind molsmith/zinc-kek. The atom ORDER differs between them, not
+#     just the bond set, so this is not a cosmetic switch.
+VOCABULARY: str = "legacy_aromatic"
+
+# :param FP_FROM: Whether the conditioning fingerprint describes the SOURCE
+#     SMILES or the molecule the graph actually is.
+#
+#     Morgan bits encode formal charges. A DeFoG graph does not store them, and
+#     32% of ZINC molecules carry one. Measured over ZINC train, 512-bit r=2,
+#     Tanimoto( FP(source), FP(decoded) ):
+#
+#         neutral molecules (68%)   1.0000   <- identical, no loss whatsoever
+#         charged molecules (32%)   0.6813
+#         overall                   0.8990
+#
+#     Stereochemistry does not affect Morgan bits, so unlike clogP the damage is
+#     confined entirely to charged molecules -- and for those it is severe.
+#     "decoded" makes the fingerprint-to-graph mapping self-consistent at no
+#     cost to the 68% that were already exact.
+#
+#     That 0.899 is also a CEILING on the reported metric: a model reproducing a
+#     target graph perfectly still scores only 0.899 against a source-derived
+#     target fingerprint. The evaluation below reports against BOTH conventions
+#     so the ceiling is visible rather than silently absorbed into the score.
+FP_FROM: str = "source"
+
+# Only used by VOCABULARY="legacy_aromatic"; "e1_kekulized" reads the
+# hash-pinned reference split.
 CSV_PATH: str = os.path.join(_PROJECT_DIR, "data", "zinc_250k_rdkit.csv")
 SMILES_COLUMN: str = "smiles"
-BOND_TYPES: list = ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
-ATOM_TYPES: list = ["C", "N", "O", "S", "F", "Cl", "Br", "I", "P"]   # match frozen base
+
+# ATOM_TYPES / BOND_TYPES are deliberately NOT parameters: they must match the
+# frozen base exactly, and a mismatch trains against classes that decode to
+# different elements -- which converges fine and produces a useless adapter.
+# Set VOCABULARY instead.
+
 BASE_CKPT: str = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
 
 FP_BITS: int = 512      # 512-bit Morgan/ECFP4: far fewer bit collisions than 128 -> more
@@ -196,21 +233,62 @@ def experiment(e: Experiment) -> None:
     pl.seed_everything(e.SEED, workers=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    df = pd.read_csv(e.CSV_PATH)
-    atom_types = e.ATOM_TYPES
-    e.log(f"Atom vocabulary ({len(atom_types)}): {atom_types}")
-    atom_encoder, atom_decoder, bond_encoder, bond_decoder = build_encoders(atom_types, e.BOND_TYPES)
+    if e.FP_FROM not in ("source", "decoded"):
+        raise ValueError(f"FP_FROM must be 'source' or 'decoded', got {e.FP_FROM!r}")
 
-    graphs, smiles_kept = [], []
-    for smi in df[e.SMILES_COLUMN]:
-        data = smiles_to_pyg_data(smi, atom_encoder, bond_encoder)
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "_advoc", os.path.join(_PROJECT_DIR, "experiments", "adapter_training__zinc.py"))
+    _m = _ilu.module_from_spec(_spec)
+    sys.modules["_advoc"] = _m           # pycomex reads annotations off the module
+    _spec.loader.exec_module(_m)
+    atom_types, bond_types, kekulize, source = _m._vocabulary(e.VOCABULARY)
+
+    e.log(f"vocabulary '{e.VOCABULARY}': {len(atom_types)} atoms {atom_types}")
+    e.log(f"  bonds={bond_types} kekulize={kekulize} smiles_source={source}")
+    e.log(f"  fp_from={e.FP_FROM}"
+          + ("  (fingerprint describes the GRAPH)" if e.FP_FROM == "decoded"
+             else "  (fingerprint describes the SOURCE SMILES)"))
+    atom_encoder, atom_decoder, bond_encoder, bond_decoder = build_encoders(atom_types, bond_types)
+
+    if source == "reference_split":
+        from defog.data import zinc_reference as _zref
+        smiles_iter = _zref.load_reference_split().train_smiles
+    else:
+        smiles_iter = pd.read_csv(e.CSV_PATH)[e.SMILES_COLUMN]
+    e.log(f"source molecules: {len(smiles_iter)}")
+
+    # Both fingerprint conventions are computed for EVERY molecule: the training
+    # label uses FP_FROM, and the evaluation reports against both so the
+    # source-target ceiling stays visible instead of being absorbed silently.
+    graphs, smiles_kept, fp_src, fp_dec = [], [], [], []
+    for smi in smiles_iter:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        data = smiles_to_pyg_data(smi, atom_encoder, bond_encoder, kekulize=kekulize)
         if data is None:
             continue
+        dec_mol = pyg_data_to_mol(data, atom_decoder, bond_decoder)
+        back = mol_to_smiles(dec_mol) if dec_mol is not None else None
+        dec_mol = Chem.MolFromSmiles(back) if back else None
+        if dec_mol is None:
+            continue          # cannot describe the graph, so cannot label it
         graphs.append(data)
         smiles_kept.append(smi)
+        fp_src.append(mol_morgan_bits(mol, e.FP_RADIUS, e.FP_BITS))
+        fp_dec.append(mol_morgan_bits(dec_mol, e.FP_RADIUS, e.FP_BITS))
     M = len(graphs)
-    e.log(f"Converted {M} graphs; computing {e.FP_BITS}-bit Morgan FPs (r{e.FP_RADIUS}) ...")
-    fp = np.stack([mol_morgan_bits(Chem.MolFromSmiles(s), e.FP_RADIUS, e.FP_BITS) for s in smiles_kept])
+    fp_src = np.stack(fp_src); fp_dec = np.stack(fp_dec)
+    fp = fp_dec if e.FP_FROM == "decoded" else fp_src
+
+    inter = (fp_src * fp_dec).sum(1)
+    union = fp_src.sum(1) + fp_dec.sum(1) - inter
+    ceil = float(np.mean(inter / np.clip(union, 1e-9, None)))
+    e.log(f"{M} graphs; source-vs-decoded FP Tanimoto = {ceil:.4f} "
+          f"(the ceiling when scoring against SOURCE targets)")
+    e["fp/ceiling_source_vs_decoded"] = ceil
+    e["fp/from"] = e.FP_FROM
     cond_mean = fp.mean(0)
     cond_std = np.clip(fp.std(0), 1e-6, None)
     fp_t = torch.from_numpy(fp)
@@ -227,6 +305,13 @@ def experiment(e: Experiment) -> None:
 
     base = DeFoGModel.load(e.BASE_CKPT, device="cpu").to(device).eval()
     assert base.cond_dim == 0, f"expected unconditional base, cond_dim={base.cond_dim}"
+
+    # A vocabulary mismatch trains the adapter against classes that decode to
+    # different elements. It converges normally and produces a useless adapter,
+    # with nothing in the loop to notice.
+    from defog.data import vocabulary as _vocab
+    e.log(_vocab.check_model(base, atom_types, bond_types,
+                             what=f"base {e.BASE_CKPT}"))
     adapter = AdaLNAdapter.for_base(
         base, cond_dim=e.FP_BITS, hidden=e.H_HIDDEN, time_conditioned=e.TIME_CONDITIONED,
         streams=tuple(e.STREAMS), cond_mean=cond_mean, cond_std=cond_std,
@@ -274,9 +359,16 @@ def experiment(e: Experiment) -> None:
     base = base.to(device).eval()
     adapter = adapter.to(device).eval()
     tgt_idx = random.sample(holdout_idx, min(e.N_TARGETS, len(holdout_idx)))
+    # Condition on the TRAINING convention (that is what the adapter speaks),
+    # then score the same generated molecules against BOTH conventions. One
+    # sampling run, two measurements: the gap between them is exactly the
+    # charge ceiling, shown rather than absorbed.
     tgt_raw = [fp[i] for i in tgt_idx]
+    tgt_by_conv = {"decoded": [fp_dec[i] for i in tgt_idx],
+                   "source": [fp_src[i] for i in tgt_idx]}
     tgt_mols = [Chem.MolFromSmiles(smiles_kept[i]) for i in tgt_idx]
-    e.log(f"{len(tgt_idx)} target molecules")
+    e.log(f"{len(tgt_idx)} target molecules; conditioning on '{e.FP_FROM}' FPs, "
+          f"scoring against both conventions")
 
     base_sampler = Sampler(base, eta=e.ETA, omega=e.OMEGA, sample_steps=e.EVAL_STEPS, time_distortion=e.TIME_DISTORTION)
     bsamp, rem = [], e.N_BASELINE
@@ -288,29 +380,35 @@ def experiment(e: Experiment) -> None:
     e.log(f"baseline valid: {base_fp.shape[0]}/{e.N_BASELINE}")
 
     methods = ["baseline"] + [f"w={w}" for w in e.GUIDANCE_WEIGHTS]
-    agg = {m: [] for m in methods}
+    CONVS = ("decoded", "source")
+    agg = {c: {m: [] for m in methods} for c in CONVS}
     per_target = []
     for ti, (traw, tmol) in enumerate(zip(tgt_raw, tgt_mols)):
-        base_sims = tanimoto_to_target(base_fp, traw)
-        agg["baseline"].extend(base_sims.tolist())
         rec = {"index": int(tgt_idx[ti]), "smiles": smiles_kept[tgt_idx[ti]],
-               "baseline_mean_tanimoto": float(base_sims.mean()) if base_sims.size else None, "per_w": {}}
+               "baseline_mean_tanimoto": {}, "per_w": {}}
+        for c in CONVS:
+            bs = tanimoto_to_target(base_fp, tgt_by_conv[c][ti])
+            agg[c]["baseline"].extend(bs.tolist())
+            rec["baseline_mean_tanimoto"][c] = float(bs.mean()) if bs.size else None
         best_grid = None
         for w in e.GUIDANCE_WEIGHTS:
             samples = guided_sample(base, adapter, traw, w, e.N_PER_TARGET, e.EVAL_STEPS,
                                     e.ETA, e.OMEGA, e.TIME_DISTORTION, e.EVAL_CHUNK, device)
             mols, smis, gfp = decode_and_fp(samples, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS)
-            sims = tanimoto_to_target(gfp, traw)
-            agg[f"w={w}"].extend(sims.tolist())
-            rec["per_w"][str(w)] = {
-                "n_valid": len(mols), "n_unique": len(set(smis)),
-                "validity": len(mols) / len(samples) if samples else 0.0,
-                "mean_tanimoto": float(sims.mean()) if sims.size else None,
-                "median_tanimoto": float(np.median(sims)) if sims.size else None,
-                "max_tanimoto": float(sims.max()) if sims.size else None,
-            }
+            entry = {"n_valid": len(mols), "n_unique": len(set(smis)),
+                     "validity": len(mols) / len(samples) if samples else 0.0}
+            sims = None
+            for c in CONVS:
+                s = tanimoto_to_target(gfp, tgt_by_conv[c][ti])
+                agg[c][f"w={w}"].extend(s.tolist())
+                entry[f"mean_tanimoto_{c}"] = float(s.mean()) if s.size else None
+                entry[f"max_tanimoto_{c}"] = float(s.max()) if s.size else None
+                if c == "decoded":
+                    sims = s
+            rec["per_w"][str(w)] = entry
             e.log(f"  [t{ti}] w={w}: valid={len(mols)}/{len(samples)} uniq={len(set(smis))} "
-                  f"<T>={rec['per_w'][str(w)]['mean_tanimoto']} maxT={rec['per_w'][str(w)]['max_tanimoto']}")
+                  f"<T>decoded={entry['mean_tanimoto_decoded']} "
+                  f"<T>source={entry['mean_tanimoto_source']}")
             if abs(w - e.GRID_SCALE) < 1e-9 and mols:
                 order = np.argsort(-sims)[:e.GRID_N]
                 best_grid = ([tmol] + [mols[j] for j in order], ["TARGET"] + [f"T={sims[j]:.2f}" for j in order])
@@ -319,41 +417,61 @@ def experiment(e: Experiment) -> None:
                                  legends=best_grid[1]).save(os.path.join(e.path, f"grid_target{ti}.png"))
         per_target.append(rec)
 
-    base_mean = float(np.mean(agg["baseline"])) if agg["baseline"] else float("nan")
     summary = {"methods": methods, "n_targets": len(tgt_idx), "learning_rate": e.LEARNING_RATE,
                "eval_steps": e.EVAL_STEPS, "baseline_valid": int(base_fp.shape[0]),
+               "vocabulary": e.VOCABULARY, "fp_from": e.FP_FROM,
+               "ceiling_source_vs_decoded": ceil,
                "per_target": per_target, "aggregate": {}}
-    for m in methods:
-        mean = float(np.mean(agg[m])) if agg[m] else float("nan")
-        summary["aggregate"][m] = {"mean_tanimoto": mean, "lift_over_baseline": mean - base_mean}
+    e.log("=" * 60)
+    e.log(f"{'convention':12s}{'method':12s}{'<T>':>9s}{'lift':>9s}")
+    for c in CONVS:
+        base_mean = float(np.mean(agg[c]["baseline"])) if agg[c]["baseline"] else float("nan")
+        summary["aggregate"][c] = {}
+        for m in methods:
+            mean = float(np.mean(agg[c][m])) if agg[c][m] else float("nan")
+            summary["aggregate"][c][m] = {"mean_tanimoto": mean,
+                                          "lift_over_baseline": mean - base_mean}
+            e.log(f"{c:12s}{m:12s}{mean:>9.4f}{mean - base_mean:>+9.4f}")
+    e.log(f"ceiling when scoring against SOURCE targets: {ceil:.4f} "
+          f"(a perfect reproduction of the target GRAPH cannot beat this)")
     e.commit_json("adapter_fingerprint_metrics.json", summary)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    means = [summary["aggregate"][m]["mean_tanimoto"] for m in methods]
-    bars = ax.bar(methods, means, color=["0.6"] + ["#55a868"] * len(e.GUIDANCE_WEIGHTS))
-    ax.axhline(base_mean, ls="--", color="0.5", lw=1)
-    for b, mn in zip(bars, means):
-        ax.text(b.get_x() + b.get_width() / 2, mn, f"{mn:.3f}", ha="center", va="bottom", fontsize=9)
-    ax.set_ylabel("mean Tanimoto to target")
-    ax.set_title(f"FP adapter steering (LR={e.LEARNING_RATE}, {e.EVAL_STEPS} steps) | baseline<T>={base_mean:.3f}")
+    # Both conventions side by side, with the source-target ceiling drawn in --
+    # otherwise the source bars look like a failure rather than a known limit.
+    dec_mean = summary["aggregate"]["decoded"]["baseline"]["mean_tanimoto"]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x = np.arange(len(methods)); wdt = 0.38
+    for k, (c, col) in enumerate((("decoded", "#55a868"), ("source", "#4c72b0"))):
+        vals = [summary["aggregate"][c][m]["mean_tanimoto"] for m in methods]
+        bars = ax.bar(x + (k - 0.5) * wdt, vals, wdt, color=col, label=f"{c} targets")
+        for b, mn in zip(bars, vals):
+            ax.text(b.get_x() + b.get_width() / 2, mn, f"{mn:.3f}",
+                    ha="center", va="bottom", fontsize=8)
+    ax.axhline(ceil, ls=":", color="#c44e52", lw=1.4,
+               label=f"source-target ceiling {ceil:.3f}")
+    ax.set_xticks(x); ax.set_xticklabels(methods)
+    ax.set_ylabel("mean Tanimoto to target"); ax.legend(fontsize=8)
+    ax.set_title(f"FP adapter steering (LR={e.LEARNING_RATE}, {e.EVAL_STEPS} steps)")
     fig.tight_layout()
     e.commit_fig("method_comparison.png", fig)
 
     fig2, ax2 = plt.subplots(figsize=(9, 5.2))
     bins = np.linspace(0, 1, 41)
     for m in methods:
-        if agg[m]:
-            ax2.hist(agg[m], bins=bins, density=True, histtype="stepfilled", alpha=0.45,
-                     label=f"{m} (<T>={np.mean(agg[m]):.3f})")
+        if agg["decoded"][m]:
+            ax2.hist(agg["decoded"][m], bins=bins, density=True, histtype="stepfilled",
+                     alpha=0.45, label=f"{m} (<T>={np.mean(agg['decoded'][m]):.3f})")
     ax2.set_xlabel("Tanimoto to target"); ax2.set_ylabel("density")
-    ax2.set_title("FP adapter steering: Tanimoto-to-target by guidance weight")
+    ax2.set_title("FP adapter steering: Tanimoto to DECODED target by guidance weight")
     ax2.legend(fontsize=9); fig2.tight_layout()
     e.commit_fig("tanimoto_distributions.png", fig2)
 
     e.log("=" * 60)
-    for m in methods:
-        a = summary["aggregate"][m]
-        e.log(f"{m:10s} <T>={a['mean_tanimoto']:.3f}  lift={a['lift_over_baseline']:+.3f}")
+    for c in ("decoded", "source"):
+        for m in methods:
+            a = summary["aggregate"][c][m]
+            e.log(f"{c:8s} {m:10s} <T>={a['mean_tanimoto']:.3f}  "
+                  f"lift={a['lift_over_baseline']:+.3f}")
     e.log("Done.")
 
 
@@ -379,7 +497,22 @@ def testing(e: Experiment):
     smoke = os.path.join(folder_path(__file__), "_adapter_fp_smoke.csv")
     df.to_csv(smoke, index=False)
     e.CSV_PATH = smoke
-    e.BASE_CKPT = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
+    if e.VOCABULARY == "legacy_aromatic" and not os.path.exists(e.BASE_CKPT):
+        e.BASE_CKPT = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
+
+    # The reference-split path ignores CSV_PATH, so truncate it too or a "smoke"
+    # run encodes and double-fingerprints all 224k training molecules.
+    from defog.data import zinc_reference as _zr
+    _real = _zr.load_reference_split
+
+    def _small(*a, **kw):
+        s0 = _real(*a, **kw)
+        return _zr.ZincReferenceSplit(
+            train_smiles=s0.train_smiles[:300], val_smiles=s0.val_smiles[:50],
+            test_smiles=s0.test_smiles[:50],
+            provenance={**s0.provenance, "TRUNCATED_FOR_SMOKE_TEST": True})
+
+    _zr.load_reference_split = _small
 
 
 experiment.run_if_main()
