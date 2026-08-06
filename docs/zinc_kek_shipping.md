@@ -9,6 +9,7 @@ aromatic base, so its eight adapters keep working.
 |---|---|---|---|
 | `molsmith/zinc-kek@1.0.0` | base | — | `4633ac4fa321` |
 | `molsmith/clogp@1.0.0` | adapter | `molsmith/zinc-kek` | `11184acb369d` |
+| `molsmith/clogp@1.1.0` | adapter | `molsmith/zinc-kek` | `5b5fb1539dd4` |
 
 Source checkpoint: `ckpts/zinc_rl2_seed42/best_model` -- the 2-round sanity-RL
 model, chosen over the E1 base for validity 0.9959 vs 0.9929, disconnected
@@ -104,3 +105,44 @@ run. Not applied yet.
 - All eight old adapters still report compatible against `molsmith/zinc-base`.
 - ZINC encodes under the new vocabulary with zero failures; round-trip fidelity
   modulo stereo/charge is 0.882 against the legacy vocabulary's 0.883.
+
+
+## clogP v1.1.0 — the label defect, fixed
+
+v1.0 computed its conditioning label from the SOURCE SMILES. A DeFoG graph
+stores atoms and bonds but not formal charges, and 33% of ZINC carries one, so
+the low-end labels described molecules the graphs were not. v1.1.0 labels the
+DECODED molecule instead (`PROPERTY_FROM="decoded"`), changing that one variable
+and nothing else -- same base, vocabulary, LR x width grid and epochs.
+
+Steering at w=1.0, n~128, four arms:
+
+| arm | low MAE | high MAE |
+|---|---:|---:|
+| lr2h256 | 0.635 | 0.679 |
+| **lr4h256 (shipped)** | **0.631** | **0.663** |
+| lr2h512 | 0.710 | 0.788 |
+| lr4h512 | 0.649 | 0.683 |
+| *v1.0, all four* | *1.51 - 1.73* | *0.648 - 0.759* |
+
+**Low-end MAE improved 2.4-2.7x; the high end did not move.** That is exactly
+the pre-registered signature, and it matters that the high end held: the
+high-end labels were already correct (95th percentile is only 7% charged), so a
+large change there would have meant something other than the relabelling moved
+and the run was suspect rather than successful. An intermediate epoch-4 reading
+showed the high end apparently 25% better and was flagged as a possible
+confound; at the proper n=128 evaluation it was unchanged, so that was
+small-sample noise during early training.
+
+End-to-end through `molsmith sample`, 40 molecules per target, all valid:
+
+| target | v1.1.0 | v1.0.0 |
+|---:|---:|---:|
+| 1.0 | **1.04** | 2.09 |
+| 2.5 | **2.40** | 2.75 |
+| 4.5 | 4.09 | 4.38 |
+
+The declared range moves from [-1.84, 6.75] to [-0.65, 6.30]. That is the fix,
+not a regression: the model cannot generate clogP -0.1, because that region
+needs charges the representation cannot express, and v1.0 advertised reach it
+did not have. v1.0.0 stays installed for reproducibility.
