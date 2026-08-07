@@ -93,6 +93,27 @@ BASE_CKPT: str = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.c
 FP_BITS: int = 512      # 512-bit Morgan/ECFP4: far fewer bit collisions than 128 -> more
 FP_RADIUS: int = 2      # discriminative fingerprint + a cleaner Tanimoto signal
 
+# :param FP_COUNTS: Condition on how MANY times each substructure occurs, not
+#     merely whether it occurs.
+#
+#     A binary Morgan vector records presence only, which is why it calls hexane
+#     and eicosane 0.875 similar -- the same environments, different amounts.
+#     The v2.0.0 adapter inherited that blind spot, and it shows: steering
+#     quality falls off sharply with target size (corr(heavy atoms, lift) =
+#     -0.92 over six held-out targets), and its own analogues include molecules
+#     with the reference motif repeated twice scoring 0.705.
+#
+#     True uses GetHashedMorganFingerprint with **log1p** applied. The transform
+#     is not cosmetic: counts are small integers with a heavy tail, the adapter
+#     normalises per-bit by mean/std, and on a rare bit a raw count of 3 becomes
+#     roughly a ten-sigma input -- which is where FiLM conditioning destabilises.
+#
+#     MUST match molsmith's FingerprintSpec.counts for the shipped package.
+#     Serving an adapter the encoding it was not trained on raises nothing; it
+#     just steers badly. molsmith reads the flag from the package for that
+#     reason, so the two cannot drift apart once shipped.
+FP_COUNTS: bool = False
+
 # --- Adapter architecture ---
 H_HIDDEN: int = 256
 TIME_CONDITIONED: bool = True
@@ -144,13 +165,35 @@ __TESTING__: bool = False
 # ============================================================================
 # Helpers
 # ============================================================================
-def mol_morgan_bits(mol, radius, n_bits) -> np.ndarray:
+def mol_morgan_bits(mol, radius, n_bits, counts: bool = False) -> np.ndarray:
+    """Condition vector for one molecule.
+
+    ``counts=False`` is a binary bit vector. ``counts=True`` is a hashed count
+    fingerprint with ``log1p``. This MUST stay identical to
+    ``molsmith.sample.morgan_bits``: the adapter is served through that function,
+    and feeding it the other encoding raises nothing while steering badly.
+    """
     arr = np.zeros((n_bits,), dtype=np.float32)
     if mol is None:
         return arr
-    bv = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
-    DataStructs.ConvertToNumpyArray(bv, arr)
-    return arr
+    if not counts:
+        bv = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+        DataStructs.ConvertToNumpyArray(bv, arr)
+        return arr
+    cv = AllChem.GetHashedMorganFingerprint(mol, radius, nBits=n_bits)
+    DataStructs.ConvertToNumpyArray(cv, arr)
+    return np.log1p(arr).astype(np.float32)
+
+
+def mol_morgan_binary(mol, radius, n_bits) -> np.ndarray:
+    """Always-binary fingerprint, for the Tanimoto METRIC.
+
+    The reported similarity stays binary whatever the conditioning encoding is,
+    so a number from a count-conditioned adapter is directly comparable to
+    fingerprint@2.0.0's. Changing the metric alongside the conditioning would
+    make 'did counts help' unanswerable.
+    """
+    return mol_morgan_bits(mol, radius, n_bits, counts=False)
 
 
 def tanimoto_to_target(fp_mat, target):
@@ -169,7 +212,9 @@ def decode_and_fp(samples, atom_decoder, bond_decoder, radius, n_bits):
         if smi is not None and Chem.MolFromSmiles(smi) is not None:
             mols.append(mol)
             smis.append(smi)
-    fp = np.stack([mol_morgan_bits(m, radius, n_bits) for m in mols]) if mols else \
+    # BINARY: this feeds the Tanimoto metric, which stays binary whatever the
+    # conditioning encoding is, so numbers remain comparable across generations.
+    fp = np.stack([mol_morgan_binary(m, radius, n_bits) for m in mols]) if mols else \
         np.zeros((0, n_bits), dtype=np.float32)
     return mols, smis, fp
 
@@ -190,12 +235,16 @@ class FPAdapterProbe(pl.Callback):
     """Per-epoch loss log + every-K-epoch Tanimoto-steering probe vs a cached
     unconditional baseline, so training is visible."""
 
-    def __init__(self, e, atom_decoder, bond_decoder, radius, n_bits, targets_raw,
+    def __init__(self, e, atom_decoder, bond_decoder, radius, n_bits, targets,
                  baseline_tan, every_k, n, steps, weight, eta, omega, td, chunk):
         super().__init__()
         self.e = e
         self.ad, self.bd, self.radius, self.n_bits = atom_decoder, bond_decoder, radius, n_bits
-        self.targets_raw, self.baseline_tan = targets_raw, baseline_tan
+        # (condition, metric) per target. They differ once the adapter is
+        # conditioned on counts while Tanimoto is still reported on binary bits,
+        # and conflating them would silently score against the wrong vector.
+        self.targets = targets
+        self.baseline_tan = baseline_tan
         self.every_k, self.n, self.steps, self.weight = every_k, n, steps, weight
         self.eta, self.omega, self.td, self.chunk = eta, omega, td, chunk
 
@@ -214,11 +263,11 @@ class FPAdapterProbe(pl.Callback):
     def _probe(self, pl_module, ep):
         device = pl_module.device
         per = []
-        for traw in self.targets_raw:
-            samples = guided_sample(pl_module.base, pl_module.adapter, traw, self.weight, self.n,
+        for tcond, tmetric in self.targets:
+            samples = guided_sample(pl_module.base, pl_module.adapter, tcond, self.weight, self.n,
                                     self.steps, self.eta, self.omega, self.td, self.chunk, device)
             _, _, gfp = decode_and_fp(samples, self.ad, self.bd, self.radius, self.n_bits)
-            sims = tanimoto_to_target(gfp, traw)
+            sims = tanimoto_to_target(gfp, tmetric)
             per.append(float(sims.mean()) if sims.size else float("nan"))
         guided = float(np.nanmean(per)) if per else float("nan")
         base = float(np.nanmean(self.baseline_tan)) if self.baseline_tan else float("nan")
@@ -258,10 +307,14 @@ def experiment(e: Experiment) -> None:
         smiles_iter = pd.read_csv(e.CSV_PATH)[e.SMILES_COLUMN]
     e.log(f"source molecules: {len(smiles_iter)}")
 
-    # Both fingerprint conventions are computed for EVERY molecule: the training
-    # label uses FP_FROM, and the evaluation reports against both so the
-    # source-target ceiling stays visible instead of being absorbed silently.
-    graphs, smiles_kept, fp_src, fp_dec = [], [], [], []
+    # ONE full-size array only. At 1024 bits over 224k molecules a float32 array
+    # is ~0.9 GB, so keeping both conventions and both encodings would be several
+    # gigabytes for no benefit: the evaluation needs only six target molecules,
+    # whose fingerprints are recomputed on demand. The decoded SMILES are kept
+    # (cheap, strings) so those targets can be built in either convention later.
+    CEIL_SAMPLE = 5000          # the ceiling is a mean; 5k pins it to ~0.003
+    graphs, smiles_kept, dec_smiles, fp_list = [], [], [], []
+    ceil_num = []
     for smi in smiles_iter:
         mol = Chem.MolFromSmiles(smi)
         if mol is None:
@@ -276,19 +329,31 @@ def experiment(e: Experiment) -> None:
             continue          # cannot describe the graph, so cannot label it
         graphs.append(data)
         smiles_kept.append(smi)
-        fp_src.append(mol_morgan_bits(mol, e.FP_RADIUS, e.FP_BITS))
-        fp_dec.append(mol_morgan_bits(dec_mol, e.FP_RADIUS, e.FP_BITS))
+        dec_smiles.append(back)
+        # The CONDITION: FP_FROM picks which molecule, FP_COUNTS picks the encoding.
+        cond_mol = dec_mol if e.FP_FROM == "decoded" else mol
+        fp_list.append(mol_morgan_bits(cond_mol, e.FP_RADIUS, e.FP_BITS,
+                                       counts=e.FP_COUNTS))
+        if len(ceil_num) < CEIL_SAMPLE:
+            # Ceiling is a property of the BINARY metric, so measure it there
+            # regardless of how the adapter is conditioned.
+            a = mol_morgan_binary(mol, e.FP_RADIUS, e.FP_BITS)
+            b = mol_morgan_binary(dec_mol, e.FP_RADIUS, e.FP_BITS)
+            i = float((a * b).sum()); u = float(a.sum() + b.sum() - i)
+            ceil_num.append(i / u if u > 0 else 1.0)
     M = len(graphs)
-    fp_src = np.stack(fp_src); fp_dec = np.stack(fp_dec)
-    fp = fp_dec if e.FP_FROM == "decoded" else fp_src
-
-    inter = (fp_src * fp_dec).sum(1)
-    union = fp_src.sum(1) + fp_dec.sum(1) - inter
-    ceil = float(np.mean(inter / np.clip(union, 1e-9, None)))
-    e.log(f"{M} graphs; source-vs-decoded FP Tanimoto = {ceil:.4f} "
-          f"(the ceiling when scoring against SOURCE targets)")
+    fp = np.stack(fp_list); del fp_list
+    ceil = float(np.mean(ceil_num))
+    e.log(f"{M} graphs; source-vs-decoded BINARY Tanimoto = {ceil:.4f} "
+          f"over {len(ceil_num)} (the ceiling when scoring against SOURCE targets)")
+    e.log(f"condition: {e.FP_BITS} bits, radius {e.FP_RADIUS}, "
+          f"counts={e.FP_COUNTS}, from={e.FP_FROM}; "
+          f"nonzero/molecule ~{float((fp > 0).sum(1).mean()):.1f}, max value "
+          f"{float(fp.max()):.3f}")
     e["fp/ceiling_source_vs_decoded"] = ceil
     e["fp/from"] = e.FP_FROM
+    e["fp/counts"] = e.FP_COUNTS
+    e["fp/bits"] = e.FP_BITS
     cond_mean = fp.mean(0)
     cond_std = np.clip(fp.std(0), 1e-6, None)
     fp_t = torch.from_numpy(fp)
@@ -325,7 +390,9 @@ def experiment(e: Experiment) -> None:
 
     # probe targets (held out) + cached unconditional baseline
     probe_idx = random.sample(holdout_idx, min(e.PROBE_N_TARGETS, len(holdout_idx)))
-    probe_raw = [fp[i] for i in probe_idx]
+    probe_raw = [fp[i] for i in probe_idx]        # conditioning, trained encoding
+    probe_metric = [mol_morgan_binary(Chem.MolFromSmiles(dec_smiles[i]),
+                                      e.FP_RADIUS, e.FP_BITS) for i in probe_idx]
     pb = []
     pbs = Sampler(base, eta=e.ETA, omega=e.OMEGA, sample_steps=e.PROBE_STEPS, time_distortion=e.TIME_DISTORTION)
     rem = max(32, e.PROBE_N)
@@ -335,9 +402,10 @@ def experiment(e: Experiment) -> None:
         rem -= cur
     _, _, pb_fp = decode_and_fp(pb, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS)
     probe_baseline = [float(tanimoto_to_target(pb_fp, t).mean()) if pb_fp.shape[0] else float("nan")
-                      for t in probe_raw]
+                      for t in probe_metric]
     e.log(f"probe baseline <T>: {[round(x, 3) for x in probe_baseline]}")
-    probe = FPAdapterProbe(e, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS, probe_raw, probe_baseline,
+    probe = FPAdapterProbe(e, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS,
+                           list(zip(probe_raw, probe_metric)), probe_baseline,
                            e.PROBE_EVERY_K, e.PROBE_N, e.PROBE_STEPS, e.PROBE_WEIGHT,
                            e.ETA, e.OMEGA, e.TIME_DISTORTION, e.EVAL_CHUNK)
 
@@ -363,9 +431,14 @@ def experiment(e: Experiment) -> None:
     # then score the same generated molecules against BOTH conventions. One
     # sampling run, two measurements: the gap between them is exactly the
     # charge ceiling, shown rather than absorbed.
-    tgt_raw = [fp[i] for i in tgt_idx]
-    tgt_by_conv = {"decoded": [fp_dec[i] for i in tgt_idx],
-                   "source": [fp_src[i] for i in tgt_idx]}
+    tgt_raw = [fp[i] for i in tgt_idx]          # conditioning, trained encoding
+    # Measurement targets are always BINARY, in both conventions.
+    tgt_by_conv = {
+        "decoded": [mol_morgan_binary(Chem.MolFromSmiles(dec_smiles[i]),
+                                      e.FP_RADIUS, e.FP_BITS) for i in tgt_idx],
+        "source": [mol_morgan_binary(Chem.MolFromSmiles(smiles_kept[i]),
+                                     e.FP_RADIUS, e.FP_BITS) for i in tgt_idx],
+    }
     tgt_mols = [Chem.MolFromSmiles(smiles_kept[i]) for i in tgt_idx]
     e.log(f"{len(tgt_idx)} target molecules; conditioning on '{e.FP_FROM}' FPs, "
           f"scoring against both conventions")
