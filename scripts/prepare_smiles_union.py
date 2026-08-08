@@ -85,6 +85,19 @@ def clean_one(smiles: str):
         for bond in mol.GetBonds():
             if bond.GetBondType() not in BOND_ORDER:
                 return ("drop", "bond_type")
+        # The foundation lineage now trains kekulized (12 atom / 4 edge), so a
+        # molecule whose ring system will not kekulize cannot be encoded at all.
+        # Cheap: sanitization has already done the work, so this is a re-run on a
+        # copy rather than new analysis. Measured rate on 300k uniform ZINC: zero.
+        #
+        # Deliberately only the ENCODE half. The full encode->decode round trip
+        # catches ~1 molecule in 300,000 (scripts/check_representation_roundtrip.py)
+        # and costs several hours at 100M, which is not a trade worth making; the
+        # trainer's startup encode probe covers the systematic-failure case.
+        try:
+            Chem.Kekulize(Chem.Mol(mol), clearAromaticFlags=True)
+        except Exception:                                       # noqa: BLE001
+            return ("drop", "kekulize")
         Chem.RemoveStereochemistry(mol)
         for atom in mol.GetAtoms():
             if atom.GetIsotope() != 0:
@@ -197,9 +210,24 @@ def main():
                          "molecules are added and used to drop cross-duplicates")
     ap.add_argument("--target-clean", type=int, default=100_000_000,
                     help="target number of CLEAN, unique source molecules to keep")
-    ap.add_argument("--oversample", type=float, default=1.18,
-                    help="reservoir raw size = target-clean * oversample (covers "
-                         "filter drop-rate so we net ~target-clean)")
+    ap.add_argument("--oversample", type=float, default=1.05,
+                    help="reservoir raw size = target-clean * oversample. Two "
+                         "different things are being covered, and only one of them "
+                         "is a fixed rate. (1) Structural drops are "
+                         "density-independent and tiny: 0.07%% on a 300k uniform "
+                         "ZINC sample (wonky_ring 0.045%%, radical 0.007%%, element "
+                         "7-in-5M; zero too_large/multifragment). (2) DUPLICATES "
+                         "SCALE WITH SAMPLING DENSITY, because ZINC enumerates "
+                         "stereoisomers that collapse onto one stereo-free "
+                         "canonical SMILES -- measured ~2.65 source rows per "
+                         "distinct molecule. So the duplicate rate is 0.016%% when "
+                         "sampling 300k of ~1.8B, but 19.3%% when sampling 5.05M of "
+                         "20M. Do NOT read a small-sample keep rate as a constant. "
+                         "At 100M of ~1.8B (5.6%% density) the model predicts ~4.6%% "
+                         "duplicates -- hence 1.05. The model reproduces the 300k "
+                         "point to 41 predicted vs 49 observed. The original 1.18 "
+                         "came from raw ChEMBL's 85.8%% keep rate and does not "
+                         "describe this source at all.")
     ap.add_argument("--limit-scan", type=int, default=None, help="cap raw rows scanned (smoke)")
     ap.add_argument("--out-dir", default="data/zinc_chembl_union")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))

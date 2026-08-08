@@ -243,7 +243,8 @@ def train(args):
     gen_fn = make_generation_metrics_fn(ad, bd, train_smiles)
     monitor = TrainingMonitorCallback(
         smoothing_window=5, generation_metrics_fn=gen_fn, gen_every_k=args.gen_every_k,
-        gen_num_samples=64, gen_sample_steps=args.gen_sample_steps, gen_eta=5.0,
+        gen_num_samples=args.gen_num_samples,
+        gen_sample_steps=args.gen_sample_steps, gen_eta=args.gen_eta,
         checkpoint_dir=args.ckpt_dir, figure_callback=save_progress,
     )
     sampler = SampleVisualizationCallback(
@@ -411,6 +412,17 @@ def main():
     p.add_argument("--rrwp-steps", type=int, default=20)
     p.add_argument("--gen-every-k", type=int, default=2)
     p.add_argument("--gen-sample-steps", type=int, default=250)
+    # The in-training probe also drives best_model selection, and at the historical
+    # 64 samples / eta=5 it does not track the metric decisions are made on. On the
+    # kekulized ChEMBL A/B the probe picked epoch 10, but the eta=0 extended eval
+    # rated the epoch-12 end-of-link model better on EVERY metric (validity 0.984
+    # vs 0.981, sanity 0.940 vs 0.913, connected 0.963 vs 0.948). Two causes: n=64
+    # has a +-6 point standard error, and eta=5 flatters -- the aromatic model lost
+    # 7 validity points when that error-correction crutch was removed. Defaults are
+    # unchanged so existing runs reproduce; raise both for long runs where the
+    # probe is actually used to choose a checkpoint.
+    p.add_argument("--gen-num-samples", type=int, default=64)
+    p.add_argument("--gen-eta", type=float, default=5.0)
     p.add_argument("--sample-vis-every-k", type=int, default=5)
     p.add_argument("--ckpt-every-n-steps", type=int, default=2000)
     p.add_argument("--max-train", type=int, default=None)
