@@ -18,11 +18,64 @@ guard is three chances for one to drift.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 
 class VocabularyMismatch(RuntimeError):
     """A checkpoint's channel counts disagree with the requested vocabulary."""
+
+
+@dataclass(frozen=True)
+class Representation:
+    """How a dataset's molecules are encoded as graphs.
+
+    Atom types, bond types and the kekulize flag travel together because they
+    must agree: encoding an aromatic molecule against a bond set with no
+    AROMATIC class and ``kekulize=False`` silently discards nearly every
+    drug-like molecule instead of raising.
+
+    This is a *model-side* choice, not an evaluation choice -- the E1 protocol
+    scores SMILES, so changing it does not affect comparability with published
+    baselines. It does change the channel count, which means a checkpoint and
+    the representation it was trained under must travel together: decoding with
+    the wrong one mis-decodes silently rather than raising. ``matches_model``
+    exists to turn that into an error.
+
+    Lives here rather than in one dataset module because more than one dataset
+    now defines named representations (MOSES since 2026-08-03, ChEMBL since
+    2026-08-07), and two copies of this class is one chance for them to drift.
+    """
+
+    name: str
+    atom_types: List[str]
+    bond_types: List[str]
+    kekulize: bool
+    note: str = ""
+
+    @property
+    def aromatic(self) -> bool:
+        return "AROMATIC" in self.bond_types
+
+    def encoders(self):
+        from defog.domains.molecule import build_encoders
+
+        return build_encoders(list(self.atom_types), list(self.bond_types))
+
+    def matches_model(self, model) -> bool:
+        """True iff the model's node/edge class counts fit this vocabulary.
+
+        Reads ``output_dims``, not ``input_dims``: the latter is padded with
+        RRWP/molecular/time features, so it does not equal the vocabulary size.
+        Edge classes carry an extra 'no bond' class at index 0, which is why the
+        bond comparison is off by one.
+        """
+        try:
+            dims = getattr(model, "output_dims", None) or {}
+            n_x, n_e = int(dims["X"]), int(dims["E"])
+        except Exception:                                   # noqa: BLE001
+            return True          # cannot tell -> do not block the caller
+        return n_x == len(self.atom_types) and n_e == len(self.bond_types) + 1
 
 
 def resolve(dataset_module, representation: Optional[str] = None):

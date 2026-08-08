@@ -11,6 +11,7 @@ edge against 7 / 4), that is a live hazard rather than a hypothetical one.
 
 import pytest
 
+from defog.data import chembl_reference as cref
 from defog.data import guacamol_reference as gmref
 from defog.data import moses_reference as mref
 from defog.data import vocabulary
@@ -139,8 +140,64 @@ def test_resolve_and_check_raises_before_building_decoders():
         vocabulary.resolve_and_check(mref, FakeModel(7, 4), None)
 
 
-def test_all_three_datasets_pass_with_their_own_dims():
-    for mod in (zref, gmref, mref):
+def test_every_dataset_passes_with_its_own_dims():
+    for mod in (zref, gmref, mref, cref):
         atoms, bonds, _ = vocabulary.resolve(mod)
         model = FakeModel(len(atoms), len(bonds) + 1)
         assert "OK" in vocabulary.check_model(model, atoms, bonds)
+
+
+# ===========================================================================
+# ChEMBL / foundation lineage
+# ===========================================================================
+def test_chembl_defaults_to_the_released_aromatic_schema():
+    """The released v1/v2 checkpoints are 12 atom / 5 edge. Defaulting to
+    anything else would break every artifact built on the model card."""
+    atoms, bonds, rep = vocabulary.resolve(cref)
+    assert atoms == ["C", "N", "O", "F", "B", "Br", "Cl", "I", "P", "S", "Se", "Si"]
+    assert bonds == ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
+    assert cref.get_representation().name == "aromatic_v1"
+    assert rep is None
+
+
+def test_chembl_kekulized_keeps_all_twelve_atom_types():
+    """Unlike MOSES, which dropped a never-used H class, no ChEMBL element is
+    dead: the rarest (Si) still appears 3,353 times across 2.44M molecules."""
+    atoms, bonds, rep = vocabulary.resolve(cref, "kekulized_v2")
+    assert rep.name == "kekulized_v2"
+    assert atoms == list(cref.ATOM_TYPES)
+    assert bonds == ["SINGLE", "DOUBLE", "TRIPLE"]
+    assert rep.kekulize is True and rep.aromatic is False
+
+
+def test_kekulized_v2_means_different_things_per_dataset():
+    """The name is scoped to its dataset module: 7 atom types on MOSES, 12 on
+    ChEMBL. Sharing a name across modules is fine precisely because the guard
+    below catches a checkpoint meeting the wrong one."""
+    moses_atoms, _, _ = vocabulary.resolve(mref, "kekulized_v2")
+    chembl_atoms, _, _ = vocabulary.resolve(cref, "kekulized_v2")
+    assert len(moses_atoms) == 7 and len(chembl_atoms) == 12
+
+
+def test_released_chembl_dims_are_refused_by_the_kekulized_vocabulary():
+    """The mixup this guard exists for, on the lineage about to acquire a
+    second representation: a 12/5 checkpoint decoded as 12/4 would silently
+    read AROMATIC edges as 'no bond'."""
+    released = FakeModel(12, 5)
+    assert cref.get_representation("aromatic_v1").matches_model(released)
+    assert not cref.get_representation("kekulized_v2").matches_model(released)
+    with pytest.raises(vocabulary.VocabularyMismatch):
+        vocabulary.resolve_and_check(cref, released, "kekulized_v2")
+
+
+def test_chembl_unknown_representation_is_rejected():
+    with pytest.raises(vocabulary.VocabularyMismatch):
+        vocabulary.resolve(cref, "no_such_representation")
+
+
+def test_molecular_feature_tables_cover_the_vocabulary():
+    """atom_valencies/atom_weights are passed to the model as lists indexed by
+    channel, so a missing element would silently shift every later element's
+    valency by one."""
+    for table in (cref.ATOM_VALENCY, cref.ATOM_WEIGHT):
+        assert set(table) == set(cref.ATOM_TYPES)

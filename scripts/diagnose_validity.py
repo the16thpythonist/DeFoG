@@ -46,7 +46,7 @@ from defog.domains.molecule import pyg_data_to_mol  # noqa: E402
 RDLogger.DisableLog("rdApp.*")
 
 REFERENCES = {"zinc": "zinc_reference", "guacamol": "guacamol_reference",
-              "moses": "moses_reference"}
+              "moses": "moses_reference", "chembl": "chembl_reference"}
 
 
 def classify(mol):

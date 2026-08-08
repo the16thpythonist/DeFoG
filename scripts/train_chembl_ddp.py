@@ -54,15 +54,65 @@ from defog.core import (
 )
 from defog.domains import MoleculeDomain
 
-# --- Frozen schema (must match scripts/prepare_chembl.py) -------------------
-ATOM_DECODER = ["C", "N", "O", "F", "B", "Br", "Cl", "I", "P", "S", "Se", "Si"]
-BOND_TYPES = ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
-ATOM_VALENCY = {"C": 4, "N": 3, "O": 2, "F": 1, "B": 3, "Br": 1, "Cl": 1, "I": 1,
-                "P": 5, "S": 6, "Se": 2, "Si": 4}
-ATOM_WEIGHT = {"C": 12.011, "N": 14.007, "O": 15.999, "F": 18.998, "B": 10.81,
-               "Br": 79.904, "Cl": 35.45, "I": 126.904, "P": 30.974, "S": 32.06,
-               "Se": 78.971, "Si": 28.085}
-MAX_ATOM_WEIGHT = 700.0
+# --- Frozen schema ----------------------------------------------------------
+# Sourced from defog.data.chembl_reference rather than restated here, so the
+# vocabulary cannot drift from prepare_chembl.py and diagnose_validity.py.
+from defog.data import chembl_reference as chembl_ref  # noqa: E402
+from defog.data import vocabulary  # noqa: E402
+
+ATOM_DECODER = list(chembl_ref.ATOM_TYPES)
+BOND_TYPES = list(chembl_ref.BOND_TYPES)
+ATOM_VALENCY = dict(chembl_ref.ATOM_VALENCY)
+ATOM_WEIGHT = dict(chembl_ref.ATOM_WEIGHT)
+MAX_ATOM_WEIGHT = chembl_ref.MAX_ATOM_WEIGHT
+
+
+def resolve_vocab(args):
+    """(representation, atom_encoder, atom_decoder, bond_encoder, bond_decoder).
+
+    Every entry point goes through this so the encoders, the kekulize flag and
+    the declared representation can never disagree -- the failure mode being
+    that a 3-bond encoder without kekulize=True rejects every aromatic molecule,
+    which SmilesGraphDataset would paper over by silently substituting the next
+    one (see check_encodable below).
+    """
+    rep = chembl_ref.get_representation(args.representation)
+    ae, ad, be, bd = build_encoders(list(rep.atom_types), list(rep.bond_types))
+    return rep, ae, ad, be, bd
+
+
+def stats_path(args, rep):
+    """Explicit --stats wins; otherwise the default representation keeps the
+    historical '{prefix}_stats.json' and any other gets its own file, because
+    the marginals ARE the noise prior and differ per bond vocabulary."""
+    if args.stats:
+        return args.stats
+    if rep.name == chembl_ref.DEFAULT_REPRESENTATION:
+        return os.path.join(args.data_dir, f"{args.prefix}_stats.json")
+    return os.path.join(args.data_dir, f"{args.prefix}_kek_stats.json")
+
+
+def check_encodable(smiles, ae, be, rep, sample=2000, max_skip=0.01):
+    """Fail loudly if the representation cannot encode the data.
+
+    SmilesGraphDataset falls through to the next molecule when conversion
+    returns None. That is a reasonable guard against a stray bad row, but it
+    also means a mis-wired representation does not crash: it silently trains on
+    whatever minority of the dataset happens to encode (for ChEMBL under a
+    3-bond vocabulary without kekulize, the ~7% with no aromatic ring, cycled
+    over and over). Measured skip rate for both declared representations is 0.
+    """
+    probe = smiles[:sample]
+    skipped = sum(1 for s in probe
+                  if smiles_to_pyg_data(s, ae, be, kekulize=rep.kekulize) is None)
+    frac = skipped / max(1, len(probe))
+    if frac > max_skip:
+        raise SystemExit(
+            f"representation {rep.name!r} cannot encode {frac:.1%} of a "
+            f"{len(probe)}-molecule probe (bonds={rep.bond_types}, "
+            f"kekulize={rep.kekulize}). Training would silently proceed on the "
+            f"remainder. Check the representation matches the data.")
+    return frac
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -91,10 +141,13 @@ def read_smiles(path, limit=None):
 class SmilesGraphDataset(torch.utils.data.Dataset):
     """Lazy SMILES -> PyG Data (keeps 2.44M graphs off the heap)."""
 
-    def __init__(self, smiles, atom_encoder, bond_encoder):
+    def __init__(self, smiles, atom_encoder, bond_encoder, kekulize=False):
         self.smiles = smiles
         self.atom_encoder = atom_encoder
         self.bond_encoder = bond_encoder
+        # Must agree with the bond vocabulary: a bond set without AROMATIC needs
+        # kekulize=True or every aromatic molecule converts to None.
+        self.kekulize = kekulize
 
     def __len__(self):
         return len(self.smiles)
@@ -103,13 +156,25 @@ class SmilesGraphDataset(torch.utils.data.Dataset):
         n = len(self.smiles)
         for off in range(n):
             d = smiles_to_pyg_data(self.smiles[(idx + off) % n],
-                                   self.atom_encoder, self.bond_encoder)
+                                   self.atom_encoder, self.bond_encoder,
+                                   kekulize=self.kekulize)
             if d is not None:
                 return d
         raise RuntimeError("no convertible SMILES")
 
 
-def build_model(args, stats):
+def build_model(args, stats, rep=None):
+    rep = rep or chembl_ref.get_representation(args.representation)
+    # The stats file carries the marginals the model denoises from, so a stats
+    # file built for another bond vocabulary is not a mismatch to discover at
+    # the first backward pass.
+    want_e = len(rep.bond_types) + 1
+    if int(stats["num_edge_classes"]) != want_e:
+        raise SystemExit(
+            f"stats file has {stats['num_edge_classes']} edge classes but "
+            f"representation {rep.name!r} implies {want_e}. The marginals are "
+            f"the noise prior -- regenerate with scripts/compute_graph_stats.py "
+            f"--representation {rep.name}.")
     node_marginals = torch.tensor(stats["node_marginals"], dtype=torch.float)
     edge_marginals = torch.tensor(stats["edge_marginals"], dtype=torch.float)
     max_nodes = int(stats["max_nodes"])
@@ -125,8 +190,8 @@ def build_model(args, stats):
         edge_marginals=edge_marginals, node_counts=node_counts, max_nodes=max_nodes,
         extra_features_type="rrwp", rrwp_steps=args.rrwp_steps,
         molecular_features=True,
-        atom_valencies=[ATOM_VALENCY[a] for a in ATOM_DECODER],
-        atom_weights=[ATOM_WEIGHT[a] for a in ATOM_DECODER],
+        atom_valencies=[ATOM_VALENCY[a] for a in rep.atom_types],
+        atom_weights=[ATOM_WEIGHT[a] for a in rep.atom_types],
         max_atom_weight=MAX_ATOM_WEIGHT,
         lr=args.lr, weight_decay=1e-5, lambda_edge=5.0,
         train_time_distortion="polydec", lr_scheduler="cosine", lr_min=1e-6,
@@ -136,25 +201,32 @@ def build_model(args, stats):
 
 def train(args):
     pl.seed_everything(args.seed, workers=True)
-    ae, ad, be, bd = build_encoders(ATOM_DECODER, BOND_TYPES)
+    rep, ae, ad, be, bd = resolve_vocab(args)
 
     train_smiles = read_smiles(os.path.join(args.data_dir, f"{args.prefix}_train.smiles"), args.max_train)
     val_smiles = read_smiles(os.path.join(args.data_dir, f"{args.prefix}_val.smiles"), args.max_val)
     rprint(f"train {len(train_smiles):,}  val {len(val_smiles):,}")
+    skip_frac = check_encodable(train_smiles, ae, be, rep)
+    rprint(f"representation={rep.name} atoms={len(rep.atom_types)} "
+           f"edges={len(rep.bond_types) + 1} kekulize={rep.kekulize} "
+           f"probe_skip={skip_frac:.5f}")
 
     train_loader = DataLoader(
-        SmilesGraphDataset(train_smiles, ae, be), batch_size=args.batch_size,
+        SmilesGraphDataset(train_smiles, ae, be, kekulize=rep.kekulize),
+        batch_size=args.batch_size,
         shuffle=True, num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
-        SmilesGraphDataset(val_smiles, ae, be), batch_size=args.batch_size,
+        SmilesGraphDataset(val_smiles, ae, be, kekulize=rep.kekulize),
+        batch_size=args.batch_size,
         num_workers=args.num_workers, persistent_workers=args.num_workers > 0,
     ) if val_smiles else None
 
-    with open(os.path.join(args.data_dir, f"{args.prefix}_stats.json")) as fh:
+    with open(stats_path(args, rep)) as fh:
         stats = json.load(fh)
-    model = build_model(args, stats)
+    rprint(f"stats: {stats_path(args, rep)}")
+    model = build_model(args, stats, rep)
     rprint(f"params {sum(p.numel() for p in model.parameters()):,}  max_nodes {stats['max_nodes']}")
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -217,10 +289,15 @@ def train(args):
 
 def evaluate(args):
     """Single-GPU extended eval on a checkpoint (no DDP)."""
-    ae, ad, be, bd = build_encoders(ATOM_DECODER, BOND_TYPES)
+    rep, ae, ad, be, bd = resolve_vocab(args)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = DeFoGModel.load(args.eval_ckpt.replace(".ckpt", "")).to(device).eval()
-    rprint(f"loaded {args.eval_ckpt} on {device}")
+    # Decoding with the wrong vocabulary yields plausible molecules made of the
+    # wrong elements rather than an error, so every metric below would be a
+    # number describing nothing.
+    rprint(vocabulary.check_model(model, rep.atom_types, rep.bond_types,
+                                  what=args.eval_ckpt))
+    rprint(f"loaded {args.eval_ckpt} on {device} as {rep.name}")
 
     samples = []
     remaining = args.num_eval_samples
@@ -256,9 +333,11 @@ def sweep(args):
     guidance) at fixed time-distortion, scoring each with the full metric suite,
     so we can pick the sampling config the released model ships with.
     """
-    ae, ad, be, bd = build_encoders(ATOM_DECODER, BOND_TYPES)
+    rep, ae, ad, be, bd = resolve_vocab(args)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = DeFoGModel.load(args.eval_ckpt.replace(".ckpt", "")).to(device).eval()
+    rprint(vocabulary.check_model(model, rep.atom_types, rep.bond_types,
+                                  what=args.eval_ckpt))
     rprint(f"sweep on {args.eval_ckpt} ({device}); distortion={args.sweep_distortion} "
            f"steps={args.eval_sample_steps} samples/config={args.sweep_samples}")
 
@@ -305,6 +384,16 @@ def main():
     p.add_argument("--prefix", default="chembl",
                    help="data-file prefix: reads {prefix}_train.smiles / {prefix}_stats.json "
                         "/ {prefix}_ref_descriptors.npz (use 'union' for the ZINC∪ChEMBL set)")
+    p.add_argument("--representation", default=chembl_ref.DEFAULT_REPRESENTATION,
+                   choices=sorted(chembl_ref.REPRESENTATIONS),
+                   help="graph vocabulary. 'aromatic_v1' is what v1/v2 shipped "
+                        "(12 atom / 5 edge); 'kekulized_v2' drops the AROMATIC "
+                        "class (12 / 4). Not interchangeable -- a checkpoint and "
+                        "its representation must travel together.")
+    p.add_argument("--stats", default=None,
+                   help="explicit stats JSON (default: {prefix}_stats.json for "
+                        "aromatic_v1, {prefix}_kek_stats.json otherwise). The "
+                        "marginals are the noise prior, so they are per-vocabulary.")
     p.add_argument("--ckpt-dir", default=os.path.join(_HERE, "ckpts", "chembl_foundation"))
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--epochs", type=int, default=60)          # cosine horizon (fixed across links)
