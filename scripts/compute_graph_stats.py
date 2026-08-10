@@ -24,6 +24,7 @@ Usage:
 """
 import argparse
 import collections
+import gc
 import importlib
 import json
 import os
@@ -96,6 +97,12 @@ def main():
     size_hist = collections.Counter()
     total_pairs = total_bonds = n_ok = n_skip = 0
 
+    # Before forking: the workers inherit the whole SMILES list copy-on-write and
+    # never read it (they only get pickled chunks), but a child's cyclic GC writes
+    # to every inherited object header and copies the page. At union scale (~100M
+    # strings, ~10 GB) times 16 workers that is fatal; freeze() moves the list into
+    # a generation the collector never visits. See prepare_smiles_union.py.
+    gc.freeze()
     with Pool(workers, initializer=_init_worker,
               initargs=(atom_types, bond_types, kekulize)) as pool:
         for res in pool.imap_unordered(count_one, smiles, chunksize=args.chunksize):

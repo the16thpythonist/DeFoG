@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import lzma
 import os
@@ -248,6 +249,18 @@ def main():
     print(f"[prep-union] reservoir holds {len(raw):,} raw molecules")
 
     # ---- Pass 2: filter + dedup the sampled subset -------------------------
+    # gc.freeze() BEFORE forking the pool. The reservoir is ~105M str objects
+    # (~15 GB), which the workers inherit copy-on-write and never read -- they
+    # only ever touch the pickled chunks sent over the queue. But a child's
+    # cyclic GC walks every tracked object it inherited and writes to each
+    # object header, which copies the page. With 16 workers that turns a shared
+    # 15 GB into an unbounded multiple of it. freeze() moves everything already
+    # allocated into a permanent generation the collector never visits, so the
+    # inherited heap stays genuinely shared.
+    #
+    # Measured on the 100M run before this was added: 16 workers pushed system
+    # memory from 41 GB used to 68 GB within a minute of the pool starting.
+    gc.freeze()
     reasons = Counter()
     seen = set()
     with Pool(args.workers, initializer=_init_worker) as pool:
@@ -300,6 +313,9 @@ def main():
     edge_tot = [0, 0, 0, 0]
     size_hist = Counter()
     total_pairs = total_bonds = 0
+    # Again before forking: all_smiles was allocated after the first freeze, so
+    # it is back in a generation the children's collector would walk.
+    gc.freeze()
     with Pool(args.workers, initializer=_init_worker) as pool:
         for res in pool.imap_unordered(stats_one, all_smiles, chunksize=args.chunksize):
             if res is None:
