@@ -6,10 +6,9 @@ It supersedes [DeFoG-ChEMBL](CHEMBL_FOUNDATION_MODEL.md) v1/v2 and is intended a
 the frozen base that downstream work (property adapters, guidance, RL
 fine-tuning, inpainting) builds on.
 
-> **Status: DRAFT.** Training and per-link evaluation are complete. Two things
-> are still open and are marked **TBD** below: the η/ω sampling sweep (stage 1
-> was interrupted) and the frozen n=10,000 release evaluation. Do not publish
-> until those are filled in.
+> **Status: complete pending distribution.** Training, the η/ω sweep and the
+> frozen n=10,000 evaluation are all done. The only open item is deciding how the
+> checkpoint is distributed — it currently exists only on JUPITER.
 
 - **Developed on:** `feat/kekulized-foundation`
 - **Checkpoint:** `ckpts/foundation_union_kek_snapshots/link6_final/foundation_model.ckpt`
@@ -158,29 +157,49 @@ Unconditional generation at 500 steps, scored with
 wonky-ring fraction, and KDE KL of logP / TPSA / QED against the training
 distribution (`kl_score = exp(−mean KL)`).
 
-**Final model, n=5000, η=0 / ω=0:**
+**RELEASE FIGURES — n=10,000, η=25 / ω=0.1, 500 steps, polydec:**
 
 | Metric | Value |
 |---|---|
-| validity | **0.9946** |
+| validity | **0.9967** |
 | uniqueness | 1.0000 |
-| novelty | 0.9813 |
-| sanity | **0.9824** |
-| connected | 0.9922 |
-| wonky-ring frac | 0.0060 |
-| KL logP / TPSA / QED | 0.0192 / 0.0143 / 0.0250 |
-| kl_score | 0.9807 |
+| novelty | 0.9754 |
+| sanity | **0.9897** |
+| connected | 0.9950 |
+| disconnected | 0.0050 |
+| wonky-ring frac | 0.0028 |
+| KL logP / TPSA / QED | 0.0097 / 0.0015 / 0.0066 |
+| kl_score | **0.9941** |
+
+At n=10,000 the standard error on validity is ±0.00055. This is a single run, not
+replicated; the MOSES-derived noise floors (FCD ±0.0084, sanity ±0.0020 at
+n=10,000) are the reference for judging differences of this size.
+
+**The same model at η=0 / ω=0** (n=5000), for the contribution of the sampling
+config: validity 0.9946, sanity 0.9824, connected 0.9922, novelty 0.9813,
+kl_score 0.9807. So the swept config buys +0.007 sanity, +0.002 validity and
+**+0.013 kl_score** — the TPSA divergence alone improves nearly tenfold
+(0.0143 → 0.0015) — at a cost of ~0.006 novelty.
 
 **Versus the predecessors** (their figures are against ChEMBL's reference; KL and
 novelty are therefore *not* directly comparable across lineages — each model is
 scored against its own training distribution):
 
-| | v1 aromatic (39 ep) | v2 (v1 + GDPO RL) | ChEMBL-kek (12 ep) | **union-kek (2 ep)** |
+| | v1 aromatic (39 ep) | v2 (v1 + GDPO RL) | ChEMBL-kek (12 ep) | **union-kek (release)** |
 |---|---|---|---|---|
-| validity | 0.845 | 0.926 | 0.984 | **0.9946** |
-| sanity | 0.825 | 0.908 | 0.940 | **0.9824** |
-| connected | 0.983 | 0.984 | 0.963 | 0.9922 |
-| wonky_ring | 0.009 | — | 0.021 | 0.0060 |
+| validity | 0.845 | 0.926 | 0.984 | **0.9967** |
+| sanity | 0.825 | 0.908 | 0.940 | **0.9897** |
+| connected | 0.983 | 0.984 | 0.963 | **0.9950** |
+| wonky_ring | 0.009 | — | 0.021 | **0.0028** |
+| kl_score | 0.986 | 0.984 | 0.984 | **0.9941** |
+| novelty | 0.998 | 0.991 | 0.997 | 0.9754 |
+
+**Read the novelty row with care.** Novelty is the fraction of valid samples
+absent from the *training set*, and this model's training set is 99.8M molecules
+against v1's 2.4M — a 41× larger denominator makes a collision far more likely, so
+0.9754 here is not the same measurement as 0.998 there and is arguably the harder
+number. Part of the remainder is a genuine trade from η>0, which buys structural
+quality with a little diversity.
 
 **Training progression** (all n=5000, η=0):
 
@@ -208,36 +227,52 @@ not more data, the obvious next experiment.
 
 ## Recommended sampling config
 
-**TBD — pending the η/ω sweep.** Stage 1 (`run_chembl_sweep_jupiter.sh`, job
-1305614, 1500 samples/config) was interrupted at 6 of 15 configs. Partial results:
-
-| η | ω | validity | sanity | connected | kl_score |
-|---|---|---|---|---|---|
-| 0 | 0 | 0.992 | 0.982 | 0.991 | 0.979 |
-| 0 | 0.05 | 0.995 | 0.982 | 0.991 | 0.974 |
-| 0 | 0.1 | 0.992 | 0.982 | 0.991 | 0.970 |
-| 5 | 0 | 0.993 | 0.985 | 0.995 | 0.986 |
-| 5 | 0.05 | 1.000 | 0.991 | 0.995 | 0.989 |
-| 5 | 0.1 | 0.994 | 0.983 | 0.991 | 0.986 |
-
-Early indication is that **η=5 beats η=0** on sanity, connectivity and kl_score
-at once — which contradicts the ChEMBL-era conclusion that η barely helps
-molecular data, and is exactly why this lineage needed its own sweep instead of
-inheriting the old optimum. It is **not yet a finding**: n=1500 gives ±0.0018
-here, the gaps are 1–2σ, and `validity = 1.000` is a boundary value. η ∈ {25, 50,
-100} are unmeasured. Confirm the shortlist at n=5000 before choosing.
+**η = 25, ω = 0.1, polydec, 500 steps.**
 
 ```python
 from defog.core import DeFoGModel
 model = DeFoGModel.load("ckpts/foundation_union_kek_snapshots/link6_final/foundation_model")
 samples = model.sample(
     num_samples=1000,
-    eta=None,           # TBD - see sweep above
-    omega=None,         # TBD
+    eta=25.0,           # error-correction stochasticity -- NOT optional here
+    omega=0.1,          # target guidance
     sample_steps=500,
     time_distortion="polydec",
 )
 ```
+
+### η matters on this model, contradicting the ChEMBL-era conclusion
+
+The full 5×3 grid (`run_chembl_sweep_jupiter.sh`, 1500 samples/config), sanity:
+
+| η | ω=0 | ω=0.05 | ω=0.1 |
+|---|---|---|---|
+| **0** | 0.982 | 0.982 | 0.982 |
+| **5** | 0.985 | 0.991 | 0.983 |
+| **25** | 0.992 | 0.991 | **0.994** |
+| **50** | 0.989 | **0.995** | 0.990 |
+| **100** | 0.991 | 0.993 | 0.992 |
+
+All three η=0 configs sit at 0.982; every η≥25 config lands in 0.989–0.995, with
+connectivity moving 0.991 → 0.997–0.999 alongside. That is a uniform pattern
+across nine configs against three, not one lucky cell.
+
+The predecessor's card concluded that η "barely helps (unlike planar graphs)" and
+shipped η=0. **This lineage inherited that conclusion without ever testing it.**
+The kekulized model's error profile is different — kekulization failures are gone
+by construction, so what remains is the kind of local error that CTMC
+error-correction can actually repair — and η buys real structural quality on it.
+The general lesson is that a sampling optimum belongs to the model that was swept,
+not to the architecture or the domain.
+
+**Why η=25/ω=0.1 rather than the sanity-ranked top cell** (η=50/ω=0.05, sanity
+0.995): the two differ by 0.001 sanity, roughly 0.4σ at n=1500, i.e. tied, while
+η=25/ω=0.1 was better on both kl_score (0.992 vs 0.990) and novelty (0.981 vs
+0.977). For a frozen base that adapters, guidance and RL bind to, distribution
+fidelity and diversity are worth more than a structural decimal. The n=10,000 run
+above confirms the choice delivers (kl_score 0.9941), but note it validates *what
+shipping this config gives*, not that it was the best of the six — the top
+configs were statistically tied at the precision they were ranked with.
 
 Decode with `pyg_data_to_mol(sample, atom_decoder, bond_decoder)` using the
 **kekulized** decoders — `defog.data.chembl_reference.get_representation("kekulized_v2").encoders()`.
@@ -283,11 +318,25 @@ Per-link snapshots: `ckpts/foundation_union_kek_snapshots/link{1..5,6_final}/`.
 
 ## Release checklist
 
-- [ ] Finish the η/ω sweep (stage 1: η ∈ {25,50,100}; stage 2: shortlist at n=5000)
-- [ ] Frozen evaluation at n=10,000 with replicates, to establish noise floors
-- [ ] Fill in the sampling config and release figures above
-- [ ] Mark DeFoG-ChEMBL v1/v2 superseded in `docs/CHEMBL_FOUNDATION_MODEL.md`
-- [ ] Decide checkpoint distribution (the file currently lives only on JUPITER)
+- [x] η/ω sweep — full 5×3 grid at 1500 samples/config
+- [x] Frozen evaluation at n=10,000 (single run, not replicated)
+- [x] Sampling config and release figures filled in
+- [x] DeFoG-ChEMBL v1/v2 marked superseded in `docs/CHEMBL_FOUNDATION_MODEL.md`
+- [ ] **Decide checkpoint distribution** — the file exists only on JUPITER
+- [ ] Optional: replicate the n=10,000 eval 2–3× to establish this lineage's own
+      noise floors rather than borrowing MOSES's
 - [ ] Optional: GDPO structural-sanity RL, re-scoped — on the kekulized MOSES base
       the same reward bought distribution match rather than validity, and at
-      0.9946 validity there is little left for it to recover
+      0.9967 validity / 0.9897 sanity there is very little left for it to recover.
+      The remaining 1% of non-sane samples is now the least valuable place to spend
+      compute on this model.
+
+## What is worth doing next
+
+Not more data, and probably not more RL. The model converged after ~1⅓ epochs of
+a 100M-molecule set and every metric from link 4 onward moved inside noise, which
+points at **capacity** rather than data or sampling as the binding constraint.
+Model size was deliberately held at 25.9M so the data scale-up would be the only
+variable; that experiment is finished and the answer is that 40× more data lifted
+a kekulized ChEMBL model from 0.984/0.940 to 0.997/0.990. The open question this
+run did not touch is what a larger model does with the same 100M molecules.
