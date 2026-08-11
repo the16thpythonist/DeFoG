@@ -1,5 +1,26 @@
 # DeFoG-ChEMBL — Unconditional Molecular Foundation Model
 
+> ## ⚠️ SUPERSEDED by [DeFoG-Union](UNION_FOUNDATION_MODEL.md)
+>
+> The schema published below carries an **`AROMATIC` bond class, and that class
+> is a defect**. It cannot round-trip its own training data: 14.07% of real
+> ChEMBL molecules fail to survive encode→decode through it (n=50,000), almost
+> entirely `KekulizeException`, and 93% of this model's own invalid samples are
+> that same failure. Removing the class drops the loss to 0.02%.
+>
+> A successor trained on ~102M molecules with a **kekulized** 12 atom / 4 edge
+> vocabulary reaches **validity 0.9946 / sanity 0.9824** against v1's 0.845 /
+> 0.825 and v2's 0.926 / 0.908 — and a single 9.5 h link of it already beat both.
+>
+> **The two are not interchangeable.** These checkpoints are 12 atom / 5 edge;
+> the successor is 12 / 4. Decoding one with the other's vocabulary does not
+> raise, it produces plausible molecules made of the wrong elements. Anything
+> loading these files must use the `aromatic_v1` representation (the default in
+> `defog.data.chembl_reference`).
+>
+> v1/v2 are retained because existing artifacts decode against them. **Do not
+> build anything new on this schema.**
+
 A general-purpose **unconditional** DeFoG (Discrete Flow Matching) model for
 drug-like molecular graph generation, trained on cleaned ChEMBL 37. It is meant
 as a *frozen base* that downstream work (property adapters, guidance, RL
