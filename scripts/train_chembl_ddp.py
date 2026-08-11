@@ -305,6 +305,8 @@ def evaluate(args):
     while remaining > 0:
         cur = min(args.eval_chunk, remaining)
         samples += model.sample(num_samples=cur, sample_steps=args.eval_sample_steps,
+                                eta=args.eval_eta, omega=args.eval_omega,
+                                time_distortion=args.sweep_distortion,
                                 device=device, show_progress=False)
         remaining -= cur
 
@@ -432,6 +434,13 @@ def main():
     p.add_argument("--eval-ckpt", default=None)
     p.add_argument("--num-eval-samples", type=int, default=1000)
     p.add_argument("--eval-sample-steps", type=int, default=500)
+    # Until 2026-08-11 evaluate() did not pass these at all, so every eval ran at
+    # the model's construction defaults (eta=0, omega=0) no matter what config it
+    # was labelled with. That silently turns "final evaluation at the winning
+    # sweep config" into "another baseline measurement with a misleading name".
+    # Defaults kept at 0/0 so earlier eta=0 numbers remain reproducible.
+    p.add_argument("--eval-eta", type=float, default=0.0)
+    p.add_argument("--eval-omega", type=float, default=0.0)
     p.add_argument("--eval-chunk", type=int, default=64)
     # eta/omega sampling sweep
     p.add_argument("--sweep", action="store_true")

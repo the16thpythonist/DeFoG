@@ -51,12 +51,19 @@ PREFIX="${4:-}"
 # Cheap next to the alternative -- one more training link costs ~38 GPU-hours, a
 # higher-precision eval costs ~1.3.
 N="${5:-}"
+# $6/$7 = eta/omega. Until 2026-08-11 evaluate() ignored these entirely and always
+# sampled at eta=0/omega=0, so an eval labelled with a sweep-winning config
+# silently reported baseline numbers.
+ETA="${6:-}"
+OMEGA="${7:-}"
 
 REP_ARG=""; [ -n "$REP" ] && REP_ARG="--representation $REP"
 DATA_ARG=""; [ -n "$DATA_DIR" ] && DATA_ARG="--data-dir $DATA_DIR"
 PREFIX_ARG=""; [ -n "$PREFIX" ] && PREFIX_ARG="--prefix $PREFIX"
 N_ARG=""; [ -n "$N" ] && N_ARG="--num-eval-samples $N"
+ETA_ARG=""; [ -n "$ETA" ] && ETA_ARG="--eval-eta $ETA"
+OM_ARG=""; [ -n "$OMEGA" ] && OM_ARG="--eval-omega $OMEGA"
 
-echo "eval $CKPT ${REP:+(representation=$REP)} ${DATA_DIR:+(data=$DATA_DIR/$PREFIX)} ${N:+(n=$N)} @ $(date)"
-python -u scripts/train_chembl_ddp.py --eval-only --eval-ckpt "$CKPT" $REP_ARG $DATA_ARG $PREFIX_ARG $N_ARG
+echo "eval $CKPT ${REP:+(representation=$REP)} ${DATA_DIR:+(data=$DATA_DIR/$PREFIX)} ${N:+(n=$N)} (eta=${ETA:-0} omega=${OMEGA:-0}) @ $(date)"
+python -u scripts/train_chembl_ddp.py --eval-only --eval-ckpt "$CKPT" $REP_ARG $DATA_ARG $PREFIX_ARG $N_ARG $ETA_ARG $OM_ARG
 echo "eval done @ $(date)"
