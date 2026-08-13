@@ -228,3 +228,129 @@ def fit_property_head(head, graphs, *, epochs: int = 60, lr: float = 1e-3, batch
         if progress is not None and (epoch + 1) % 10 == 0:
             progress(f"  head fit epoch {epoch + 1}/{epochs}  loss {mean_loss:.4f}")
     return head.eval(), history
+
+
+def fit_size_model(conditions, sizes, *, min_size=None, max_size=None, hidden: int = 512,
+                   layers: int = 2, epochs: int = 200, lr: float = 1e-3,
+                   batch_size: int = 256, seed: int = 0, device: str = "cpu",
+                   val_frac: float = 0.1, grad_clip: float = 1.0,
+                   property_name: str = "", property_from: str = "",
+                   progress=None):
+    """Fit a :class:`~defog.core.size_distribution.LearnedSizeDistribution` on
+    ``(raw condition, node count)`` pairs.
+
+    Takes plain tensors. **No graphs, no PyG, no adapter anywhere in the loop** -- this
+    model never sees a molecule, only a property value and an atom count, so it is a few
+    seconds of CPU work. The practical consequence is that it retrofits to an
+    already-shipped adapter without retraining it.
+
+    Normalization statistics and the marginal ``P(n)`` are derived from the data here, so
+    a fitted model and its ``log_pmf`` agree by construction -- the same guarantee
+    :func:`fit_property_head` gives for ``predict``.
+
+    Returns ``(model, metrics)``. ``metrics`` carries the number that decides whether the
+    model is worth shipping:
+
+    ``gain_nats``
+        ``nll_marginal - nll_val``. This is how much better than doing nothing the model
+        predicts held-out sizes. **At ~0 the property carries no size information and the
+        conditional draw should not be used for it** -- report this rather than assuming
+        a fitted model is an improved one. For reference, a quantile-bucketed estimate on
+        the full ZINC train split gives ~0.10 nats for logP, ~0.17 for QED, ~0.14 for TPSA.
+
+    ``shrink``
+        Held-out ``std(n - E[n|c]) / std(n)``. Complements ``gain_nats`` by saying what
+        KIND of improvement it is. On ZINC this stays near 0.9: conditioning moves the
+        size distribution's centre (E[n|logP] spans 20.2-26.7 heavy atoms across deciles)
+        far more than it narrows its width. A bias correction, not a variance reduction.
+    """
+    import torch
+
+    from .size_distribution import LearnedSizeDistribution
+
+    conditions = torch.as_tensor(conditions, dtype=torch.float32)
+    if conditions.dim() == 1:
+        conditions = conditions.unsqueeze(-1)
+    sizes = torch.as_tensor(sizes, dtype=torch.long).reshape(-1)
+    assert conditions.size(0) == sizes.size(0), "conditions and sizes must align"
+    assert conditions.size(0) > 1, "need more than one (condition, size) pair"
+
+    lo = int(sizes.min()) if min_size is None else int(min_size)
+    hi = int(sizes.max()) if max_size is None else int(max_size)
+    assert (sizes >= lo).all() and (sizes <= hi).all(), \
+        f"sizes fall outside the requested grid {lo}..{hi}"
+
+    generator = torch.Generator().manual_seed(seed)
+    torch.manual_seed(seed)
+    perm = torch.randperm(sizes.numel(), generator=generator)
+    n_val = max(1, int(round(val_frac * sizes.numel()))) if val_frac > 0 else 0
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    assert train_idx.numel() > 0, "val_frac left no training data"
+
+    # The marginal and the normalisation come from the TRAINING rows only: a marginal
+    # that has seen the validation sizes makes `gain_nats` flatter than it is.
+    #
+    # Add-one smoothing across the declared grid, which is a real decision and not a
+    # numerical nicety. LearnedSizeDistribution treats a zero-mass bin as structurally
+    # unreachable, and that invariant is right for sizes OUTSIDE [lo, hi] -- the caller
+    # declaring the grid is saying the model must never emit them. It is wrong for a size
+    # inside the grid that this particular finite sample happened to miss: absence from a
+    # subsample is not impossibility, and hard-zeroing it sends every held-out molecule of
+    # that size to an infinite NLL, which is how `gain_nats` came back as `inf` rather than
+    # as a number. Callers who genuinely want hard zeros can build the marginal themselves
+    # and pass it to the constructor, which honours them.
+    counts = torch.bincount(sizes[train_idx] - lo, minlength=hi - lo + 1).float() + 1.0
+    model = LearnedSizeDistribution(
+        conditions.size(1), lo, hi, hidden=hidden, layers=layers,
+        cond_mean=conditions[train_idx].mean(0), cond_std=conditions[train_idx].std(0),
+        marginal=counts, property_name=property_name, property_from=property_from,
+    ).to(device)
+
+    ct, st = conditions[train_idx].to(device), sizes[train_idx].to(device)
+    cv, sv = conditions[val_idx].to(device), sizes[val_idx].to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    history = []
+    model.train()
+    for epoch in range(epochs):
+        order = torch.randperm(st.numel(), generator=generator).to(device)
+        total, seen = 0.0, 0
+        for i in range(0, order.numel(), batch_size):
+            idx = order[i:i + batch_size]
+            loss = -model.log_pmf(ct[idx]).gather(
+                1, (st[idx] - lo).unsqueeze(1)).squeeze(1).mean()
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
+            total += float(loss.detach()) * idx.numel()
+            seen += idx.numel()
+        history.append(total / max(1, seen))
+        if progress is not None and (epoch + 1) % 20 == 0:
+            progress(f"  size fit epoch {epoch + 1}/{epochs}  nll {history[-1]:.4f}")
+
+    model.eval()
+    with torch.no_grad():
+        log_marg = model.log_marginal
+        if n_val:
+            lp = model.log_pmf(cv)
+            bins = (sv - lo).unsqueeze(1)
+            nll_val = float(-lp.gather(1, bins).squeeze(1).mean())
+            nll_marg = float(-log_marg[sv - lo].mean())
+            grid = model.sizes().float()
+            expected = (lp.exp() * grid).sum(-1)
+            resid = (sv.float() - expected).std()
+            shrink = float(resid / sv.float().std()) if sv.numel() > 1 else float("nan")
+        else:
+            nll_val = nll_marg = shrink = float("nan")
+
+    metrics = {
+        "nll_train": history[-1] if history else float("nan"),
+        "nll_val": nll_val,
+        "nll_marginal": nll_marg,
+        "gain_nats": nll_marg - nll_val,
+        "shrink": shrink,
+        "n_train": int(train_idx.numel()), "n_val": int(n_val),
+        "min_size": lo, "max_size": hi,
+        "history": history,
+    }
+    return model, metrics

@@ -199,3 +199,6 @@ experiments/_gdpo_*.log
 # structural-sanity reference cache (large, regenerated on demand)
 data/.sanity_ref_*.json
 ckpts/
+
+# Downloaded reference papers (fetchable from arXiv; ~63MB)
+adapter_improvements/papers/

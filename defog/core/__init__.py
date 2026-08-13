@@ -66,12 +66,17 @@ from .size_distribution import (
     UniformSizeDistribution,
     CategoricalSizeDistribution,
     ConditionalSizeDistribution,
+    LearnedSizeDistribution,
+    SizeBranch,
+    ComposedSizeDistribution,
 )
 from .rate_matrix import RateMatrixDesigner
 from .sampler import Sampler, InpaintingSampler, GuidedSampler, RefinementSampler, AdaptedSampler
 from .adapter import (
     Modulation,
     AdaLNAdapter,
+    FingerprintEncoder,
+    SpectrumEncoder,
     ConditionBranch,
     AdapterComposition,
     AdapterRegistry,
@@ -156,6 +161,9 @@ __all__ = [
     "UniformSizeDistribution",
     "CategoricalSizeDistribution",
     "ConditionalSizeDistribution",
+    "LearnedSizeDistribution",
+    "SizeBranch",
+    "ComposedSizeDistribution",
     # Noise distribution
     "LimitDistribution",
     "sample_noise",
@@ -169,6 +177,8 @@ __all__ = [
     "AdaptedSampler",
     "Modulation",
     "AdaLNAdapter",
+    "FingerprintEncoder",
+    "SpectrumEncoder",
     "ConditionBranch",
     "AdapterComposition",
     "AdapterRegistry",

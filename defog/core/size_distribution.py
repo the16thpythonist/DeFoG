@@ -11,18 +11,30 @@ from a :class:`SizeDistribution`. This can be:
 - :class:`ExplicitSizeDistribution` -- an explicit per-sample list of sizes.
 - :class:`UniformSizeDistribution` -- uniform over a user-specified range.
 - :class:`CategoricalSizeDistribution` -- an arbitrary user-specified pmf.
-- :class:`ConditionalSizeDistribution` -- ``P(n | c)`` estimated from the
-  training ``(condition, size)`` pairs, so that size-correlated properties
+- :class:`ConditionalSizeDistribution` -- ``P(n | c)`` estimated non-parametrically
+  from training ``(condition, size)`` pairs, so that size-correlated properties
   (molecular weight, edge count, diameter, ...) draw a *consistent* size.
+- :class:`LearnedSizeDistribution` -- ``P(n | c)`` from a small trained MLP with a
+  categorical output, the parametric counterpart of the above.
+- :class:`ComposedSizeDistribution` -- product-of-experts over several
+  :class:`LearnedSizeDistribution` branches, for multi-adapter steering.
 
-The condition passed to ``sample`` must live in the **same (normalized) space**
-the model was trained on; conditioning-unaware distributions simply ignore it.
+**Which space is the condition in?** The older, non-parametric distributions take a
+condition in whatever space their stored training conditions were in, and ignore it
+entirely if they are conditioning-unaware. :class:`LearnedSizeDistribution` instead
+takes the **RAW** condition and normalizes internally from its own buffers, matching
+the convention :class:`~defog.core.adapter.AdaLNAdapter` and ``ConditionBranch``
+already use. Prefer that convention for anything new: "the caller normalizes" is how
+a target ends up normalized twice, or by the wrong statistics.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Sequence, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SizeDistribution(ABC):
@@ -341,3 +353,449 @@ class ConditionalSizeDistribution(SizeDistribution):
         conditions = torch.cat(conditions, dim=0)
         sizes = torch.cat(sizes, dim=0)
         return cls(conditions, sizes, method=method, **kwargs)
+
+
+# ===========================================================================
+# Learned P(n | c)
+# ===========================================================================
+_NEG_INF = float("-inf")
+
+
+class LearnedSizeDistribution(nn.Module, SizeDistribution):
+    """``P(n | c)`` from a small MLP with a CATEGORICAL output over node counts.
+
+    The parametric counterpart to :class:`ConditionalSizeDistribution`, and the
+    mechanism FreeGress (arXiv 2312.17397 §3.1) calls ``p_xi(n | y)``: a two-hidden-layer
+    ReLU network with a softmax over sizes, replacing the dataset's marginal ``P(n)``.
+    Its argument is that a target property may only be attainable at particular atom
+    counts, so drawing ``n`` from the marginal and then asking the denoiser to hit the
+    target means fighting the size draw for the whole trajectory.
+
+    Measured on the ZINC reference train split, that argument holds here too:
+    ``E[n | logP]`` moves from 20.2 to 26.7 heavy atoms across logP deciles (a 1.4-sigma
+    swing) while the marginal offers 23.2 regardless, and the mismatch is worst in the
+    top and bottom deciles -- exactly where targeting is hardest. Note what it does NOT
+    do: the conditional spread barely narrows (std 4.51 -> 4.11). This is a bias
+    correction on the size draw, not a variance reduction, and should be described that
+    way.
+
+    Three design choices worth stating, because each has an alternative that looks
+    equivalent and is not:
+
+    * **Categorical output, not a regressed mean.** A Gaussian head cannot express the
+      multimodality of real size distributions, and -- more importantly here -- gives no
+      exact ``log_pmf`` for :class:`ComposedSizeDistribution` to combine. (Note that
+      :class:`ConditionalSizeDistribution` implements no ``log_prob`` at all, which is
+      why it cannot be composed.)
+    * **The condition arrives RAW and is normalized inside**, from the ``cond_mean`` /
+      ``cond_std`` buffers, exactly as :meth:`AdaLNAdapter.normalize` does. Pair this
+      model with an adapter via :meth:`check_compatible` rather than trusting a caller
+      to have applied the right statistics.
+    * **Sizes with zero marginal mass stay at probability zero**, at fit time and at
+      sampling time. This mirrors the invariant in ``DeFoGModel._blend_rates`` that
+      structurally-forbidden transitions stay forbidden: the model may reweight the
+      support, never extend it.
+
+    Args:
+        cond_dim: Width of the raw condition (1 for a scalar property).
+        min_size, max_size: Inclusive node-count grid. Bin ``i`` is size ``min_size + i``.
+        hidden, layers: MLP width / number of hidden layers.
+        cond_mean, cond_std: Normalization statistics for the raw condition.
+        marginal: ``P(n)`` over the grid -- the ``condition=None`` fallback, the
+            product-of-experts anchor, and the baseline the fitter scores against.
+            Defaults to uniform, which makes every size "supported"; pass the real
+            training histogram in anything but a unit test.
+        cond_encoder: Reserved for wide conditions (fingerprints, spectra). Declared in
+            the config format now so adding one later needs no package migration; no
+            encoder is wired in this version.
+        property_name, property_from: Provenance. ``property_from`` records the label
+            convention ("decoded" / "source") the model was fit under -- a size model fit
+            on source labels and paired with an adapter conditioned on decoded ones will
+            disagree precisely at the extremes.
+    """
+
+    def __init__(
+        self,
+        cond_dim: int,
+        min_size: int,
+        max_size: int,
+        hidden: int = 512,
+        layers: int = 2,
+        cond_mean=None,
+        cond_std=None,
+        marginal=None,
+        cond_encoder: Optional[nn.Module] = None,
+        property_name: str = "",
+        property_from: str = "",
+    ):
+        nn.Module.__init__(self)
+        assert min_size >= 1, "min_size must be >= 1"
+        assert max_size >= min_size, "max_size must be >= min_size"
+        assert layers >= 1, "need at least one hidden layer"
+        self.cond_dim = int(cond_dim)
+        self._min_size = int(min_size)
+        self._max_size = int(max_size)
+        self.hidden = int(hidden)
+        self.layers = int(layers)
+        self.property_name = property_name
+        self.property_from = property_from
+
+        if cond_encoder is not None:
+            raise NotImplementedError(
+                "cond_encoder is a reserved config slot; no encoder is wired in this "
+                "version. Scalar-property conditions only."
+            )
+        self.cond_encoder = None
+
+        n_bins = self._max_size - self._min_size + 1
+        net: List[nn.Module] = []
+        in_dim = self.cond_dim
+        for _ in range(self.layers):
+            net += [nn.Linear(in_dim, self.hidden), nn.ReLU()]
+            in_dim = self.hidden
+        net += [nn.Linear(in_dim, n_bins)]
+        self.net = nn.Sequential(*net)
+
+        m = torch.zeros(self.cond_dim) if cond_mean is None else \
+            torch.as_tensor(cond_mean, dtype=torch.float32).reshape(-1)
+        s = torch.ones(self.cond_dim) if cond_std is None else \
+            torch.as_tensor(cond_std, dtype=torch.float32).reshape(-1).clamp_min(1e-6)
+        assert m.numel() == self.cond_dim and s.numel() == self.cond_dim, \
+            f"cond_mean/cond_std must have {self.cond_dim} entries"
+
+        if marginal is None:
+            p = torch.ones(n_bins)
+        else:
+            p = torch.as_tensor(marginal, dtype=torch.float32).reshape(-1)
+            assert p.numel() == n_bins, (
+                f"marginal has {p.numel()} bins but the grid "
+                f"{self._min_size}..{self._max_size} has {n_bins}"
+            )
+            assert (p >= 0).all() and p.sum() > 0, "marginal must be non-negative with mass"
+        self.register_buffer("cond_mean", m)
+        self.register_buffer("cond_std", s)
+        self.register_buffer("marginal", p / p.sum())
+
+    # -- grid ----------------------------------------------------------------
+
+    @property
+    def min_size(self) -> int:
+        return self._min_size
+
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
+    @property
+    def n_bins(self) -> int:
+        return self._max_size - self._min_size + 1
+
+    @property
+    def support(self) -> torch.Tensor:
+        """Boolean mask of sizes the training marginal actually gave mass to."""
+        return self.marginal > 0
+
+    @property
+    def log_marginal(self) -> torch.Tensor:
+        """``log P(n)`` over the grid; ``-inf`` off-support."""
+        return torch.log(self.marginal)
+
+    def sizes(self) -> torch.Tensor:
+        """The node counts each bin stands for, ``(n_bins,)``."""
+        return torch.arange(self._min_size, self._max_size + 1, device=self.marginal.device)
+
+    # -- forward -------------------------------------------------------------
+
+    def normalize(self, c: torch.Tensor) -> torch.Tensor:
+        return (c - self.cond_mean) / self.cond_std
+
+    def _prepare(self, condition, num_samples: Optional[int]) -> torch.Tensor:
+        c = torch.as_tensor(condition, dtype=torch.float32, device=self.marginal.device)
+        if c.dim() == 1:
+            c = c.unsqueeze(0) if self.cond_dim > 1 else c.reshape(-1, 1)
+        assert c.size(-1) == self.cond_dim, \
+            f"condition has width {c.size(-1)}, expected {self.cond_dim}"
+        if num_samples is not None and c.size(0) == 1 and num_samples > 1:
+            c = c.expand(num_samples, -1)
+        if num_samples is not None:
+            assert c.size(0) == num_samples, \
+                f"condition has {c.size(0)} rows but {num_samples} samples were requested"
+        return c
+
+    def log_pmf(self, condition=None, num_samples: Optional[int] = None) -> torch.Tensor:
+        """Normalized ``log P(n | c)``, shape ``(bs, n_bins)``.
+
+        ``condition=None`` returns the marginal, broadcast to ``num_samples`` rows --
+        the same fallback :class:`ConditionalSizeDistribution` makes, so swapping the two
+        cannot silently change unconditional behaviour.
+        """
+        support = self.support
+        if condition is None:
+            lp = self.log_marginal.unsqueeze(0)
+            return lp.expand(num_samples or 1, -1)
+        c = self._prepare(condition, num_samples)
+        logits = self.net(self.normalize(c))
+        return torch.log_softmax(logits.masked_fill(~support, _NEG_INF), dim=-1)
+
+    def forward(self, condition=None, num_samples: Optional[int] = None) -> torch.Tensor:
+        return self.log_pmf(condition, num_samples)
+
+    # -- SizeDistribution ----------------------------------------------------
+
+    def sample(self, num_samples, condition=None, device=None, generator=None):
+        with torch.no_grad():
+            probs = self.log_pmf(condition, num_samples=num_samples).exp()
+        if probs.size(0) == 1 and num_samples > 1:
+            probs = probs.expand(num_samples, -1)
+        # multinomial on CPU: `generator` is a CPU generator by convention here (see
+        # ConditionalSizeDistribution._sample_kernel), and the grid is tiny.
+        idx = torch.multinomial(probs.cpu(), 1, generator=generator).squeeze(1)
+        return self._to((idx + self._min_size).long(), device)
+
+    def log_prob(self, sizes, condition=None):
+        sizes = torch.as_tensor(sizes, dtype=torch.long).reshape(-1)
+        lp = self.log_pmf(condition, num_samples=sizes.numel())
+        if lp.size(0) == 1 and sizes.numel() > 1:
+            lp = lp.expand(sizes.numel(), -1)
+        bins = sizes.to(lp.device) - self._min_size
+        inside = (bins >= 0) & (bins < self.n_bins)
+        out = torch.full((sizes.numel(),), _NEG_INF, device=lp.device, dtype=lp.dtype)
+        if inside.any():
+            out[inside] = lp[inside].gather(1, bins[inside].unsqueeze(1)).squeeze(1)
+        return out.to(sizes.device)
+
+    # -- pairing -------------------------------------------------------------
+
+    def check_compatible(self, adapter, tol: float = 1e-4):
+        """Assert this model and ``adapter`` speak the same conditioning language.
+
+        Catches the failure the ZINC heads already hit once: a model fit against one
+        label convention paired with an adapter trained on another. Both parts are
+        individually correct and the pair is wrong only at the extremes, which is where
+        nobody is looking.
+        """
+        assert self.cond_dim == adapter.cond_dim, (
+            f"size model expects a width-{self.cond_dim} condition but the adapter's is "
+            f"{adapter.cond_dim}"
+        )
+        for name in ("cond_mean", "cond_std"):
+            mine, theirs = getattr(self, name), getattr(adapter, name).to(self.marginal.device)
+            assert torch.allclose(mine, theirs, atol=tol), (
+                f"{name} differs between the size model ({mine.tolist()}) and the adapter "
+                f"({theirs.tolist()}). They were fit on differently-scaled targets, so the "
+                f"size draw will not match the steering."
+            )
+        return True
+
+    # -- io ------------------------------------------------------------------
+
+    def config(self) -> dict:
+        """Architecture config needed to rebuild this model (buffers live in the
+        state dict, and their shapes are all derivable from these fields)."""
+        return {
+            "cond_dim": self.cond_dim, "min_size": self._min_size,
+            "max_size": self._max_size, "hidden": self.hidden, "layers": self.layers,
+            "cond_encoder": None,
+            "property_name": self.property_name, "property_from": self.property_from,
+        }
+
+    @classmethod
+    def from_config(cls, config: dict, state_dict: dict, device="cpu"):
+        known = {
+            "cond_dim", "min_size", "max_size", "hidden", "layers",
+            "property_name", "property_from",
+        }
+        cfg = {k: v for k, v in config.items() if k in known}
+        model = cls(**cfg)
+        model.load_state_dict(state_dict)      # includes cond_mean/cond_std/marginal
+        return model.to(device).eval()
+
+    def save(self, path):
+        path = str(path)
+        if not path.endswith(".ckpt"):
+            path += ".ckpt"
+        torch.save({"state_dict": self.state_dict(), "config": self.config()}, path)
+        return path
+
+    @classmethod
+    def load(cls, path, device="cpu"):
+        path = str(path)
+        if not path.endswith(".ckpt"):
+            path += ".ckpt"
+        ck = torch.load(path, map_location=device, weights_only=False)
+        return cls.from_config(ck["config"], ck["state_dict"], device=device)
+
+
+# ===========================================================================
+# Composition
+# ===========================================================================
+@dataclass
+class SizeBranch:
+    """One conditioned size model in a composition: the model, a RAW condition
+    (the model normalizes internally), and its weight. Mirrors
+    :class:`~defog.core.adapter.ConditionBranch`."""
+
+    dist: LearnedSizeDistribution
+    condition: Any
+    weight: float = 1.0
+
+
+class ComposedSizeDistribution(SizeDistribution):
+    r"""Product-of-experts over several :class:`LearnedSizeDistribution` branches.
+
+    When two adapters steer two properties, each has an opinion about how big the
+    molecule should be, and the sampler needs one number. Assuming the targets are
+    conditionally independent given the size,
+
+    .. math::
+        p(n \mid y_1 \ldots y_N) \;\propto\; P(n) \prod_i \frac{p_i(n \mid y_i)}{P(n)}
+
+    which in log space is ``log P(n) + sum_i w_i [log p_i(n|y_i) - log P(n)]``,
+    renormalized. That is exactly the algebra ``DeFoGModel._blend_rates`` already applies
+    to rate matrices, with the dataset marginal in the role the frozen base plays there,
+    and the same ``product`` / ``mean`` modes as ``AdapterComposition``.
+
+    Two things make this better behaved than the rate-matrix blend: the grid is ~30
+    categories, so the normalization is exact and needs none of the clamping that blend
+    requires; and the resulting entropy is available in closed form, so collapse is
+    observable rather than inferred (see :meth:`diagnostics`).
+
+    **On the default mode.** ``product`` is correct only to the extent the branches carry
+    independent information about ``n``, and the intuition that two size-correlated
+    properties must be largely redundant is wrong here. Measured on 219,568 ZINC train
+    molecules at matched 49-bucket resolution, the logP+QED joint recovers 0.236 nats
+    against a sum-of-singles of 0.266 and a best-single of 0.169 -- 89% additive. The
+    reason is that the two pull size in opposite directions (corr +0.398 and -0.321), so
+    they act as near-orthogonal constraints rather than duplicate votes. ``mean`` remains
+    available for the residual sub-additivity, and halves the deviation.
+    """
+
+    def __init__(self, branches: Sequence[SizeBranch], mode: str = "product",
+                 marginal=None, max_divergence: float = 0.05):
+        """
+        Args:
+            marginal: The single ``P(n)`` anchor every log-ratio is taken against.
+                Defaults to the first branch's.
+            max_divergence: Reject branches whose own marginal sits further than this in
+                total-variation distance from the anchor.
+
+        On why the anchor is a parameter and not a consensus: the formula contains ONE
+        ``log P(n)``, so the composition picks an anchor -- it does not require the
+        branches to have memorised identical copies of one. Demanding exact agreement
+        conflates "these were fit on the same data" with "we use one anchor", and fails in
+        normal use, since two size models fit from the same dataset still differ in which
+        molecules RDKit dropped and how the split fell. What genuinely breaks the
+        composition is an anchor that is *materially* wrong for a branch, so the guard is a
+        distance with a threshold: TV = 0.05 means at most 5% of the probability mass sits
+        somewhere different, which comfortably admits sampling noise and still catches a
+        model fit on another dataset or vocabulary.
+        """
+        assert mode in ("product", "mean"), f"unknown mode {mode!r}"
+        assert len(branches) >= 1, "need at least one branch"
+        self.branches = list(branches)
+        self.mode = mode
+
+        first = self.branches[0].dist
+        self._min_size, self._max_size = first.min_size, first.max_size
+        for b in self.branches[1:]:
+            assert (b.dist.min_size, b.dist.max_size) == (self._min_size, self._max_size), (
+                f"branches disagree on the size grid: {self._min_size}..{self._max_size} "
+                f"vs {b.dist.min_size}..{b.dist.max_size}. A product of experts needs one "
+                f"shared support."
+            )
+        anchor = first.marginal if marginal is None else \
+            torch.as_tensor(marginal, dtype=torch.float32).reshape(-1)
+        assert anchor.numel() == self._max_size - self._min_size + 1, \
+            "the anchor marginal does not match the branches' size grid"
+        anchor = anchor / anchor.sum()
+        for i, b in enumerate(self.branches):
+            tv = float(0.5 * (b.dist.marginal.to(anchor.device) - anchor).abs().sum())
+            if tv > max_divergence:
+                raise AssertionError(
+                    f"branch {i} ({b.dist.property_name or 'unnamed'}) carries a marginal "
+                    f"P(n) that is {tv:.3f} in total variation from the anchor, above the "
+                    f"{max_divergence} limit. The anchor is what every log-ratio is taken "
+                    f"against, so a branch this far from it was fit on different data and "
+                    f"its ratios are not comparable with the others'."
+                )
+        self._marginal = anchor
+
+    # -- core ----------------------------------------------------------------
+
+    def log_pmf(self, num_samples: Optional[int] = None) -> torch.Tensor:
+        """Blended ``log q(n)``, shape ``(bs, n_bins)``."""
+        support = self._marginal > 0
+        keep = support.unsqueeze(0)
+        # Off-support bins are -inf in every term; zero them before differencing so the
+        # arithmetic never sees (-inf) - (-inf) = nan, then mask the result back out.
+        lu = torch.where(keep, torch.log(self._marginal).unsqueeze(0),
+                         torch.zeros(1, self._marginal.numel(), device=self._marginal.device))
+        dev = torch.zeros_like(lu)
+        for b in self.branches:
+            lc = b.dist.log_pmf(b.condition, num_samples=num_samples)
+            lc = torch.where(keep, lc, torch.zeros_like(lc))
+            dev = dev + float(b.weight) * (lc - lu)
+        if self.mode == "mean":
+            dev = dev / len(self.branches)
+        lq = (lu + dev).masked_fill(~keep, _NEG_INF)
+        return torch.log_softmax(lq, dim=-1)
+
+    def sample(self, num_samples, condition=None, device=None, generator=None):
+        """``condition`` is ignored: each branch carries its own, as in
+        ``AdapterComposition``."""
+        with torch.no_grad():
+            probs = self.log_pmf(num_samples=num_samples).exp()
+        if probs.size(0) == 1 and num_samples > 1:
+            probs = probs.expand(num_samples, -1)
+        idx = torch.multinomial(probs.cpu(), 1, generator=generator).squeeze(1)
+        return self._to((idx + self._min_size).long(), device)
+
+    def log_prob(self, sizes, condition=None):
+        sizes = torch.as_tensor(sizes, dtype=torch.long).reshape(-1)
+        lp = self.log_pmf(num_samples=sizes.numel())
+        if lp.size(0) == 1 and sizes.numel() > 1:
+            lp = lp.expand(sizes.numel(), -1)
+        bins = sizes.to(lp.device) - self._min_size
+        inside = (bins >= 0) & (bins < lp.size(-1))
+        out = torch.full((sizes.numel(),), _NEG_INF, device=lp.device, dtype=lp.dtype)
+        if inside.any():
+            out[inside] = lp[inside].gather(1, bins[inside].unsqueeze(1)).squeeze(1)
+        return out.to(sizes.device)
+
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
+    # -- diagnostics ---------------------------------------------------------
+
+    def diagnostics(self, num_samples: Optional[int] = None) -> Dict[str, float]:
+        """Is the blend collapsing, and do the branches agree?
+
+        * ``entropy`` / ``marginal_entropy`` -- nats. A blend far below the marginal has
+          concentrated the size draw, which buys MAE with diversity; report it beside any
+          MAE improvement rather than after someone asks.
+        * ``agreement`` -- the smallest pairwise Bhattacharyya coefficient
+          ``sum_n sqrt(p_i p_j)``, in [0, 1]. Near zero means the branches want disjoint
+          size ranges, so the product is supported only on their thin overlap, which is
+          where both models are least reliable.
+        """
+        with torch.no_grad():
+            q = self.log_pmf(num_samples=num_samples).exp().mean(0)
+            ent = float(-(q * torch.log(q.clamp_min(1e-30))).sum())
+            m = self._marginal
+            m_ent = float(-(m * torch.log(m.clamp_min(1e-30))).sum())
+            per = [b.dist.log_pmf(b.condition, num_samples=num_samples).exp().mean(0)
+                   for b in self.branches]
+            agreement = 1.0
+            for i in range(len(per)):
+                for j in range(i + 1, len(per)):
+                    agreement = min(agreement, float((per[i] * per[j]).sqrt().sum()))
+            return {
+                "entropy": ent,
+                "marginal_entropy": m_ent,
+                "entropy_ratio": ent / m_ent if m_ent > 0 else float("nan"),
+                "agreement": agreement,
+                "modal_size": int(q.argmax()) + self._min_size,
+                "mean_size": float((q * torch.arange(
+                    self._min_size, self._max_size + 1, dtype=q.dtype, device=q.device)).sum()),
+            }
