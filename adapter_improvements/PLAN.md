@@ -42,7 +42,52 @@ unvalidated. Decide the freeze point deliberately. My recommendation is marked b
 
 ---
 
-## Wave 1 — finish what is already built
+## Wave 1 — DONE (2026-08-13). Null pooled; a real, pre-registered win at the low end.
+
+Run on the frozen Wave-2 config (prob blend, w=2.0): `{marginal, learned} × {seed 42, 43}`,
+KCIST job 43080. Size model fitted against `clogp@1.2.0`'s own labels — the decoded
+pipeline reproduced its `cond_mean`/`cond_std` to **six decimals** (2.825129 / 1.158113),
+so the label convention is confirmed rather than assumed. Fit gain **+0.0939 nats**,
+shrink 0.911.
+
+| arm | MAE | low | mid | high | validity |
+|---|---|---|---|---|---|
+| marginal seed42 | 0.5420 | 0.696 | 0.470 | 0.455 | 0.982 |
+| marginal seed43 | 0.5338 | 0.681 | 0.473 | 0.443 | 0.989 |
+| learned seed42 | 0.5400 | 0.657 | 0.495 | 0.465 | 0.979 |
+| learned seed43 | 0.5358 | 0.606 | 0.508 | 0.492 | 0.983 |
+
+**Pooled: nothing.** Mean paired difference +0.0002, learned better on exactly 100/200,
+p≈0.80. Reported first because it is the headline number and it is null.
+
+**By target third, pooled over both seeds:**
+
+| third | n | target range | marginal | learned | Δ | p | validity |
+|---|---|---|---|---|---|---|---|
+| **low** | 68 | [−3.95, 1.83] | 0.6888 | **0.6314** | **−0.0575** | **0.035** | 0.984 → 0.991 |
+| mid | 66 | [1.78, 3.29] | 0.4715 | 0.5015 | +0.0300 | 0.33 | 0.986 → 0.980 |
+| high | 66 | [3.24, 5.34] | 0.4486 | 0.4783 | +0.0297 | 0.31 | 0.986 → 0.971 |
+
+Learned size **helps the low-logP third by 8.3% and improves its validity**, while costing
+a non-significant amount at mid and high. It is a redistribution, not a gain.
+
+**How much to believe it.** In favour: the prediction was made *before* the run (Wave 1 was
+justified on "size conditioning should help disproportionately at the low end, which is
+where prob-space blending did nothing"), and the sign replicates independently in both
+seeds across all three thirds. Against: it is one subgroup of three, and p=0.035 becomes
+0.105 under Bonferroni. Treat as **suggestive and worth one confirmatory low-end run**,
+not as established.
+
+This partly walks back the "low end is a pure capacity wall" reading from Wave 2. Some of
+that failure was the base being handed the wrong atom count — and note validity *rises* at
+the low end with the correct size, while falling at the high end, where the learned model
+asks for bigger molecules that break more easily under strong guidance.
+
+**Also established here:** the pipeline is **exactly deterministic** (marginal/seed42
+reproduced the earlier identical-config run to 1e-9), and the **seed spread is 0.0082** —
+so Wave 2's −16% headline (Δ0.103) is ~12× run-to-run noise.
+
+## Wave 1 (original text) — finish what is already built
 
 **Run the node-count ablation pair** on `clogp@1.2.0`, validation split: `--size-mode
 marginal` vs `--size-mode learned`. The code, the fitted models and the harness flag all
@@ -58,7 +103,66 @@ which changes how much the later waves have left to win.
 
 ---
 
-## Wave 2 — the free inference-time fix
+## Wave 2 — DONE (2026-08-13). Result below; it changes Wave 3.
+
+Implemented as `AdapterComposition.blend_space` (default `"rate"`, so prior numbers
+reproduce). Branch `feat/prob-space-blending`, KCIST jobs 43069 / 43072.
+E2 logP, validation, 100 targets × 10, adapter-only, seed 42, 500 steps, η=25, size marginal.
+
+| blend | w | MAE | low | mid | high | validity |
+|---|---|---|---|---|---|---|
+| rate *(historical)* | 1.0 | 0.6453 | 0.712 | 0.593 | 0.629 | 0.991 |
+| rate | 2.0 | **5.5948** | 8.385 | 6.326 | 2.049 | **0.526** |
+| prob | 1.0 | 0.6410 | 0.711 | 0.599 | 0.614 | 0.997 |
+| **prob** | **2.0** | **0.5420** | 0.696 | 0.470 | 0.455 | 0.982 |
+| prob | 2.5 | 0.5818 | 0.813 | 0.479 | 0.480 | 0.957 |
+| prob | 3.0 | 0.5943 | 0.858 | 0.459 | 0.491 | 0.898 |
+| prob | 4.0 | 0.6717 | 1.237 | 0.613 | 0.584 | 0.466 |
+| prob | 6.0 | 5.9468 | — | — | — | 0.031 |
+
+**At w=1 the change is a no-op**, exactly as theory says (paired mean −0.0034, 51/100,
+Wilcoxon p=0.72) — the guided distribution *is* `p_cond` there. **At w=2 rate-space is
+catastrophically broken** (paired mean −5.05, prob better on 99/99, p=5.7e-18) and prob-space
+is not. The rate arm runs the *unchanged* code path, and `model.py:1053` documents the
+mechanism in its own docstring: "w>1 with a small R_uncond can make the log-ratio deviation
+explode". The `1e5` clamp does not rescue the distribution.
+
+**Headline: 0.6453 → 0.5420, −16.0%, for a 0.9pt validity cost.** Also ~6% faster
+(1047s vs 1111s per arm: one `compute_rate_matrices` call per step instead of two). For
+scale that nearly matches FK at K=64 (0.5194) without the 64-particle cost.
+
+### The asymmetry, which is the more interesting finding
+
+Validity **by target third** at increasing w:
+
+| w | low | mid | high |
+|---|---|---|---|
+| 1.0 | 0.991 | 1.000 | 1.000 |
+| 2.0 | 0.982 | 0.982 | 0.982 |
+| 3.0 | 0.835 | 0.930 | 0.930 |
+| 4.0 | **0.232** | 0.518 | 0.655 |
+
+Two distinct low-end problems, not one. **(a)** Even at w=2, where validity is uniform, the
+low third barely responds to guidance (0.711 → 0.696, −2%) while mid and high move −22% and
+−26%. **(b)** Past w=2 the low third breaks structurally *far* faster than the high third.
+Target logP spans [−3.95, 5.34] with the base centred near 2.46, so the low third is asking
+the model to go below its own centre — which needs polar/heteroatom content the frozen base
+evidently cannot add without wrecking the molecule.
+
+This is evidence for the **capacity** side of the Wave 4 question, at least at the low end:
+the base cannot make these molecules, and pushing harder destroys them rather than steering
+them. It also matches the RL notes ("tightens HIGH-logP in all 4 seeds but not LOW-logP").
+
+### Consequence: Wave 3's expected value just dropped
+
+Wave 3 was ranked highest because `w=1` always won and a miscalibrated null seemed the likely
+cause. **That symptom is now explained and fixed by the blend space instead.** With prob-space
+we sit at an optimum of w=2, which is the same regime FreeGress's learned null reaches (their
+best logP is at s=2–3). A learned null may still help, but the specific evidence that
+motivated it is gone. **Demote Wave 3 below Wave 4** and re-derive the case for it before
+spending 3–5 days.
+
+## Wave 2 (original text) — the free inference-time fix
 
 **Blend branches in probability space, not rate space.** Today `denoise_step` builds a full
 rate matrix per branch — each drawing *its own* `X₁` sample (`model.py:999`) — and blends

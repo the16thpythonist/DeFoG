@@ -339,6 +339,39 @@ Still to run: the E2 ablation pair against `clogp@1.2.0`.
 
 ---
 
+## Part 6b — Correction: what rate-space blending actually does
+
+Written after implementing Wave 2. The argument in Part 5 called rate-space blending
+"extra estimator noise". That understates it.
+
+`rate_matrix.py:104` builds the rate matrix from a **discrete sample** of the clean graph,
+not from the predicted marginal:
+
+```python
+# Sample x_1 from predicted distribution
+sampled = sample_from_probs(X_1_pred, E_1_pred, node_mask)
+```
+
+So the two placements are:
+
+| | what it does |
+|---|---|
+| `rate` | draw `X₁` from `p_uncond`, draw `X₁` from `p_cond`, build a rate matrix from each, take their geometric mean |
+| `prob` | blend the marginals into the guided `q`, draw `X₁` **once from `q`**, build one rate matrix |
+
+Only the second is what classifier-free guidance means. The first averages two rate
+matrices derived from two different discrete samples of two different distributions.
+
+**This also makes the change hard to measure, in a way worth recording.** The two paths
+consume the random stream a different number of times (N+1 draws vs 1), so naive
+comparisons measure RNG alignment rather than the math — three of my first attempts did
+exactly that and disagreed with each other. Pinning the draw makes them agree *exactly* at
+every `w`, which is equally misleading: with one uniform draw fixed the sampled `X₁` stops
+moving with `p`, so `R` is locally constant. The difference is distributional and has to be
+measured as one. Two hypotheses died here and are pinned as tests: prob-space does **not**
+re-open transitions the base vetoes (those zeros are structural), and the paths are **not**
+pointwise equal at `w=1`.
+
 ## Part 7 — Calibration
 
 | | odds | note |
@@ -373,9 +406,8 @@ Two other levers from the same analysis, not yet pursued:
   Currently the unconditional branch is the frozen base, so `(cond − uncond)` is dominated by
   whatever the small adapter changed. That `w=1.0` always wins is a symptom of a
   poorly-calibrated guidance direction, not a property of the task.
-- **Blend in probability space** rather than rate space, matching FreeGress Eq. 10. We build a
-  full rate matrix per branch, each drawing its own `X₁` sample (`model.py:999`) — extra
-  estimator noise, and inconsistent with our own terminal step, which PoE-blends log-probs.
+- **Blend in probability space** rather than rate space, matching FreeGress Eq. 10/11.
+  **Implemented and under test — see `PLAN.md` Wave 2 and the note below.**
 
 ---
 
