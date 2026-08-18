@@ -41,6 +41,73 @@ RDLogger.DisableLog("rdApp.*")
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _vocabulary(name: str):
+    """(atom_types, bond_types, kekulize, smiles_source) for a named base vocabulary.
+
+    Kept identical to adapter_training__zinc.py._vocabulary: an adapter and the RL that
+    fine-tunes it must agree on the class order, and the two lists differ in ORDER as
+    well as in the bond set.
+    """
+    if name == "legacy_aromatic":
+        return (["C", "N", "O", "S", "F", "Cl", "Br", "I", "P"],
+                ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"], False, "csv")
+    if name == "e1_kekulized":
+        from defog.data import zinc_reference as zref
+
+        return (list(zref.ATOM_TYPES), list(zref.BOND_TYPES), True, "reference_split")
+    raise ValueError(f"unknown VOCABULARY {name!r}; have 'legacy_aromatic', 'e1_kekulized'")
+
+
+def _reference_values(e, prop_fn, atom_encoder, bond_encoder, atom_decoder, bond_decoder,
+                      kekulize, smiles_source):
+    """Property values over a reference sample, under the adapter's own label convention.
+
+    ``PROPERTY_FROM='decoded'`` measures the molecule the GRAPH represents (encode ->
+    decode -> measure) rather than the input SMILES. The RL target range, the eval
+    percentiles and ``prop_std`` are all derived from this, so getting it wrong shifts
+    every target the policy ever sees relative to what the adapter was trained on.
+    """
+    from defog.domains.molecule import smiles_to_pyg_data
+
+    if smiles_source == "reference_split":
+        from defog.data import zinc_reference as zref
+        pool = zref.load_reference_split().train_smiles
+        rng = np.random.default_rng(e.SEED)
+        idx = rng.permutation(len(pool))[:min(e.REF_SUBSAMPLE, len(pool))]
+        smiles = [pool[int(i)] for i in idx]
+    else:
+        df = pd.read_csv(e.CSV_PATH)
+        smiles = df[e.SMILES_COLUMN].sample(min(e.REF_SUBSAMPLE, len(df)),
+                                            random_state=e.SEED).tolist()
+
+    vals, n_skipped = [], 0
+    for smi in smiles:
+        m = Chem.MolFromSmiles(smi)
+        if m is None:
+            n_skipped += 1
+            continue
+        if e.PROPERTY_FROM == "decoded":
+            d = smiles_to_pyg_data(smi, atom_encoder, bond_encoder, kekulize=kekulize)
+            if d is None:
+                n_skipped += 1
+                continue
+            m2 = pyg_data_to_mol(d, atom_decoder, bond_decoder)
+            s2 = mol_to_smiles(m2) if m2 is not None else None
+            m = Chem.MolFromSmiles(s2) if s2 else None
+            if m is None:
+                n_skipped += 1
+                continue
+        try:
+            vals.append(float(prop_fn(m)))
+        except Exception:                                       # noqa: BLE001
+            n_skipped += 1
+    if n_skipped > 0.02 * max(1, len(smiles)):
+        raise RuntimeError(
+            f"{n_skipped}/{len(smiles)} reference molecules failed to encode/measure. "
+            f"Under a matching vocabulary this is near zero -- check VOCABULARY.")
+    return np.asarray(vals), n_skipped
+
+
 def _make_prop_fns():
     """RDKit ground-truth property fns -- used for EVAL/validation even when the REWARD is a
     learned head. SAScore lives in RDKit's Contrib dir, so add it to sys.path."""
@@ -65,9 +132,33 @@ PROP_FNS = _make_prop_fns()
 # ============================================================================
 CSV_PATH: str = os.path.join(_PROJECT_DIR, "data", "zinc_250k_rdkit.csv")
 SMILES_COLUMN: str = "smiles"
+# :param VOCABULARY: which frozen base this adapter belongs to. ATOM_TYPES/BOND_TYPES
+#     below are the legacy defaults and are IGNORED unless VOCABULARY is
+#     "legacy_aromatic" -- they must match the base's class order exactly, and the
+#     kekulized lineage uses both a different bond set AND a different atom ORDER
+#     (C N O F P S Cl Br I against C N O S F Cl Br I P). A mismatch trains against
+#     classes that decode to different elements: it converges fine and is useless.
+VOCABULARY: str = "legacy_aromatic"     # legacy_aromatic | e1_kekulized
+# :param PROPERTY_FROM: which molecule the RL TARGETS describe. Must match what the
+#     adapter being fine-tuned was trained on, or RL optimises toward a target scale
+#     the adapter does not speak -- see adapter_training__zinc.py for the 1.6-log-unit
+#     gap this opens at the low-clogP end.
+PROPERTY_FROM: str = "source"           # source | decoded
 BOND_TYPES: list = ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
 ATOM_TYPES: list = ["C", "N", "O", "S", "F", "Cl", "Br", "I", "P"]
 BASE_CKPT: str = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
+# :param SIZE_MODEL_CKPT: a LearnedSizeDistribution to draw rollout graph sizes from,
+#     i.e. P(n | target) instead of the dataset marginal. Empty = marginal (the
+#     historical behaviour).
+#
+#     Set this when the adapter will be DEPLOYED with a conditional size draw. The
+#     size prior is part of the environment the policy acts in: measured on QED it is
+#     worth 10-15% MAE on its own, so training under the marginal and deploying under
+#     the conditional optimises against a distribution we do not use. The trainer
+#     forwards the RAW per-row targets as the condition, which is exactly what
+#     LearnedSizeDistribution normalises internally -- no wrapper needed here (molsmith
+#     needs one only because its adapter pipeline passes a computed condition instead).
+SIZE_MODEL_CKPT: str = ""
 ADAPTER_CKPT: str = ""           # trained scalar-property adapter to RL-finetune
 PROPERTY: str = "logp"           # logp | tpsa | qed | sascore
 # --- reward source: RDKit ground-truth vs a learned property HEAD ---
@@ -102,6 +193,15 @@ LAMBDA_EDGE: float = 1.0
 INVALID_REWARD: float = -10.0     # unparseable molecule (worst)
 DISCONNECT_REWARD: float = -4.0   # valid but fragmented ('.' in SMILES); < -PROP_CLAMP
 PROP_CLAMP: float = 3.0           # connected reward in [-PROP_CLAMP, 0]
+# :param REWARD_SHAPE: "tiered" (the above: connectivity-FIRST, sanity vetoes
+#     targeting) or "weighted" (WeightedSanityPropertyReward: both terms normalised to
+#     [0,1] then weighted, so targeting can outrank sanity). Use "weighted" when the
+#     goal is to emphasise targeting; "tiered" is the historical default and keeps the
+#     earlier RL runs reproducible.
+REWARD_SHAPE: str = "tiered"      # tiered | weighted
+W_PROP: float = 3.0               # weighted only: targeting weight
+W_SANITY: float = 1.0             # weighted only: sanity weight (3:1 = emphasise targeting)
+PROP_SPAN: float = 3.0            # weighted only: targeting hits 0 at SPAN * prop_std off-target
 TARGET_RANGE_PCT: list = [1, 99]  # amortized RL targets sampled uniform over this range
 LOG_EVERY: int = 10
 PROBE_EVERY: int = 40
@@ -210,73 +310,84 @@ class PropertyMatchReward:
         return out
 
 
-def head_predict_batch(mols, head, atom_encoder, bond_encoder, device):
-    """The HEAD's predicted property for each RDKit Mol via its native re-encoding
-    (SMILES -> smiles_to_pyg_data -> to_dense -> head.predict), exactly as LearnedPropertyEnergy
-    does (the head is trained on that encoding; the raw graph mispredicts). Returns a list
-    aligned to ``mols`` (None where re-encode fails). Batched over the molecules."""
-    from torch_geometric.data import Batch
-    from defog.domains.molecule import smiles_to_pyg_data
-    reenc, idx = [], []
-    for i, m in enumerate(mols):
-        if m is None:
-            continue
-        try:
-            rd = smiles_to_pyg_data(Chem.MolToSmiles(m), atom_encoder, bond_encoder)
-        except Exception:
-            rd = None
-        if rd is not None and getattr(rd, "x", None) is not None:
-            reenc.append(rd); idx.append(i)
-    out = [None] * len(mols)
-    if reenc:
-        batch = Batch.from_data_list(reenc).to(device)
-        dense, mask = to_dense(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
-        dense = dense.mask(mask)
-        preds = head.predict(dense.X, dense.E, mask).reshape(-1).tolist()
-        for j, i in enumerate(idx):
-            out[i] = float(preds[j])
-    return out
+class WeightedSanityPropertyReward:
+    """Targeting-weighted reward: ``r = W_PROP * targeting + W_SANITY * sanity``.
 
+    The DIFFERENCE from :class:`PropertyMatchReward`, and the reason this exists: that
+    one is connectivity-FIRST, with the disconnect penalty placed below the property
+    clamp so ANY connected molecule outranks ANY on-target disconnected one. Sanity
+    therefore vetoes targeting outright, which is the opposite of "emphasise the
+    targeting". Here both terms are normalised to [0, 1] and then weighted, so a
+    well-targeted molecule with one oversized ring CAN outrank a sane but off-target
+    one -- at the chosen 3:1 that is exactly the trade being asked for.
 
-class HeadPropertyMatchReward:
-    """Connectivity-FIRST conditional reward with a learned HEAD as the property term (instead
-    of RDKit): connected+valid on-target > connected off-target > disconnected > invalid. The
-    property term ``-min(|head(mol)-target|/scale, clamp)`` uses ``head.predict`` (batched over
-    the connected mols). Same tiering/scale as :class:`PropertyMatchReward`."""
+    ``sanity`` is the project's own definition, not a proxy: valid AND connected AND
+    every ring size within [3, 8] (:func:`defog.domains.molecule.ring_sizes_ok`), so
+    the thing being optimised is the thing the metric reports.
 
-    def __init__(self, head, atom_encoder, bond_encoder, atom_decoder, bond_decoder, device,
-                 scale=1.0, invalid_reward=-10.0, disconnect_reward=-4.0, prop_clamp=3.0):
-        self.head = head
-        self.ae, self.be = atom_encoder, bond_encoder
-        self.ad, self.bd = atom_decoder, bond_decoder
-        self.device = device
-        self.scale, self.invalid = float(scale), float(invalid_reward)
-        self.disconnect, self.clamp = float(disconnect_reward), float(prop_clamp)
+        sane (valid + connected + rings 3-8)   1.00
+        valid + connected, ring outside [3,8]  0.67
+        disconnected                           0.33
+        invalid / unparseable                  0.00
+
+    ``targeting`` is ``1 - min(|prop - target| / (span * scale), 1)``, with ``scale``
+    the property's std, so it reaches 0 at ``span`` standard deviations off-target and
+    1 exactly on it.
+
+    Targeting IS still scored for disconnected molecules -- RDKit computes QED over the
+    whole multi-fragment record -- so the policy keeps a property gradient in that
+    region rather than seeing a flat penalty it cannot climb out of. Only unparseable
+    molecules score zero on both terms, which is the one case where no gradient exists.
+    """
+
+    def __init__(self, atom_decoder, bond_decoder, prop_fn, scale=1.0,
+                 w_prop=3.0, w_sanity=1.0, prop_span=3.0,
+                 sanity_wonky=0.67, sanity_disconnected=0.33):
+        self.ad, self.bd, self.prop_fn = atom_decoder, bond_decoder, prop_fn
+        self.scale = float(scale) or 1.0
+        self.w_prop, self.w_sanity = float(w_prop), float(w_sanity)
+        self.span = float(prop_span)
+        self.s_wonky, self.s_disc = float(sanity_wonky), float(sanity_disconnected)
 
     def __call__(self, X1, E1, node_mask, cond):
+        from defog.domains.molecule import ring_sizes_ok
         n = node_mask.sum(-1)
         datas = dense_to_pyg(X1, E1, None, node_mask, n)
-        out = X1.new_full((len(datas),), self.invalid)
+        out = X1.new_zeros((len(datas),))
         tgt = cond.reshape(-1).tolist()
-        conn_mols, conn_idx = [], []
         for i, d in enumerate(datas):
             mol = pyg_data_to_mol(d, self.ad, self.bd)
             smi = mol_to_smiles(mol) if mol is not None else None
             m = Chem.MolFromSmiles(smi) if smi is not None else None
             if m is None:
-                continue                                   # invalid -> floor
+                continue                                   # invalid -> 0 on both terms
             if "." in smi:
-                out[i] = self.disconnect; continue         # disconnected -> flat penalty
-            conn_mols.append(m); conn_idx.append(i)
-        if conn_mols:
-            preds = head_predict_batch(conn_mols, self.head, self.ae, self.be, self.device)
-            for j, i in enumerate(conn_idx):
-                p = preds[j]
-                if p is None:
-                    continue                               # re-encode failed -> invalid floor
-                out[i] = -min(abs(p - tgt[i]) / self.scale, self.clamp)
+                sanity = self.s_disc
+            elif not ring_sizes_ok(m):
+                sanity = self.s_wonky
+            else:
+                sanity = 1.0
+            try:
+                err = abs(float(self.prop_fn(m)) - tgt[i]) / (self.span * self.scale)
+                targeting = 1.0 - min(err, 1.0)
+            except Exception:
+                targeting = 0.0                            # property error -> no credit
+            out[i] = self.w_prop * targeting + self.w_sanity * sanity
         return out
 
+
+# head_predict_batch and HeadPropertyMatchReward used to be duplicated here, byte-drifted
+# from defog.core.rl, and the drift cost a run: the local copy re-encoded a decoded molecule
+# with `smiles_to_pyg_data(Chem.MolToSmiles(m), atom_encoder, bond_encoder)` and no
+# `kekulize=`. On the kekulized zinc-kek vocabulary that rejects ~94% of real molecules, so
+# they fell through to invalid_reward=-10.0 -- below disconnect_reward=-4.0 and below the
+# worst on-target score of -PROP_CLAMP. Job 43175 sat at reward -9.5 with 120/128 at the
+# floor while its own decode tree showed 126/128 producing good drug-like SMILES.
+#
+# The library copy was fixed and this one was not, which is precisely why every diagnostic
+# run against defog.core came back healthy while the experiment did not. Importing rather
+# than re-declaring is the fix: there is now one implementation and it cannot drift again.
+from defog.core import HeadPropertyMatchReward, head_predict_batch  # noqa: E402,F401
 
 def make_condition_sampler(p_lo, p_hi, K, G, seed):
     gen = torch.Generator().manual_seed(seed)
@@ -352,7 +463,11 @@ def experiment(e: Experiment) -> None:
     pl.seed_everything(e.SEED, workers=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     prop_fn = PROP_FNS[e.PROPERTY]
-    atom_encoder, atom_decoder, bond_encoder, bond_decoder = build_encoders(e.ATOM_TYPES, e.BOND_TYPES)
+    atom_types, bond_types, kekulize, smiles_source = _vocabulary(e.VOCABULARY)
+    e.log(f"vocabulary {e.VOCABULARY!r}: {len(atom_types)} atoms {atom_types} "
+          f"bonds={bond_types} kekulize={kekulize} source={smiles_source} "
+          f"property_from={e.PROPERTY_FROM}")
+    atom_encoder, atom_decoder, bond_encoder, bond_decoder = build_encoders(atom_types, bond_types)
 
     base = DeFoGModel.load(e.BASE_CKPT, device="cpu").to(device).eval()
     assert base.cond_dim == 0
@@ -365,11 +480,12 @@ def experiment(e: Experiment) -> None:
                                         name=f"{e.PROPERTY}_adapter", cond_type=e.PROPERTY).to(device)
         e.log("[fresh/untrained] adapter (smoke only)")
 
-    # property distribution -> RL target range + eval targets
-    df = pd.read_csv(e.CSV_PATH)
-    ref_smiles = df[e.SMILES_COLUMN].sample(min(e.REF_SUBSAMPLE, len(df)), random_state=e.SEED).tolist()
-    _mols = [Chem.MolFromSmiles(s) for s in ref_smiles]
-    vals = np.asarray([prop_fn(m) for m in _mols if m is not None])
+    # property distribution -> RL target range + eval targets, under the adapter's
+    # own label convention (see _reference_values)
+    vals, n_skipped = _reference_values(e, prop_fn, atom_encoder, bond_encoder,
+                                        atom_decoder, bond_decoder, kekulize, smiles_source)
+    e.log(f"reference values: {len(vals)} molecules (skipped {n_skipped}), "
+          f"{e.PROPERTY} mean={vals.mean():.4f} std={vals.std():.4f}")
     p_lo, p_hi = [float(x) for x in np.percentile(vals, e.TARGET_RANGE_PCT)]
     prop_std = float(vals.std()) or 1.0
     targets = dict(zip(e.LEVEL_NAMES, [float(x) for x in np.percentile(vals, e.TARGET_PERCENTILES)]))
@@ -389,11 +505,38 @@ def experiment(e: Experiment) -> None:
         e.log(f"REWARD_SOURCE=head: PropertyHead from {e.HEAD_CKPT} "
               f"(prop_mean={float(head.prop_mean):.3f} prop_std={float(head.prop_std):.3f}); "
               f"probe/selection use HEAD, eval reports RDKit truth too")
+    elif e.REWARD_SHAPE == "weighted":
+        reward = WeightedSanityPropertyReward(
+            atom_decoder, bond_decoder, prop_fn, scale=prop_std,
+            w_prop=e.W_PROP, w_sanity=e.W_SANITY, prop_span=e.PROP_SPAN)
+        e.log(f"REWARD_SHAPE=weighted: r = {e.W_PROP}*targeting + {e.W_SANITY}*sanity, "
+              f"both in [0,1]; targeting hits 0 at {e.PROP_SPAN}*std = "
+              f"{e.PROP_SPAN * prop_std:.3f} off-target. Sanity = valid AND connected "
+              f"AND rings in [3,8] (1.0) / wonky ring (0.67) / disconnected (0.33) / "
+              f"invalid (0.0). Targeting can outrank sanity -- that is the point.")
     else:
         reward = PropertyMatchReward(atom_decoder, bond_decoder, prop_fn, scale=prop_std,
                                      invalid_reward=e.INVALID_REWARD, disconnect_reward=e.DISCONNECT_REWARD,
                                      prop_clamp=e.PROP_CLAMP)
     cond_sampler = make_condition_sampler(p_lo, p_hi, e.ROLLOUT_SIZE, e.N_GROUPS, e.SEED)
+
+    # Rollout graph sizes: P(n | target) when a size model is supplied, else the
+    # marginal. The trainer hands size_dist.sample the RAW per-row targets, which is
+    # what LearnedSizeDistribution expects.
+    size_dist = None
+    if e.SIZE_MODEL_CKPT:
+        from defog.core import LearnedSizeDistribution
+        size_dist = LearnedSizeDistribution.load(e.SIZE_MODEL_CKPT, device=device)
+        if getattr(size_dist, "property_from", None) not in (None, e.PROPERTY_FROM):
+            raise RuntimeError(
+                f"size model was fit on property_from={size_dist.property_from!r} but this "
+                f"run uses {e.PROPERTY_FROM!r}; the two disagree about what a target means")
+        e.log(f"rollout sizes: LearnedSizeDistribution from {e.SIZE_MODEL_CKPT} "
+              f"(grid {size_dist.min_size}..{size_dist.max_size}, "
+              f"property={getattr(size_dist, 'property_name', '?')!r}) -- rollouts match "
+              f"the deployment size draw")
+    else:
+        e.log("rollout sizes: dataset MARGINAL P(n) (no size model supplied)")
 
     def eval_now(tag):
         ev = steer_eval(base, adapter, atom_decoder, bond_decoder, prop_fn, targets, e.GUIDANCE_WEIGHTS,
@@ -414,7 +557,7 @@ def experiment(e: Experiment) -> None:
         rollout_size=e.ROLLOUT_SIZE, sample_steps=e.ROLLOUT_STEPS, eta=e.ROLLOUT_ETA,
         omega=e.ROLLOUT_OMEGA, time_distortion=e.TIME_DISTORTION, condition_sampler=cond_sampler,
         subsample_steps=e.SUBSAMPLE_STEPS, minibatch_size=e.MINIBATCH, lambda_edge=e.LAMBDA_EDGE,
-        crn=e.CRN,
+        crn=e.CRN, size_dist=size_dist,
         grad_clip=e.GRAD_CLIP, seed=e.SEED, device=device,
     )
 
