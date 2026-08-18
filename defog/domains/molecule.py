@@ -87,6 +87,19 @@ def build_encoders(atom_types, bond_types):
     return atom_encoder, atom_decoder, bond_encoder, bond_decoder
 
 
+def needs_kekulize(bond_encoder) -> bool:
+    """Whether ``bond_encoder`` requires its input kekulized: True when it has no AROMATIC
+    class, so an aromatic bond would hit the unknown-bond branch and reject the molecule.
+
+    Call sites that re-encode a DECODED molecule must use this. ``Chem.MolToSmiles`` returns
+    aromatic SMILES, so on a kekulized vocabulary ({SINGLE, DOUBLE, TRIPLE}, as zinc-kek and
+    union-kek use) the round trip silently rejects ~94% of real drug-like molecules. Deriving
+    the flag from the vocabulary rather than hard-coding it means a caller cannot pair the
+    wrong one with a base.
+    """
+    return Chem.BondType.AROMATIC not in bond_encoder
+
+
 def smiles_to_pyg_data(smiles: str, atom_encoder, bond_encoder, kekulize: bool = False):
     """
     Convert a SMILES string to a PyG ``Data`` object (one-hot x and edge_attr).

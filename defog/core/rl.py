@@ -733,8 +733,18 @@ class AdapterGDPOTrainer(GDPOTrainer):
                                  sample_steps=self.sample_steps, time_distortion=self.time_distortion,
                                  group_ids=groups, crn=self.crn, guidance_scale=1.0)
         sampler.composition = comp
+        # `condition` MUST reach the size distribution. A condition-aware
+        # SizeDistribution (defog_megan.sizes.ConceptSizeDistribution) recovers its
+        # target from `condition.argmin(-1)` and silently falls back to the base's
+        # marginal when it is absent -- so omitting it does not raise, it just draws
+        # every rollout graph from the wrong distribution. Measured on the AqSolDB
+        # concepts: rollouts averaged 22.5 heavy atoms against 18.1 at evaluation,
+        # i.e. RL trained on a +4.5-atom surplus that deployment does not have, and
+        # that surplus is exactly what produces macrocycles and disconnected
+        # fragments. Callers using a size distribution that ignores `condition`
+        # (e.g. CategoricalSizeDistribution) are unaffected.
         sampler.sample(self.rollout_size, num_nodes=self.num_nodes, size_dist=self.size_dist,
-                       device=self.device, show_progress=False)
+                       condition=cond, device=self.device, show_progress=False)
         X1, E1 = sampler.endpoint
         node_mask = sampler.end_node_mask
         states = list(zip(sampler.trace_X, sampler.trace_E, sampler.trace_t))
@@ -865,7 +875,7 @@ def head_predict_batch(mols, head, atom_encoder, bond_encoder, device):
 
     from rdkit import Chem
 
-    from ..domains.molecule import smiles_to_pyg_data
+    from ..domains.molecule import needs_kekulize, smiles_to_pyg_data
     from .data import to_dense
 
     reenc, idx = [], []
@@ -873,7 +883,8 @@ def head_predict_batch(mols, head, atom_encoder, bond_encoder, device):
         if m is None:
             continue
         try:
-            rd = smiles_to_pyg_data(Chem.MolToSmiles(m), atom_encoder, bond_encoder)
+            rd = smiles_to_pyg_data(Chem.MolToSmiles(m), atom_encoder, bond_encoder,
+                                    kekulize=needs_kekulize(bond_encoder))
         except Exception:
             rd = None
         if rd is not None and getattr(rd, "x", None) is not None:

@@ -51,3 +51,51 @@ def test_learned_property_energy_constructs():
     head = PropertyHead(6, 4, hid=16, layers=2)
     e = LearnedPropertyEnergy(head, 1.5, domain=object(), atom_encoder={}, bond_encoder={})
     assert e.target == 1.5 and "1.5" in e._desc()
+
+
+# ---------------------------------------------------------------- re-encode vocabulary
+# LearnedPropertyEnergy decodes each predicted-clean graph to a molecule and re-encodes it
+# from `Chem.MolToSmiles`, which emits AROMATIC bonds. On a kekulized base (zinc-kek,
+# union-kek) the bond vocabulary is {SINGLE, DOUBLE, TRIPLE} with no aromatic class, so that
+# round trip used to reject ~94% of real drug-like molecules and fall through to
+# `invalid_energy=1e3`. The head was then never consulted and FK resampled on "did the
+# re-encode happen to succeed" instead of on the property.
+
+AROMATIC_SMILES = "Cc1cccn2c(=O)c(C(=O)NCC3CCOC3)cnc12"
+
+
+def _mol_dense(smiles, atom_encoder, bond_encoder):
+    from torch_geometric.data import Batch
+
+    from defog.core.data import to_dense
+    from defog.domains.molecule import needs_kekulize, smiles_to_pyg_data
+    d = smiles_to_pyg_data(smiles, atom_encoder, bond_encoder,
+                           kekulize=needs_kekulize(bond_encoder))
+    batch = Batch.from_data_list([d])
+    dense, mask = to_dense(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+    return dense.mask(mask), mask
+
+
+def test_needs_kekulize_reads_the_vocabulary():
+    from defog.domains.molecule import build_encoders, needs_kekulize
+    _, _, kek_be, _ = build_encoders(list("CNOF"), ["SINGLE", "DOUBLE", "TRIPLE"])
+    _, _, aro_be, _ = build_encoders(list("CNOF"), ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"])
+    assert needs_kekulize(kek_be) is True
+    assert needs_kekulize(aro_be) is False
+
+
+def test_energy_scores_aromatic_molecule_on_kekulized_vocabulary():
+    """The regression: a real aromatic molecule must get a REAL energy, not invalid_energy."""
+    from defog.domains.molecule import MoleculeDomain, build_encoders
+    atoms = ["C", "N", "O", "F", "P", "S", "Cl", "Br", "I"]
+    ae, adec, be, bdec = build_encoders(atoms, ["SINGLE", "DOUBLE", "TRIPLE"])
+    head = PropertyHead(len(atoms), 4, hid=16, layers=2)
+    energy = LearnedPropertyEnergy(head, 2.5, MoleculeDomain(adec, bdec), ae, be,
+                                   invalid_energy=1e3)
+    dense, mask = _mol_dense(AROMATIC_SMILES, ae, be)
+    out = energy(dense.X, dense.E, mask)
+    assert out.shape == (1,)
+    assert float(out[0]) < 1e3 - 1, (
+        "aromatic molecule scored invalid_energy on a kekulized vocabulary: the re-encode "
+        "is not kekulizing, so the head is never consulted"
+    )

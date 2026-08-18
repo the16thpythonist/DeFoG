@@ -145,7 +145,7 @@ class LearnedPropertyEnergy:
         from torch_geometric.data import Batch
 
         from .data import dense_to_pyg, to_dense
-        from ..domains.molecule import smiles_to_pyg_data
+        from ..domains.molecule import needs_kekulize, smiles_to_pyg_data
 
         n = node_mask.sum(-1)
         datas = dense_to_pyg(X1, E1, None, node_mask, n)
@@ -156,7 +156,8 @@ class LearnedPropertyEnergy:
             if mol is None:
                 continue
             try:
-                rd = smiles_to_pyg_data(Chem.MolToSmiles(mol), self.ae, self.be)
+                rd = smiles_to_pyg_data(Chem.MolToSmiles(mol), self.ae, self.be,
+                                        kekulize=needs_kekulize(self.be))
             except Exception:
                 rd = None
             if rd is not None and getattr(rd, "x", None) is not None:
