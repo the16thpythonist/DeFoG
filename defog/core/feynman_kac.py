@@ -220,6 +220,19 @@ class FeynmanKacSampler(Sampler):
         model.eval()
         device = device if device is not None else model.device
 
+        # ESS is >= 1 by construction, so a threshold of `ess_frac * num_samples` at or below 1 can
+        # never be crossed and FK silently degenerates to plain (adapter) sampling -- same
+        # molecules, same MAE, uniqueness 1.0, and nothing raised. Both ends of this have
+        # already cost real jobs: K=4 with ess_frac=0.25, and K=10 with ess_frac=0.10.
+        if self.ess_frac is not None and self.ess_frac * num_samples <= 1.0:
+            raise ValueError(
+                f"ess_frac={self.ess_frac} with K={num_samples} puts the resample threshold at "
+                f"{self.ess_frac * num_samples:.3f} particles, and the effective sample "
+                f"size is never below 1, so Feynman-Kac would never resample and this run "
+                f"would silently "
+                f"be plain sampling. Raise ess_frac above {1.0 / num_samples:.3g}, or raise K."
+            )
+
         # inpainting fixes the graph size to core_size + n_free (overrides size_dist)
         if self.constraint is not None:
             total = self.constraint.k + int(self.n_free)

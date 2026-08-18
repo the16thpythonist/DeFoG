@@ -392,3 +392,41 @@ class TestEndToEnd:
         # A usable guidance object comes straight off the module.
         guidance = module.guidance().set_target(float(np.mean(props)))
         assert guidance.h.cond_dim == 1
+
+
+def test_fk_refuses_an_ess_threshold_below_one_particle():
+    """ess_frac * K <= 1 can never trip, so FK would silently be plain sampling.
+
+    This is not hypothetical: it is why FK looked inert at K=4/ess=0.25, and why the
+    ess_frac=0.10 arm of the diversity sweep returned numbers identical to adapter-only
+    to four decimals. Both read as "this lever does nothing" rather than "it was off".
+    """
+    import pytest
+    import torch
+
+    from defog.core import FeynmanKacSampler
+
+    class _Stub:
+        training = False
+        device = torch.device("cpu")
+
+        def eval(self):
+            return self
+
+    def _sampler(ess):
+        # Every default the base Sampler would otherwise read off the model is passed
+        # explicitly, so the stub never has to look like a real model.
+        return FeynmanKacSampler(
+            _Stub(), lambda *a: torch.zeros(1), beta=1.0, ess_frac=ess,
+            eta=0.0, omega=0.0, sample_steps=10, time_distortion="identity",
+            guidance_scale=1.0,
+        )
+
+    with pytest.raises(ValueError, match="never resample"):
+        _sampler(0.10).sample(10)                    # threshold 1.0 -- unreachable
+    with pytest.raises(ValueError, match="never resample"):
+        _sampler(0.25).sample(4)                     # threshold 1.0 -- the K=4 case
+
+    with pytest.raises(Exception) as exc:            # threshold 2.5 -- guard must not fire
+        _sampler(0.25).sample(10)
+    assert "never resample" not in str(exc.value)
