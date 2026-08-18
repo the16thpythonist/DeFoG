@@ -222,21 +222,42 @@ def main() -> int:
                                  jump_length=args.fk_jump)
         return c
 
-    loaded = ms.load(cfg_for(float(tvals[0]), args.seed))
+    probe_cfg = cfg_for(float(tvals[0]), args.seed)
+    loaded = ms.load(probe_cfg)                     # fills probe_cfg.adapters[*] in place
     if args.method == "fk":
         h = loaded.heads.get(args.adapter)
         if h is None:
             sys.exit(f"REFUSING: --method fk but {args.adapter} bundles no property head. "
                      f"LearnedPropertyEnergy needs one; without it FK has nothing to score "
                      f"and would silently reduce to plain adapter sampling.")
+        # The scale is the property's own std, and the energy is divided by its square, so
+        # beta is dimensionless and means the same thing across properties. Printing it (and
+        # the raw-units beta it corresponds to) is what lets a later reader tell a run made
+        # before that normalisation existed from one made after. `probe_cfg` has been through
+        # ms.load, which fills the field in place -- a freshly built config would still read
+        # 1.0 and this check would pass while the real runs went un-normalised.
+        scale = float(getattr(probe_cfg.adapters[0], "scale", 1.0))
+        if scale == 1.0:
+            sys.exit("REFUSING: adapter spec has scale=1.0, so the FK energy would be in raw "
+                     "property units and beta would not be comparable across properties. "
+                     "Expected _fill_from_packages to set it from the package prop_std.")
         print(f"FK energy: head from {args.adapter}  "
-              f"beta={args.fk_beta} warmup={args.fk_warmup} ess={args.fk_ess} "
+              f"beta={args.fk_beta} (dimensionless; scale={scale:.4f}, "
+              f"= raw-units beta {args.fk_beta / (scale * scale):.4g})  "
+              f"warmup={args.fk_warmup} ess={args.fk_ess} "
               f"rejuvenate={args.fk_rejuvenate}")
 
     rows, all_err, t0 = [], [], time.time()
     for k, (smi, tgt) in enumerate(targets):
         cfg = cfg_for(tgt, args.seed + k)          # a different draw per target
         res = ms.sample(cfg, loaded)
+        if k == 0 and args.method == "fk" and float(cfg.adapters[0].scale) == 1.0:
+            # The per-target configs are built fresh, so the one that just sampled is the
+            # only thing that proves the energy was normalised. Checking probe_cfg alone
+            # would pass on a molsmith whose sample() does not fill the field.
+            sys.exit("REFUSING: the config that just sampled still has scale=1.0, so the FK "
+                     "energy ran in raw property units. Update molsmith: sample() must call "
+                     "_fill_from_packages.")
         smis = [s for s in res.smiles if s]
         achieved, ok = [], []
         for s in smis:
