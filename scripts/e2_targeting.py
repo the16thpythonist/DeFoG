@@ -123,7 +123,13 @@ def main() -> int:
     ap.add_argument("--method", required=True, choices=("adapter", "fk"))
     ap.add_argument("--n-targets", type=int, default=100)
     ap.add_argument("--per-target", type=int, default=10)
-    ap.add_argument("--weight", type=float, default=1.0, help="adapter guidance weight")
+    ap.add_argument("--weight", type=float, default=2.0, help="adapter guidance weight")
+    # Kept reachable, not merely documented: every E2 number before 2026-08-17 was
+    # measured in rate space, and re-deriving one means being able to ask for it.
+    ap.add_argument("--blend-space", default="prob", choices=("prob", "rate"),
+                    help="where CFG is applied: 'prob' blends clean-graph marginals "
+                         "(FreeGress Eq. 10/11, the default), 'rate' blends rate matrices "
+                         "(historical; breaks down above w=1)")
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--eta", type=float, default=25.0)
     ap.add_argument("--omega", type=float, default=0.0)
@@ -177,12 +183,32 @@ def main() -> int:
               f"{size_model.max_size}  property={size_model.property_name!r} "
               f"from={size_model.property_from!r}")
 
+    # GUARD: SamplingConfig is a plain dataclass, so `config.size_dist = ...` silently
+    # succeeds even against a molsmith build that never reads it -- the run then uses
+    # the marginal while this script's own JSON records "learned". That happened once;
+    # it is not allowed to happen quietly again.
+    if size_model is not None and "size_dist" not in ms.SamplingConfig.__dataclass_fields__:
+        sys.exit(
+            "REFUSING: this molsmith build has no SamplingConfig.size_dist field, so a "
+            "learned size distribution would be silently ignored and the results would "
+            "be mislabelled as 'learned'. Update molsmith before re-running."
+        )
+    # The same failure mode, for the blend space: asking for "prob" against a molsmith
+    # that predates the field would sample in rate space and record "prob".
+    if "blend_space" not in ms.SamplingConfig.__dataclass_fields__:
+        sys.exit(
+            f"REFUSING: this molsmith build has no SamplingConfig.blend_space field, so "
+            f"--blend-space {args.blend_space!r} would be ignored and the output would be "
+            f"mislabelled. Update molsmith before re-running."
+        )
+
     def cfg_for(target: float, seed: int):
         c = ms.SamplingConfig(
             base=args.base, n=args.per_target, seed=seed, steps=args.steps,
             eta=args.eta, omega=args.omega, time_distortion=args.time_distortion,
             adapters=[ms.AdapterTarget(package=args.adapter, target=target,
                                        weight=args.weight)],
+            blend_space=args.blend_space,
             method="fk" if args.method == "fk" else "none")
         if size_model is not None:
             # A ready-made SizeDistribution, bypassing size_mode. The condition rides in
@@ -256,7 +282,8 @@ def main() -> int:
         "split": args.split, "method": args.method, "seed": args.seed,
         "n_targets": len(rows), "per_target": args.per_target,
         "sampling": {"weight": args.weight, "steps": args.steps, "eta": args.eta,
-                     "omega": args.omega, "time_distortion": args.time_distortion},
+                     "omega": args.omega, "time_distortion": args.time_distortion,
+                     "blend_space": args.blend_space},
         # Recorded so a pair of runs can be read as an ablation without anyone having to
         # remember which was which.
         "size": {"mode": args.size_mode, "model": args.size_model,

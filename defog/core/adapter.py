@@ -47,7 +47,7 @@ _DIMKEY = {"X": "dx", "E": "de", "y": "dy"}
 _CONFIG_KEYS = frozenset({
     "cond_dim", "n_layers", "dims", "hidden", "time_conditioned", "streams",
     "time_emb_dim", "cond_mean", "cond_std", "name", "cond_type",
-    "interior_ff", "interior_attn", "base_token",
+    "interior_ff", "interior_attn", "base_token", "cond_encoder",
 })
 
 
@@ -128,6 +128,120 @@ def _base_token(base) -> float:
         return float(base.model.mlp_in_X[0].weight.detach().double().sum().cpu())
 
 
+class FingerprintEncoder(nn.Module):
+    """Residual MLP encoder for a wide, flat condition such as a Morgan fingerprint.
+
+    Why this exists: without an encoder the trunk's first layer is the *only* thing
+    between the condition and every FiLM head, and it is ``Linear(cond_dim + t, hidden)``
+    with ``hidden`` fixed at 256. Widening the fingerprint therefore does not widen the
+    path — 512 and 1024 bits are both compressed to 256 in one step, and 2048 would be an
+    8:1 squeeze. Measured: 512 -> 1024 bits bought +0.015 Tanimoto lift, which is what
+    pouring more information into an unchanged bottleneck looks like. This encoder moves
+    the narrowest point off the first layer so that "more bits" and "wider path" become
+    separable choices rather than one confounded one.
+
+    Unlike :class:`SpectrumEncoder` there is no spatial structure to exploit: Morgan bits
+    are hash buckets, so adjacency is meaningless and a convolution would be modelling an
+    artifact of the hash. Depth with residual connections is the right prior instead —
+    it lets the encoder learn bit *co-occurrence* (substructures that appear together)
+    without assuming anything about bit ordering.
+
+    The adapter's exact-no-op-at-init property is unaffected: it comes from the zero-init
+    gate heads, which sit downstream of this module.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int = 512, hidden: int = 1024,
+                 n_blocks: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.hidden = int(hidden)
+        self.n_blocks = int(n_blocks)
+        self.dropout = float(dropout)
+        self.proj_in = nn.Linear(self.in_dim, self.hidden)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(self.hidden), nn.SiLU(),
+                nn.Linear(self.hidden, self.hidden),
+                *( [nn.Dropout(self.dropout)] if self.dropout > 0 else [] ),
+            )
+            for _ in range(self.n_blocks)
+        ])
+        self.proj_out = nn.Sequential(nn.LayerNorm(self.hidden), nn.SiLU(),
+                                      nn.Linear(self.hidden, self.out_dim))
+
+    def _config(self) -> dict:
+        """Enough to rebuild this encoder — see :meth:`SpectrumEncoder._config` for why
+        omitting it would silently corrupt the GDPO KL reference."""
+        return dict(kind="mlp", in_dim=self.in_dim, out_dim=self.out_dim,
+                    hidden=self.hidden, n_blocks=self.n_blocks, dropout=self.dropout)
+
+    def forward(self, c: torch.Tensor) -> torch.Tensor:
+        if c.size(-1) != self.in_dim:
+            raise ValueError(f"FingerprintEncoder expects {self.in_dim} inputs, got {c.size(-1)}")
+        h = self.proj_in(c)
+        for blk in self.blocks:
+            h = h + blk(h)          # pre-norm residual: identity path stays clean
+        return self.proj_out(h)
+
+
+class SpectrumEncoder(nn.Module):
+    """1-D convolutional encoder for a ``[values(n_bins), mask(n_bins)]`` condition.
+
+    An adaLN trunk fed a raw 3602-dimensional vector has to learn from scratch that adjacent
+    bins are related, that a band is a local shape a few dozen bins wide, and that the mask
+    channel gates the value channel bin-by-bin. A spectrum has all of that structure by
+    construction, and a convolution gets it for free.
+
+    Position is preserved deliberately. Global pooling would answer "is there a carbonyl
+    somewhere" while discarding *where* — and where is the entire content of a spectrum. The
+    final adaptive pool keeps 16 coarse positions so the trunk still sees roughly which region
+    of the spectrum carries the signal.
+
+    The two channels are the value and the mask, so the convolution can learn "specified and
+    absent" as a distinct pattern from "unspecified" — the distinction the mask exists to make
+    and the one a flat vector buries.
+    """
+
+    def __init__(self, n_bins: int, out_dim: int = 256, channels: Sequence[int] = (32, 64, 128, 128),
+                 kernel: int = 9, pooled: int = 16):
+        super().__init__()
+        self.n_bins = int(n_bins)
+        self.out_dim = int(out_dim)
+        self.pooled = int(pooled)
+        self.channels = tuple(channels)
+        self.kernel = int(kernel)
+        layers, in_ch = [], 2
+        for ch in channels:
+            layers += [nn.Conv1d(in_ch, ch, kernel_size=kernel, stride=2, padding=kernel // 2),
+                       nn.GroupNorm(num_groups=min(8, ch), num_channels=ch), nn.SiLU()]
+            in_ch = ch
+        self.conv = nn.Sequential(*layers)
+        self.proj = nn.Linear(in_ch * self.pooled, self.out_dim)
+
+    def _config(self) -> dict:
+        """Enough to rebuild this encoder. Without it, anything that reconstructs an adapter
+        from ``_config()`` — notably ``AdapterGDPOTrainer``'s frozen KL reference — would
+        rebuild it *without* the encoder and silently compare against a different model."""
+        return dict(kind="spectrum_cnn", n_bins=self.n_bins, out_dim=self.out_dim,
+                    channels=list(self.channels), kernel=self.kernel, pooled=self.pooled)
+
+    def forward(self, c: torch.Tensor) -> torch.Tensor:
+        bs = c.size(0)
+        if c.size(-1) != 2 * self.n_bins:
+            raise ValueError(f"SpectrumEncoder expects {2 * self.n_bins} inputs, got {c.size(-1)}")
+        x = c.view(bs, 2, self.n_bins)          # channel 0 = values, 1 = mask
+        x = self.conv(x)
+        x = nn.functional.adaptive_avg_pool1d(x, self.pooled)
+        return self.proj(x.reshape(bs, -1))
+
+
+#: Condition encoders addressable from a saved config's ``kind`` field. Keeping the
+#: registry next to the classes means adding one is a single edit, and an unknown kind
+#: fails loudly at load rather than silently rebuilding the wrong architecture.
+_COND_ENCODERS = {"spectrum_cnn": SpectrumEncoder, "mlp": FingerprintEncoder}
+
+
 class AdaLNAdapter(nn.Module):
     """Zero-init gated-FiLM adapter over a FROZEN base's transformer stack.
 
@@ -141,7 +255,8 @@ class AdaLNAdapter(nn.Module):
                  streams: Sequence[str] = _STREAMS, time_emb_dim: int = 64,
                  cond_mean=None, cond_std=None, name: str = "", cond_type: str = "",
                  interior_ff: bool = False, interior_attn: bool = False,
-                 base_token: Optional[float] = None):
+                 base_token: Optional[float] = None,
+                 cond_encoder: Optional[nn.Module] = None):
         super().__init__()
         self.cond_dim = cond_dim
         self.n_layers = n_layers
@@ -155,7 +270,21 @@ class AdaLNAdapter(nn.Module):
         self.interior_attn = bool(interior_attn)  # L10: condition e_mul (edge->attn logits)
         self.base_token = base_token
 
-        cond_in = cond_dim + (time_emb_dim if time_conditioned else 0)
+        # An encoder, when present, sits between the (already normalised) condition and the
+        # trunk, so everything downstream — state_dict, ConditionBranch, the package format —
+        # still sees exactly one module with one cond_dim.
+        if isinstance(cond_encoder, dict):
+            spec = dict(cond_encoder)
+            # Configs written before `kind` existed are all spectrum encoders, so that
+            # stays the default -- changing it would silently rebuild old adapters wrong.
+            kind = spec.pop("kind", "spectrum_cnn")
+            if kind not in _COND_ENCODERS:
+                raise ValueError(f"unknown cond_encoder kind {kind!r} in {cond_encoder!r}; "
+                                 f"known: {sorted(_COND_ENCODERS)}")
+            cond_encoder = _COND_ENCODERS[kind](**spec)
+        self.cond_encoder = cond_encoder
+        encoded_dim = cond_dim if cond_encoder is None else int(cond_encoder.out_dim)
+        cond_in = encoded_dim + (time_emb_dim if time_conditioned else 0)
         self.trunk = nn.Sequential(
             nn.Linear(cond_in, hidden), nn.SiLU(),
             nn.LayerNorm(hidden), nn.Linear(hidden, hidden), nn.SiLU(),
@@ -220,6 +349,8 @@ class AdaLNAdapter(nn.Module):
 
     def forward(self, c: torch.Tensor, t: Optional[torch.Tensor] = None) -> Modulation:
         c = self.normalize(c.float())
+        if self.cond_encoder is not None:
+            c = self.cond_encoder(c)
         if self.time_conditioned:
             assert t is not None, "time_conditioned adapter requires t"
             temb = timestep_embedding(t.reshape(-1, 1), self.time_emb_dim)
@@ -263,7 +394,9 @@ class AdaLNAdapter(nn.Module):
                     RuntimeWarning)
 
     def _config(self):
-        return dict(cond_dim=self.cond_dim, n_layers=self.n_layers, dims=self.dims,
+        encoder = None if self.cond_encoder is None else self.cond_encoder._config()
+        return dict(cond_encoder=encoder,
+                    cond_dim=self.cond_dim, n_layers=self.n_layers, dims=self.dims,
                     hidden=self.hidden, time_conditioned=self.time_conditioned,
                     streams=list(self.streams), time_emb_dim=self.time_emb_dim,
                     name=self.name, cond_type=self.cond_type,
@@ -320,10 +453,19 @@ class AdaLNAdapter(nn.Module):
 @dataclass
 class ConditionBranch:
     """One condition in a composition: an adapter, a RAW target (the adapter
-    normalizes internally), and its CFG weight ``w``."""
+    normalizes internally), and its CFG weight ``w``.
+
+    The default is 2.0, which is the measured optimum for prob-space blending on
+    both logP and QED. It was 1.0 for as long as blending happened in RATE space,
+    where w>1 is not merely suboptimal but broken: the blend extrapolates past the
+    conditional and ``_stabilize``'s clamp silently drops rates, collapsing logP
+    validity to 0.526 and MAE to 5.59 at w=2. That is a property of the old blend
+    space, not of the task -- see :class:`AdapterComposition`. With ``blend_space
+    ="prob"`` the same w=2 gives the best MAE we have measured.
+    """
     adapter: AdaLNAdapter
     condition: torch.Tensor
-    weight: float = 1.0
+    weight: float = 2.0
 
 
 class AdapterComposition:
@@ -331,10 +473,32 @@ class AdapterComposition:
     ``AdaptedSampler``. ``mode='product'`` sums the log-ratios; ``'mean'`` averages
     (recommended for N>1 to keep the effective uncond coefficient bounded)."""
 
-    def __init__(self, branches: Sequence[ConditionBranch], base=None, mode: str = "product"):
+    def __init__(self, branches: Sequence[ConditionBranch], base=None, mode: str = "product",
+                 blend_space: str = "prob"):
+        """
+        ``mode`` is the FORM of the blend (geometric product vs its per-branch mean).
+        ``blend_space`` is WHERE it is applied, and the two are independent axes:
+
+        * ``"prob"`` (default) -- blend the predicted clean-graph marginals and derive
+          ONE rate matrix from the result. This is where FreeGress applies guidance
+          (Eq. 10/11), it spends a single ``X_1`` draw, and it makes the trajectory
+          consistent with the terminal step, which has always blended clean log-probs.
+        * ``"rate"`` -- build a rate matrix per branch and blend those.
+          ``compute_rate_matrices`` draws its own ``X_1`` sample inside each call, so
+          an N-branch blend mixes N+1 independent draws. Retained so that every number
+          reported before 2026-08-17 reproduces exactly.
+
+        The two are equivalent at w=1 (measured: paired mean -0.0034 over 100 targets,
+        51/100, Wilcoxon p=0.72) and diverge sharply above it: at w=2 the rate path
+        collapses to logP MAE 5.59 / validity 0.526 while prob gives 0.5420 / 0.982.
+        "w=1 always wins" was an artifact of the blend space, which is why the default
+        moved here and why :class:`ConditionBranch` now defaults to w=2.
+        """
         assert mode in ("product", "mean")
+        assert blend_space in ("rate", "prob"), f"unknown blend_space {blend_space!r}"
         self.branches = list(branches)
         self.mode = mode
+        self.blend_space = blend_space
         if base is not None:
             for b in self.branches:
                 b.adapter.check_compatible(base)
@@ -358,11 +522,30 @@ class AdapterComposition:
         return Modulation.stack_groups(mods, bs, device)
 
     def weights(self, device, dtype=torch.float32) -> torch.Tensor:
-        return torch.tensor([b.weight for b in self.branches], device=device, dtype=dtype)
+        """``(N,)`` for scalar branch weights, ``(N, bs)`` if any branch carries a
+        per-molecule weight.
+
+        The per-molecule form exists for closed-loop control, where each molecule has its
+        own error signal and therefore earns its own guidance strength. Mixing the two is
+        allowed: a scalar branch is broadcast across the batch."""
+        ws = [b.weight for b in self.branches]
+        if not any(torch.is_tensor(w) and w.numel() > 1 for w in ws):
+            return torch.tensor([float(w) for w in ws], device=device, dtype=dtype)
+        bs = max(w.numel() for w in ws if torch.is_tensor(w))
+        rows = []
+        for w in ws:
+            if torch.is_tensor(w) and w.numel() > 1:
+                rows.append(w.to(device=device, dtype=dtype).reshape(-1))
+            else:
+                rows.append(torch.full((bs,), float(w), device=device, dtype=dtype))
+        return torch.stack(rows, dim=0)
 
     def set_weights(self, ws):
         for b, w in zip(self.branches, ws):
-            b.weight = float(w)
+            # A per-molecule weight vector must survive as a tensor; float() on it would
+            # raise, and coercing to a scalar would silently discard the per-molecule
+            # signal that closed-loop control exists to carry.
+            b.weight = w if (torch.is_tensor(w) and w.numel() > 1) else float(w)
         return self
 
 
