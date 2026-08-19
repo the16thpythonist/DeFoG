@@ -45,7 +45,8 @@ from defog.core.dam import (discrete_adjoint, estimate_neg_value,    # noqa: E40
                             gkl, marginal_rate, rate_basis)
 from defog.core.noise import sample_from_probs                       # noqa: E402
 from defog.core.renoise import renoise_states                        # noqa: E402
-from defog.core.rl import _score_logprob                             # noqa: E402
+from defog.core.rl import PropertyMatchReward, _score_logprob        # noqa: E402
+from defog.domains.molecule import build_encoders                    # noqa: E402
 
 
 DEFAULT_BASE = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
@@ -99,9 +100,35 @@ def tiered_reward(X1, E1, node_mask, invalid_frac=0.10, disc_frac=0.15):
     return r
 
 
+def real_reward(atom_types, bond_types, prop_name, targets, device):
+    """The ACTUAL PropertyMatchReward -- RDKit decode, the real span and tiering.
+
+    The stand-in above gets the span right, which is what fixes the temperature, but
+    it cannot get the CORRELATION between the head's draws and the reward right: a
+    real reward is a smooth function of the molecule, and its spread across head draws
+    from one state is the thing that actually drives the adjoint's tail. This is the
+    version to trust for choosing lambda.
+    """
+    from rdkit.Chem import Crippen, Descriptors, QED
+    prop_fn = {"logp": lambda m: float(Crippen.MolLogP(m)),
+               "qed": lambda m: float(QED.qed(m)),
+               "tpsa": lambda m: float(Descriptors.TPSA(m))}[prop_name]
+    _, ad, _, bd = build_encoders(atom_types, bond_types)
+    rew = PropertyMatchReward(ad, bd, prop_fn, scale=1.0)
+    tgt = torch.as_tensor(targets, dtype=torch.float32, device=device)
+
+    def _call(X1, E1, node_mask):
+        c = tgt[: X1.shape[0]] if tgt.numel() >= X1.shape[0] else \
+            tgt.repeat((X1.shape[0] // max(tgt.numel(), 1)) + 1)[: X1.shape[0]]
+        return rew(X1, E1, node_mask, c)
+
+    return _call
+
+
 # --------------------------------------------------------------------------- (a)
 @torch.no_grad()
-def y_equals_x_control(model, X_t, E_t, t, node_mask, *, lam, K, reps, invalid_frac):
+def y_equals_x_control(model, X_t, E_t, t, node_mask, *, lam, K, reps,
+                       invalid_frac, reward_fn=None):
     """E[a_hat] where the true adjoint is exactly 1.0."""
     noisy = {"X_t": X_t, "E_t": E_t, "y_t": torch.zeros(X_t.shape[0], 0, device=X_t.device),
              "t": t, "node_mask": node_mask}
@@ -120,12 +147,13 @@ def y_equals_x_control(model, X_t, E_t, t, node_mask, *, lam, K, reps, invalid_f
         # p^base == p^theta at the pre-RL fixed point, so the log-ratio is 0 and the
         # control isolates the estimator, not the drift.
         Zx, Ze = draw()
-        g_Z = -lam * tiered_reward(Zx, Ze, node_mask, invalid_frac=invalid_frac)
+        _r = reward_fn or (lambda a, b, m: tiered_reward(a, b, m, invalid_frac=invalid_frac))
+        g_Z = -lam * _r(Zx, Ze, node_mask)
         lr_Z = torch.zeros_like(g_Z)
         gk, lrk = [], []
         for _ in range(K):
             Xk, Ek = draw()
-            gk.append(-lam * tiered_reward(Xk, Ek, node_mask, invalid_frac=invalid_frac))
+            gk.append(-lam * _r(Xk, Ek, node_mask))
             lrk.append(torch.zeros_like(gk[-1]))
         log_a, frac = discrete_adjoint(lr_Z, g_Z, torch.stack(lrk, -1),
                                        torch.stack(gk, -1), clamp=10.0)
@@ -174,6 +202,11 @@ def main():
     ap.add_argument("--graphs", type=int, default=8)
     ap.add_argument("--reps", type=int, default=32)
     ap.add_argument("--eta", type=float, default=1.0)
+    ap.add_argument("--reward", default="standin", choices=("standin", "real"),
+                    help="'real' uses PropertyMatchReward with RDKit decoding")
+    ap.add_argument("--property", default="logp", choices=("logp", "qed", "tpsa"))
+    ap.add_argument("--endpoint-steps", type=int, default=100,
+                    help="denoising steps used to draw the endpoints the states re-noise from")
     args = ap.parse_args()
 
     dev = torch.device(args.device)
@@ -184,19 +217,20 @@ def main():
     print(f"base: dx={dx} de={de} noise={model.limit_dist.noise_type} "
           f"rdb={model.rate_matrix_designer.rdb} device={dev}")
 
-    # A batch of realistic clean graphs, then re-noise them: exactly the states the
-    # trainer scores at.
-    n = 24
+    # Endpoints must be what the TRAINER sees: graphs the base model actually
+    # produces. An earlier version used random one-hot tensors, and the real reward
+    # then floored 100% of head draws -- the base was being asked to denoise nonsense,
+    # so every diagnostic downstream was measuring an unreachable regime.
+    from defog.core.rl import RolloutSampler                          # noqa: E402
+    print(f"sampling {args.graphs} endpoints from the base ({args.endpoint_steps} steps)")
     torch.manual_seed(0)
-    node_mask = torch.zeros(args.graphs, n, dtype=torch.bool, device=dev)
-    node_mask[:, :20] = True
-    X1 = F.one_hot(torch.randint(0, dx, (args.graphs, n), device=dev), dx).float()
-    idxE = torch.randint(0, de, (args.graphs, n, n), device=dev)
-    idxE = torch.triu(idxE, 1); idxE = idxE + idxE.transpose(1, 2)
-    E1 = F.one_hot(idxE, de).float()
-    X1 = X1 * node_mask[..., None]
+    sm = RolloutSampler(model, eta=1.0, omega=0.0, sample_steps=args.endpoint_steps,
+                        time_distortion="polydec", record_trace=False)
+    sm.sample(args.graphs, device=dev, show_progress=False)
+    X1, E1 = sm.endpoint
+    node_mask = sm.end_node_mask
+    n = X1.shape[1]
     em = (node_mask[:, :, None] & node_mask[:, None, :]).float()
-    E1 = E1 * em[..., None]
     y0 = torch.zeros(args.graphs, 0, device=dev)
 
     # Self-check: a reward that does not vary across samples makes the adjoint
@@ -222,18 +256,40 @@ def main():
         raise SystemExit("stand-in reward does not vary across samples -- the y=x "
                          "control would be vacuous (adjoint identically 1.0)")
 
+    reward_fn = None
+    if args.reward == "real":
+        ATOM = ["C", "N", "O", "S", "F", "Cl", "Br", "I", "P"]
+        BOND = ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
+        torch.manual_seed(0)
+        tgts = (torch.rand(args.graphs) * 4.0 - 1.0).tolist()   # logP-ish spread
+        reward_fn = real_reward(ATOM, BOND, args.property, tgts, dev)
+        with torch.no_grad():
+            _rr = torch.cat([reward_fn(*[t for t in
+                  (lambda s_: (F.one_hot(s_.X, dx).float() * node_mask[..., None],
+                               F.one_hot(s_.E, de).float() * em[..., None],
+                               node_mask))(sample_from_probs(_lx, _le, node_mask))])
+                  for _ in range(16)])
+        print(f"REAL reward over 16 head draws: mean {float(_rr.mean()):+.3f} "
+              f"sd {float(_rr.std()):.3f} min {float(_rr.min()):+.2f} "
+              f"max {float(_rr.max()):+.2f} "
+              f"| floor {float((_rr <= -9.9).float().mean()):.2f} "
+              f"disc {float((_rr == -4.0).float().mean()):.2f}")
+        if float(_rr.std()) < 1e-6:
+            print("  NOTE: no spread at this t -- every head draw floors, so the adjoint "
+                  "is identically 1. See section (c); this is a finding, not an error.")
+
     print("\n(a) y = x CONTROL -- the true adjoint is exactly 1.0")
     print(f"{'invalid':>8} {'t':>5} {'lambda':>7} {'K':>4} {'E[a_hat]':>11} "
           f"{'median':>9} {'clamp':>7}")
-    for inv in (0.10, 0.95):
-        for t_val in (0.2, 0.9):
+    for inv in ((0.0,) if args.reward == "real" else (0.10, 0.95)):
+        for t_val in ((0.9, 0.99) if args.reward == "real" else (0.2, 0.9)):
             t = torch.full((args.graphs, 1), t_val, device=dev)
             (X_t, E_t, _), = renoise_states(model, X1, E1, y0, node_mask, [t])
             for lam in (0.3, 1.0):
                 for K in (12, 64):
                     mean, med, frac = y_equals_x_control(
                         model, X_t, E_t, t, node_mask, lam=lam, K=K,
-                        reps=args.reps, invalid_frac=inv)
+                        reps=args.reps, invalid_frac=inv, reward_fn=reward_fn)
                     flag = "  <-- hot" if abs(math.log(max(mean, 1e-12))) > 0.5 else ""
                     print(f"{inv:8.2f} {t_val:5.1f} {lam:7.1f} {K:4d} {mean:11.3f} "
                           f"{med:9.3f} {frac:7.2f}{flag}")
@@ -245,6 +301,35 @@ def main():
         (X_t, E_t, _), = renoise_states(model, X1, E1, y0, node_mask, [t])
         rX, rE = projection_gap(model, X_t, E_t, t, node_mask, eta=args.eta)
         print(f"{t_val:6.1f} {rX:9.3f} {rE:9.3f}")
+
+    if reward_fn is not None:
+        print("\n(c) HEAD-DRAW REWARD BY t -- can the adjoint see anything?")
+        print(f"{'t':>6} {'floored':>9} {'disc':>7} {'reward sd':>11}  signal")
+        for t_val in (0.2, 0.5, 0.9, 0.99):
+            t = torch.full((args.graphs, 1), t_val, device=dev)
+            (X_t, E_t, _), = renoise_states(model, X1, E1, y0, node_mask, [t])
+            nz = {"X_t": X_t, "E_t": E_t, "y_t": y0, "t": t, "node_mask": node_mask}
+            with torch.no_grad():
+                pr = model.forward(nz, model._compute_extra_data(nz), node_mask)
+                px, pe = F.softmax(pr.X, -1), F.softmax(pr.E, -1)
+                rs = []
+                for _ in range(16):
+                    sd_ = sample_from_probs(px, pe, node_mask)
+                    Xd = F.one_hot(sd_.X, dx).float() * node_mask[..., None]
+                    Ed = F.one_hot(sd_.E, de).float() * em[..., None]
+                    rs.append(reward_fn(Xd, Ed, node_mask))
+                rs = torch.cat(rs)
+            fl = float((rs <= -9.9).float().mean())
+            dc = float((rs == -4.0).float().mean())
+            sd = float(rs.std())
+            print(f"{t_val:6.2f} {fl:9.2f} {dc:7.2f} {sd:11.3f}  "
+                  f"{'none -- adjoint is ~1' if sd < 0.05 else 'usable'}")
+        print("  Sampling the FACTORISED head independently across ~n*(n-1)/2 + n")
+        print("  coordinates destroys validity at low t. Where every draw floors at the")
+        print("  same value, g(Z) == g(X1_k) and the adjoint collapses to 1: no signal.")
+        print("  Consequence: keep the t-density mass near t=1. polydec already does")
+        print("  (mean t 0.667, P(t>0.9)=0.317); RAM's own p(t)=2(1-t) puts mass at the")
+        print("  NOISE end in DeFoG's convention and would be actively harmful here.")
 
     print("\nread: (a) E[a_hat] far from 1.0 means lambda is too hot or K too small;")
     print("      (b) a ratio near 1.0 means the head cannot express the tilt at all.")
