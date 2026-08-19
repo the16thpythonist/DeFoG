@@ -104,6 +104,7 @@ from .feynman_kac import FeynmanKacSampler, JointGuidanceSampler, predict_clean
 from .property_head import PropertyHead, LearnedPropertyEnergy, fit_property_head
 from .spectrum import Band, SpectrumEnergy, band_masses
 from .rl import (
+    RLTrainerBase,
     GDPOTrainer,
     AdapterGDPOTrainer,
     PropertyMatchReward,
@@ -214,6 +215,7 @@ __all__ = [
     "JointGuidanceSampler",
     "predict_clean",
     # GDPO reinforcement-learning fine-tuning (arXiv:2402.16302)
+    "RLTrainerBase",
     "GDPOTrainer",
     "AdapterGDPOTrainer",
     "PropertyMatchReward",

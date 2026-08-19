@@ -237,9 +237,15 @@ class RolloutSampler(Sampler):
     """
 
     def __init__(self, model, *, subsample_idx: Optional[Sequence[int]] = None,
-                 group_ids=None, crn: bool = False, **kwargs):
+                 group_ids=None, crn: bool = False, record_trace: bool = True, **kwargs):
         super().__init__(model, **kwargs)
         self.subsample_idx = set(subsample_idx) if subsample_idx is not None else None
+        # Trace recording is what the eager estimator needs and what the re-noising
+        # estimators (RAM/DAM) do not: they score at states drawn from p_{t|1}(.|G1),
+        # not at the states the trajectory happened to occupy. Turning it off keeps
+        # the endpoint stash and the CRN `_init_state` override, which both arms
+        # still need. Default True == today's behaviour.
+        self.record_trace = bool(record_trace)
         # Common random numbers: when `crn` and `group_ids` are given, every member of
         # an advantage group starts from the SAME initial noise + graph size (see
         # `_init_state`), so the group-relative advantage reflects the sampling
@@ -264,6 +270,9 @@ class RolloutSampler(Sampler):
         return super()._advance(t_int, X, E, y, node_mask, use_cfg)
 
     def _pre_step(self, X, E, t_norm, node_mask):
+        if not self.record_trace:
+            self._step += 1
+            return X, E
         if self.subsample_idx is None or self._step in self.subsample_idx:
             self.trace_X.append(X.detach())
             self.trace_E.append(E.detach())
@@ -312,9 +321,107 @@ class RolloutBuffer:
 
 
 # ===========================================================================
+# Shared trainer plumbing
+# ===========================================================================
+class RLTrainerBase:
+    """Optimiser / EMA / reference / loop plumbing shared by every RL fine-tuner here.
+
+    Subclasses supply the two things that actually differ between estimators:
+    :meth:`rollout` (produce a buffer) and :meth:`update` (turn it into a gradient
+    step). Everything else -- the AdamW, the EMA, the frozen reference, the outer
+    loop, the adaptive-KL controller, the checkpoint writer -- is estimator-agnostic
+    and was moved here verbatim from :class:`GDPOTrainer`.
+
+    ``record_trace`` is a CLASS attribute, not a constructor argument, because it is a
+    property of the estimator rather than of a run: the eager estimator scores at
+    trajectory states and needs the trace; the re-noising estimators (RAM/DAM) score
+    at states drawn from ``p_{t|1}(.|G1)`` and must not pay for it. Subclasses flip it.
+
+    Guarded by ``tests/test_rl_parity.py``, which compares this stack against a frozen
+    pre-refactor copy in the same process and requires bit-identical metrics and
+    weights.
+    """
+
+    #: whether :class:`RolloutSampler` should stash the per-step noisy states
+    record_trace: bool = True
+
+    def __init__(self, model, *, lr: float = 1e-5, weight_decay: float = 1e-5,
+                 grad_clip: float = 1.0, ema_decay: Optional[float] = 0.999,
+                 device=None, seed: int = 0):
+        self.model = model
+        self.grad_clip = grad_clip
+        self.device = device if device is not None else model.device
+        self.seed = seed
+        self.opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        self.ema = EMA(model, ema_decay) if ema_decay else None
+        self._iter = 0
+        # Estimators without a KL term leave these at their defaults, which makes the
+        # adaptive-KL controller in `step` inert rather than conditional.
+        self.kl_coef = 0.0
+        self.kl_target = None
+
+    # -------------------------------------------------------- to be implemented
+    def rollout(self):
+        raise NotImplementedError
+
+    def update(self, buf) -> dict:
+        raise NotImplementedError
+
+    # -------------------------------------------------------- plumbing
+    def _frozen_reference(self):
+        cls = type(self.model)
+        ref = cls(**dict(self.model.hparams))
+        ref.load_state_dict(self.model.state_dict())
+        ref.to(self.device).eval().requires_grad_(False)
+        return ref
+
+    def step(self) -> dict:
+        self._iter = getattr(self, "_iter", 0)
+        buf = self.rollout()
+        metrics = self.update(buf)
+
+        # adaptive KL controller: multiplicatively nudge kl_coef toward kl_target.
+        if self.kl_target is not None and self.kl_coef > 0:
+            err = metrics.get("kl", 0.0) / max(self.kl_target, 1e-8)
+            self.kl_coef = float(min(max(self.kl_coef * (1.0 + 0.1 * (err - 1.0)), 1e-4), 1e3))
+
+        r = buf.reward
+        metrics.update({
+            "reward_mean": float(r.mean()), "reward_std": float(r.std()),
+            "reward_min": float(r.min()), "reward_max": float(r.max()),
+            "adv_std": float(buf.advantage.std()),
+            "pos_frac": float((buf.advantage > 0).float().mean()),
+            "kl_coef": self.kl_coef,
+        })
+        self._iter += 1
+        return metrics
+
+    def fit(self, iterations: int, on_iter: Optional[Callable] = None) -> List[dict]:
+        self._iter = getattr(self, "_iter", 0)
+        history = []
+        for _ in range(iterations):
+            m = self.step()
+            history.append(m)
+            if on_iter is not None:
+                on_iter(self._iter - 1, m)
+        return history
+
+    def save(self, path: str, use_ema: bool = True) -> str:
+        """Save the fine-tuned policy as a plain DeFoG checkpoint. If ``use_ema`` and
+        an EMA is tracked, the smoothed weights are written (originals restored)."""
+        if use_ema and self.ema is not None:
+            backup = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+            self.ema.copy_to(self.model)
+            out = self.model.save(path)
+            self.model.load_state_dict(backup)
+            return out
+        return self.model.save(path)
+
+
+# ===========================================================================
 # Trainer
 # ===========================================================================
-class GDPOTrainer:
+class GDPOTrainer(RLTrainerBase):
     """GDPO eager-policy-gradient fine-tuner for a pretrained ``DeFoGModel``.
 
     Defaults reproduce faithful single-epoch eager REINFORCE (``kl_coef=0``,
@@ -389,7 +496,8 @@ class GDPOTrainer:
         device=None,
         seed: int = 0,
     ):
-        self.model = model
+        super().__init__(model, lr=lr, weight_decay=weight_decay, grad_clip=grad_clip,
+                         ema_decay=ema_decay, device=device, seed=seed)
         self.reward_fn = reward_fn
         self.rollout_size = int(rollout_size)
         self.sample_steps = int(sample_steps)
@@ -411,26 +519,12 @@ class GDPOTrainer:
         self.positive_only = bool(positive_only)
         self.kl_coef = float(kl_coef)
         self.kl_target = kl_target
-        self.grad_clip = grad_clip
-        self.device = device if device is not None else model.device
-        self.seed = seed
-
-        self.opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        self.ema = EMA(model, ema_decay) if ema_decay else None
-
         # Reference for the KL term. Built from hyperparameters + weight copy (NOT
         # copy.deepcopy -- avoids duplicating a live LightningModule). Only when KL
         # is on. The reference is a fixed frozen copy of the pretrained weights.
         self.ref = None
         if self.kl_coef > 0:
             self.ref = ref_model if ref_model is not None else self._frozen_reference()
-
-    def _frozen_reference(self):
-        cls = type(self.model)
-        ref = cls(**dict(self.model.hparams))
-        ref.load_state_dict(self.model.state_dict())
-        ref.to(self.device).eval().requires_grad_(False)
-        return ref
 
     def _choose_subsample(self):
         """Indices (shared across the K trajectories) of the noisy states that enter
@@ -466,7 +560,7 @@ class GDPOTrainer:
         sampler = RolloutSampler(
             self.model, subsample_idx=idx, eta=self.eta, omega=self.omega,
             sample_steps=self.sample_steps, time_distortion=self.time_distortion,
-            group_ids=groups, crn=self.crn,
+            group_ids=groups, crn=self.crn, record_trace=self.record_trace,
             # CFG is a sampling heuristic, not a differentiable policy: force it off
             # so the behavior policy matches the plain-conditional gradient recompute
             # (else conditional rollouts are CFG-tilted but the gradient is not).
@@ -540,48 +634,6 @@ class GDPOTrainer:
         if was_training:
             model.train()
         return {"loss": pg_loss, "kl": kl_val, "grad_norm": float(gnorm)}
-
-    def step(self) -> dict:
-        self._iter = getattr(self, "_iter", 0)
-        buf = self.rollout()
-        metrics = self.update(buf)
-
-        # adaptive KL controller: multiplicatively nudge kl_coef toward kl_target.
-        if self.kl_target is not None and self.kl_coef > 0:
-            err = metrics.get("kl", 0.0) / max(self.kl_target, 1e-8)
-            self.kl_coef = float(min(max(self.kl_coef * (1.0 + 0.1 * (err - 1.0)), 1e-4), 1e3))
-
-        r = buf.reward
-        metrics.update({
-            "reward_mean": float(r.mean()), "reward_std": float(r.std()),
-            "reward_min": float(r.min()), "reward_max": float(r.max()),
-            "adv_std": float(buf.advantage.std()),
-            "pos_frac": float((buf.advantage > 0).float().mean()),
-            "kl_coef": self.kl_coef,
-        })
-        self._iter += 1
-        return metrics
-
-    def fit(self, iterations: int, on_iter: Optional[Callable] = None) -> List[dict]:
-        self._iter = getattr(self, "_iter", 0)
-        history = []
-        for _ in range(iterations):
-            m = self.step()
-            history.append(m)
-            if on_iter is not None:
-                on_iter(self._iter - 1, m)
-        return history
-
-    def save(self, path: str, use_ema: bool = True) -> str:
-        """Save the fine-tuned policy as a plain DeFoG checkpoint. If ``use_ema`` and
-        an EMA is tracked, the smoothed weights are written (originals restored)."""
-        if use_ema and self.ema is not None:
-            backup = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
-            self.ema.copy_to(self.model)
-            out = self.model.save(path)
-            self.model.load_state_dict(backup)
-            return out
-        return self.model.save(path)
 
 
 # ===========================================================================
@@ -731,7 +783,8 @@ class AdapterGDPOTrainer(GDPOTrainer):
                                   base=self.base, mode=self.rollout_mode)
         sampler = RolloutSampler(self.base, subsample_idx=idx, eta=self.eta, omega=self.omega,
                                  sample_steps=self.sample_steps, time_distortion=self.time_distortion,
-                                 group_ids=groups, crn=self.crn, guidance_scale=1.0)
+                                 group_ids=groups, crn=self.crn,
+                                 record_trace=self.record_trace, guidance_scale=1.0)
         sampler.composition = comp
         # `condition` MUST reach the size distribution. A condition-aware
         # SizeDistribution (defog_megan.sizes.ConceptSizeDistribution) recovers its

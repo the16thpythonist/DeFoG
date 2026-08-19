@@ -582,3 +582,47 @@ def test_crn_rollout_first_recorded_state_shared_within_group(small_model):
         r = int(idx[0])
         for j in idx.tolist():
             assert torch.equal(x0[j], x0[r])
+
+
+# ======================================================================
+# record_trace: the re-noising estimators' escape hatch
+# ======================================================================
+def test_record_trace_false_suppresses_trace_but_keeps_endpoint_and_crn(small_model):
+    """RAM/DAM score at states drawn from p_{t|1}(.|G1), not at trajectory states, so
+    they must be able to switch trace recording off -- while still getting the
+    endpoint stash and the CRN shared start.
+
+    An explicit flag rather than ``subsample_steps=0``: that route returns ``[]`` for
+    ``subsample='stratified'`` and ``'uniform'`` but RAISES for ``'late'``, and it is
+    unreachable from a subclass that overrides only ``update()`` because the inherited
+    ``rollout`` builds the sampler from ``self._choose_subsample()``.
+    """
+    from defog.core.rl import RolloutSampler
+    torch.manual_seed(7)
+    gids = [0, 0, 1, 1]
+
+    off = RolloutSampler(small_model, sample_steps=5, eta=1.0,
+                         group_ids=gids, crn=True, record_trace=False)
+    off.sample(4, device=torch.device("cpu"), show_progress=False)
+
+    assert off.trace_X == [] and off.trace_E == [] and off.trace_t == [], \
+        "record_trace=False still recorded noisy states"
+    assert off.endpoint is not None and off.end_node_mask is not None, \
+        "record_trace=False lost the endpoint stash"
+    nm = off.end_node_mask
+    assert torch.equal(nm[0], nm[1]) and torch.equal(nm[2], nm[3]), \
+        "record_trace=False broke the CRN shared start (group members differ in size)"
+
+    torch.manual_seed(7)
+    on = RolloutSampler(small_model, sample_steps=5, eta=1.0,
+                        group_ids=gids, crn=True)          # default: records
+    on.sample(4, device=torch.device("cpu"), show_progress=False)
+    assert len(on.trace_X) == 5, "default record_trace no longer records every step"
+
+
+def test_record_trace_default_leaves_rollout_unchanged(small_model):
+    """The flag defaults to today's behaviour, so no existing caller changes."""
+    from defog.core.rl import RolloutSampler
+    import inspect
+    sig = inspect.signature(RolloutSampler.__init__)
+    assert sig.parameters["record_trace"].default is True
