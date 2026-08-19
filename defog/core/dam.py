@@ -491,14 +491,18 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
 
         self.opt.zero_grad()
         n_states = max(1, len(states))
-        tot, log_a_sum, clamp_sum, resid_sum = 0.0, 0.0, 0.0, 0.0
+        tot, log_a_sum, clamp_sum = 0.0, 0.0, 0.0
+        resid_sum = {"resid_ratio": 0.0, "resid_nodes": 0.0, "resid_edges": 0.0}
+        resid_n = {k: 0 for k in resid_sum}
         for (X_t, E_t, t) in states:
             loss, d = self._state_loss(X_t, E_t, t, nm, cond)
             (loss / n_states).backward()
             tot += float(loss.detach()) / n_states
             log_a_sum += d["log_a"] / n_states
             clamp_sum += d["clamp_frac"] / n_states
-            resid_sum += d["resid_ratio"] / n_states
+            for k in resid_sum:
+                if d[k] == d[k]:                       # skip NaN (no jump of that type)
+                    resid_sum[k] += d[k]; resid_n[k] += 1
 
         gnorm = clip_grad_norm_(adapter.parameters(), self.grad_clip)
         self.opt.step()
@@ -506,9 +510,12 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
             self.ema.update(adapter)
         if was_training:
             adapter.train()
-        return {"loss": tot, "kl": 0.0, "grad_norm": float(gnorm),
-                "log_adjoint": log_a_sum, "adjoint_clamp_frac": clamp_sum,
-                "resid_gkl_ratio": resid_sum}
+        out = {"loss": tot, "kl": 0.0, "grad_norm": float(gnorm),
+               "log_adjoint": log_a_sum, "adjoint_clamp_frac": clamp_sum}
+        out["resid_gkl_ratio"] = resid_sum["resid_ratio"] / max(resid_n["resid_ratio"], 1)
+        out["resid_gkl_nodes"] = resid_sum["resid_nodes"] / max(resid_n["resid_nodes"], 1)
+        out["resid_gkl_edges"] = resid_sum["resid_edges"] / max(resid_n["resid_edges"], 1)
+        return out
 
     def _state_loss(self, X_t, E_t, t, nm, cond):
         base = self.base
@@ -561,7 +568,19 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
 
         with torch.no_grad():
             noop = gkl(u_base_Y, target)
+            n_node = uX.shape[1] * uX.shape[2]
+            is_node = (pick < n_node)
+            def _ratio(mask):
+                if not bool(mask.any()):
+                    return float("nan")
+                return float((per[mask].sum() / noop[mask].sum().clamp_min(1e-12)).clamp(0, 1e6))
             resid = float((per.sum() / noop.sum().clamp_min(1e-12)).clamp(0, 1e6))
+        # Split by coordinate type: calibration on the real base shows the node and
+        # edge channels move in OPPOSITE directions with t -- the node gap sits at
+        # ~0.66-0.71 everywhere while the edge gap falls to 0.09 by t=0.99 -- so a
+        # single pooled number hides the only thing worth watching.
         return loss, {"log_a": float(log_a.mean()),
                       "clamp_frac": float(clamp_frac),
-                      "resid_ratio": resid}
+                      "resid_ratio": resid,
+                      "resid_nodes": _ratio(is_node),
+                      "resid_edges": _ratio(~is_node)}

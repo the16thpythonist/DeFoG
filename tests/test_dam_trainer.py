@@ -157,7 +157,8 @@ def test_reports_the_health_metrics(base_model, adapter):
     ratio, which is the only in-run signal for the projection gap."""
     tr = _trainer(base_model, adapter)
     m = tr.step()
-    for k in ("log_adjoint", "adjoint_clamp_frac", "resid_gkl_ratio"):
+    for k in ("log_adjoint", "adjoint_clamp_frac", "resid_gkl_ratio",
+              "resid_gkl_nodes", "resid_gkl_edges"):
         assert k in m, f"missing health metric {k}"
         assert m[k] == m[k], f"{k} is NaN"
     assert 0.0 <= m["adjoint_clamp_frac"] <= 1.0

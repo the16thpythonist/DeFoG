@@ -331,6 +331,54 @@ def main():
         print("  (mean t 0.667, P(t>0.9)=0.317); RAM's own p(t)=2(1-t) puts mass at the")
         print("  NOISE end in DeFoG's convention and would be actively harmful here.")
 
+    # ---------------------------------------------------------------- (d)
+    print("\n(d) USABLE BAND -- is there a t where the adjoint has signal AND the")
+    print("    head can express a tilt? Both must hold for a scored state to be worth")
+    print("    anything.")
+    print(f"{'t':>6} {'floored':>9} {'reward sd':>11} {'gap nodes':>11} {'gap edges':>11} "
+          f"{'E[a] y=x':>10}  verdict")
+    scan = (0.70, 0.80, 0.85, 0.90, 0.93, 0.95, 0.97, 0.99)
+    usable = []
+    for t_val in scan:
+        t = torch.full((args.graphs, 1), t_val, device=dev)
+        (X_t, E_t, _), = renoise_states(model, X1, E1, y0, node_mask, [t])
+        nz = {"X_t": X_t, "E_t": E_t, "y_t": y0, "t": t, "node_mask": node_mask}
+        with torch.no_grad():
+            pr = model.forward(nz, model._compute_extra_data(nz), node_mask)
+            px, pe = F.softmax(pr.X, -1), F.softmax(pr.E, -1)
+            rs = []
+            for _ in range(16):
+                sd_ = sample_from_probs(px, pe, node_mask)
+                Xd = F.one_hot(sd_.X, dx).float() * node_mask[..., None]
+                Ed = F.one_hot(sd_.E, de).float() * em[..., None]
+                rs.append((reward_fn or (lambda a, b, m: tiered_reward(a, b, m)))(
+                    Xd, Ed, node_mask))
+            rs = torch.cat(rs)
+        fl, sdv = float((rs <= -9.9).float().mean()), float(rs.std())
+        rX, rE = projection_gap(model, X_t, E_t, t, node_mask, eta=args.eta, steps=200)
+        ea, _, _ = y_equals_x_control(model, X_t, E_t, t, node_mask, lam=0.3, K=12,
+                                      reps=8, invalid_frac=0.0, reward_fn=reward_fn)
+        ok = (sdv > 0.5) and (max(rX, rE) < 0.75)
+        usable.append((t_val, ok))
+        print(f"{t_val:6.2f} {fl:9.2f} {sdv:11.3f} {rX:11.3f} {rE:11.3f} {ea:10.3f}"
+              f"  {'USABLE' if ok else ('no signal' if sdv <= 0.5 else 'gap too wide')}")
+
+    band = [t for t, ok in usable if ok]
+    print(f"\n    usable band: {('t in [%.2f, %.2f]' % (min(band), max(band))) if band else 'NONE'}")
+
+    # How much of the scored-state budget actually lands there, per subsample policy.
+    from defog.core.sampler import Sampler                            # noqa: E402
+    probe = Sampler(model, sample_steps=250, time_distortion="polydec")
+    grid = torch.tensor([probe._distorted_time(i) for i in range(250)])
+    if band:
+        lo = min(band)
+        w_late = torch.linspace(0.2, 1.0, 250) ** 2
+        frac_uniform = float((grid >= lo).float().mean())
+        frac_late = float(((grid >= lo).float() * w_late).sum() / w_late.sum())
+        print(f"    share of scored states in the band at sample_steps=250, polydec:")
+        print(f"      subsample='stratified'/'uniform' : {frac_uniform:.2f}")
+        print(f"      subsample='late'                 : {frac_late:.2f}")
+
     print("\nread: (a) E[a_hat] far from 1.0 means lambda is too hot or K too small;")
     print("      (b) a ratio near 1.0 means the head cannot express the tilt at all.")
 
