@@ -401,6 +401,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
     def __init__(self, base, adapter, cond_reward, *, ref_adapter=None,
                  dam_k: int = 12, dam_lambda: float = 0.3,
                  adjoint_clamp: float = 10.0, renoise_draws: int = 16,
+                 n_jumps: int = 8,
                  t_sampler: str = "match", debias: str = "snis",
                  lr: float = 1e-5, weight_decay: float = 1e-5, ema_decay=0.999,
                  **gdpo_kw):
@@ -417,6 +418,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         if debias not in ("snis", "raw"):
             raise ValueError(f"debias must be 'snis' or 'raw', got {debias!r}")
 
+        self.n_jumps = int(n_jumps)
         self.dam_k = int(dam_k)
         self.dam_lambda = float(dam_lambda)
         self.adjoint_clamp = adjoint_clamp
@@ -541,21 +543,39 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
             lr_X1 = torch.stack(lrs, -1)
             g_X1 = torch.stack(gs, -1)
 
-            # --- one jump target y, then Z ~ p^theta_{1|t}(.|y) --------------------
-            logp_y, pick, X_Y, E_Y = sample_jump(uX.detach(), uE.detach(), X_t, E_t, nm)
-            pY, pYE, noisyY, extraY = _base_uncond_softmax(base, X_Y, E_Y, t, nm)
-            polYX, polYE = self._composed(self.adapter, noisyY, extraY, nm, cond, pY, pYE)
-            refYX, refYE = self._composed(self.ref_adapter, noisyY, extraY, nm, cond, pY, pYE)
-            Z_X, Z_E = self._draw_clean(polYX, polYE, nm)
-            lr_Z = self._log_ratio(refYX, refYE, polYX, polYE, Z_X, Z_E, nm)
-            g_Z = self._terminal_loss(Z_X, Z_E, nm, cond)
+            # --- m jump targets, evaluated in ONE batched forward -----------------
+            # Eq. (11) is a single-sample estimate of Eq. (14)'s sum over ~n*dx +
+            # n^2/2*de reachable y -- about 3.2k at n=38. One draw per state makes
+            # each gradient step fit a different randomly chosen coordinate, and the
+            # residual diagnostic read at that same single y is equally noisy
+            # (measured bouncing over 0.8-12.8 across iterations). Averaging m draws
+            # is the same estimator with m samples instead of 1; the extra cost is
+            # one forward on an m-times-larger batch, not m forwards.
+            jumps = [sample_jump(uX.detach(), uE.detach(), X_t, E_t, nm)
+                     for _ in range(self.n_jumps)]
+            logp_y = torch.cat([j[0] for j in jumps])
+            pick = torch.cat([j[1] for j in jumps])
+            X_Y = torch.cat([j[2] for j in jumps])
+            E_Y = torch.cat([j[3] for j in jumps])
+            m = self.n_jumps
+            t_r = t.repeat(m, 1)
+            nm_r = nm.repeat(m, 1)
+            cond_r = cond.repeat(m, 1)
 
-            log_a, clamp_frac = discrete_adjoint(lr_Z, g_Z, lr_X1, g_X1,
+            pY, pYE, noisyY, extraY = _base_uncond_softmax(base, X_Y, E_Y, t_r, nm_r)
+            polYX, polYE = self._composed(self.adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
+            refYX, refYE = self._composed(self.ref_adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
+            Z_X, Z_E = self._draw_clean(polYX, polYE, nm_r)
+            lr_Z = self._log_ratio(refYX, refYE, polYX, polYE, Z_X, Z_E, nm_r)
+            g_Z = self._terminal_loss(Z_X, Z_E, nm_r, cond_r)
+
+            log_a, clamp_frac = discrete_adjoint(lr_Z, g_Z, lr_X1.repeat(m, 1),
+                                                 g_X1.repeat(m, 1),
                                                  clamp=self.adjoint_clamp)
-            u_base_Y = gather_rate(bX, bE, pick)
+            u_base_Y = gather_rate(bX.repeat(m, 1, 1), bE.repeat(m, 1, 1, 1), pick)
             target = u_base_Y * log_a.exp()
 
-        u_theta_Y = gather_rate(uX, uE, pick)
+        u_theta_Y = gather_rate(uX.repeat(m, 1, 1), uE.repeat(m, 1, 1, 1), pick)
         per = gkl(u_theta_Y, target)
 
         # Eq. (11) weights each sampled y by 1/p^u_t(y|x), which makes the estimate an
