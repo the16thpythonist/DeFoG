@@ -39,39 +39,85 @@ ordinary RDKit reward, at 1.057.
    did not convert into a better update, so reachability was never the binding
    constraint. (The RL rounds do measurably reduce steerability, which is worth
    knowing independently.)
-4. **Reward degeneracy.** See below. Tested and rejected.
+4. **Reward degeneracy.** Tested and rejected -- see below. The RDKit floor does not
+   collapse `g` (spread 0.44-0.51, not 0), and a head fitted to grade the floored
+   region made both the spread and the residual markedly worse.
+5. **The candidate surrogate.** The one-shot head draw was replaced with the paper's
+   actual procedure -- simulated model trajectories. The residual does not improve;
+   see below for what it did reveal instead.
 
-## The reward-degeneracy hypothesis, and why it was wrong
+## Two wrong diagnoses, in order
 
-84-98% of the head's one-shot clean-graph draws fail to decode, and RDKit floors
-every failure at the same value. The hypothesis was that this collapses `g(Z)` and
-`g(X1_k)` to the same number, making the adjoint 1 and leaving nothing to learn.
+### First: reward degeneracy (wrong)
 
-Two things falsify it:
+84-98% of one-shot clean-graph draws fail to decode, and RDKit floors every failure
+at the same value. The hypothesis was that this makes `g(Z) == g(X1_k)`, so the
+adjoint is 1 and there is nothing to learn.
 
-* **The floor does not collapse `g`.** Measured `g_spread` under RDKit is 0.487, not
-  0. The 5-15% of draws that do decode supply real variation. The earlier claim that
-  the adjoint "collapses to 1" was overstated -- inferred from `log_a ~ -0.15` without
-  measuring the spread directly.
-* **Grading the floored region made it worse.** A PropertyHead fitted on 30k draws
-  (~50% own-labelled, ~50% surrogate) drove `g_spread` DOWN by ~30x, to 0.013. It
-  predicts nearly the same value for every broken graph, because they look alike to
-  it. The residual rose from 1.20 to 2.21 (shipped) and 1.06 to 2.46 (pre-RL).
+Falsified twice over. The floor does **not** collapse `g` -- measured `g_spread` under
+RDKit is 0.44-0.51, not 0, because the 5-15% of draws that decode still vary. And
+grading the floored region made things **worse**: a PropertyHead fitted on 30k draws
+(~50% own-labelled, ~50% surrogate) drove `g_spread` DOWN ~30x to 0.013 and pushed the
+residual from 1.20 to 2.21 (shipped) and 1.06 to 2.46 (pre-RL).
 
-The training target was also ill-posed, which is the more useful lesson. A broken
-graph has no logP, so it was labelled with the logP of the endpoint it was corrupted
-from -- **not a property of the graph being scored**. The same broken graph reached
-from two different molecules gets two different labels, so it is not a function of
-the input; the best attainable fit is a conditional mean. Worse, valid draws were
-labelled with their OWN logP, so the set asks two contradictory questions at once.
-The heads land at MAE 1.57 and 1.61 against truth standard deviations of 1.04 and
-1.15 -- both worse than predicting the mean.
+The head's training target was also ill-posed, which is the transferable lesson. A
+broken graph has no logP, so it was labelled with the logP of the endpoint it was
+corrupted from -- **not a property of the graph being scored**. The same broken graph
+reached from two ancestors gets two labels, so it is not a function of the input at
+all. Mixed with own-logP labels on valid draws, the set asks two contradictory
+questions; the heads land at MAE 1.57 and 1.61 against truth SDs of 1.04 and 1.15,
+i.e. worse than predicting the mean.
 
-**The floor is arguably correct.** Under the real objective, invalid structures are
-all equally worthless. Inventing a graded score for them manufactures signal the
-objective does not contain. If a graded term is wanted it should measure a genuine
-property of the graph -- valence violations, fragment count, ring sanity -- not a
-property it does not have.
+The floor is arguably correct: under the real objective invalid structures **are** all
+equally worthless, and inventing a graded score for them manufactures signal the
+objective does not contain.
+
+### Second: the candidate surrogate (real, but not the cause either)
+
+DAM Alg. 1 line 6 draws candidates by simulating **model trajectories** from `X_t`.
+This implementation substituted a one-shot draw from the factorised clean-graph head
+-- ~25x cheaper, and not the same object. The head is a good marginal and a poor
+joint, so sampling ~740 coordinates independently produces almost nothing valid. That
+substitution was listed as a risk in `dam_design.md` section 11.3 and then built upon
+without being tested.
+
+It never bites in DAM's own experiments because those are masked diffusion **language**
+models: every completion is a valid token sequence and no invalid state exists.
+Validity is a hard constraint here and independent per-slot sampling destroys it.
+
+`simulate_to_end` implements the paper's version. It does not fix the residual:
+
+| base | candidates | g_spread | log_a | resid nodes | resid edges | s/it |
+|---|---|---|---|---|---|---|
+| shipped | one-shot head | 0.439 | -0.239 | 1.379 | 1.077 | 12.4 |
+| shipped | **simulated** | 0.282 | -0.033 | 1.380 | 1.040 | 147.3 |
+| pre-RL | one-shot head | 0.507 | -0.196 | 1.474 | 1.208 | 12.4 |
+| pre-RL | **simulated** | 0.399 | -0.051 | 1.615 | 1.058 | 136.0 |
+
+## What the simulated candidates actually revealed
+
+`g_spread` went **down** with real candidates (0.44 -> 0.28, 0.51 -> 0.40) and `log_a`
+moved **toward** 0 (-0.24 -> -0.03, -0.20 -> -0.05). The prediction was the opposite.
+
+The explanation reframes the whole investigation. Candidates simulated from the same
+`X_t` are valid molecules with **similar properties**: at the `t` these runs scored at,
+the endpoint is already nearly determined, so every continuation lands on much the
+same molecule and there is genuinely little to compare. The one-shot draws only looked
+more varied because they were varied *garbage* -- spread of noise, read as signal.
+
+That exposes a squeeze:
+
+* **high t** -- simulation is cheap (short sub-rollouts) but the endpoint is settled,
+  so the adjoint has nothing to say;
+* **low t** -- the endpoint is genuinely uncertain, so the adjoint should have real
+  signal, but only a real sub-rollout can score it and those are long.
+
+Every measurement before this sat in the first corner, because runs used
+`subsample='late'` on the strength of an earlier "no signal below t~0.7" finding --
+which is itself suspect, having been derived from the head's ability to produce varied
+draws and therefore conflating "the endpoint is uncertain" with "the head produces
+garbage". A `subsample='early'` mode was added to probe the other corner; results
+below when available.
 
 ## What is worth keeping
 

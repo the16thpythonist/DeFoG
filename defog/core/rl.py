@@ -536,6 +536,13 @@ class GDPOTrainer(RLTrainerBase):
         g = torch.Generator().manual_seed(self.seed + self._iter)
         if self.subsample == "uniform":
             idx = torch.randperm(S, generator=g)[:m]
+        elif self.subsample == "early":
+            # Mirror of "late": bias toward t->0. Added for the DAM diagnostic, where
+            # the question is whether the adjoint has signal in the region the
+            # ENDPOINT IS STILL UNDETERMINED -- which is the low-t end, and which only
+            # a real sub-rollout can score (a one-shot head draw there is garbage).
+            w = torch.linspace(1.0, 0.2, S) ** 2
+            idx = torch.multinomial(w, m, replacement=False, generator=g)
         elif self.subsample == "late":
             # bias toward t->1, where the clean prediction most directly carries G1
             w = torch.linspace(0.2, 1.0, S) ** 2

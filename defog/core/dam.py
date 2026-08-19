@@ -45,6 +45,7 @@ from torch.nn.utils import clip_grad_norm_
 from .data import PlaceHolder
 from .noise import sample_from_probs
 from .renoise import draw_times, renoise_states
+from .sampler import Sampler
 from .rl import (
     AdapterGDPOTrainer,
     _base_uncond_softmax,
@@ -54,6 +55,7 @@ from .rl import (
 
 __all__ = [
     "assert_valid_base_rate",
+    "simulate_to_end",
     "sample_jump",
     "gather_rate",
     "rate_basis",
@@ -360,6 +362,39 @@ def gather_rate(RX: torch.Tensor, RE: torch.Tensor, pick: torch.Tensor) -> torch
 
 
 # ===========================================================================
+# Candidate endpoints, the way the paper gets them
+# ===========================================================================
+@torch.no_grad()
+def simulate_to_end(model, X_t, E_t, y_t, node_mask, t_int, *, sample_steps,
+                    time_distortion, eta, omega=0.0, composition=None):
+    """Run the generative process from an intermediate state to t=1.
+
+    DAM Alg. 1 line 6 draws its candidates by sampling MODEL TRAJECTORIES from X_t --
+    it simulates. The cheap alternative, asking the clean-graph head "what do you
+    think the finished molecule is?" and sampling every coordinate independently, is
+    not the same thing and on molecules it is catastrophic: the head is a good
+    marginal and a poor joint, so 84-98% of one-shot draws fail to decode and the
+    reward cannot tell them apart.
+
+    That never bites in DAM's own experiments because they are masked diffusion
+    LANGUAGE models, where every completion is a valid token sequence and there is no
+    invalid state at all. Validity is a real constraint here and independent per-slot
+    sampling destroys it.
+
+    Affordable because the usable signal sits at high t: from t=0.9 only ~10% of the
+    steps remain, and the K candidates for one state simulate together as a batch.
+    """
+    probe = Sampler(model, sample_steps=sample_steps, time_distortion=time_distortion,
+                    eta=eta, omega=omega)
+    X, E, y = X_t, E_t, y_t
+    for k in range(int(t_int), int(sample_steps)):
+        t_n, s_n = probe._step_times(k, X.shape[0], X.device)
+        X, E, y = model.denoise_step(t_n, s_n, X, E, y, node_mask, eta=eta,
+                                     omega=omega, composition=composition)
+    return X, E
+
+
+# ===========================================================================
 # Trainer
 # ===========================================================================
 class AdapterDAMTrainer(AdapterGDPOTrainer):
@@ -402,6 +437,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                  dam_k: int = 12, dam_lambda: float = 0.3,
                  adjoint_clamp: float = 10.0, renoise_draws: int = 16,
                  n_jumps: int = 8, scoring_head=None,
+                 candidate_mode: str = "head",
                  head_scale: float = 1.0, head_clamp: float = 3.0,
                  t_sampler: str = "match", debias: str = "snis",
                  lr: float = 1e-5, weight_decay: float = 1e-5, ema_decay=0.999,
@@ -419,6 +455,12 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         if debias not in ("snis", "raw"):
             raise ValueError(f"debias must be 'snis' or 'raw', got {debias!r}")
 
+        if candidate_mode not in ("head", "simulate"):
+            raise ValueError("candidate_mode must be 'head' or 'simulate'")
+        # "simulate" is what DAM Alg. 1 line 6 actually specifies; "head" is the
+        # one-shot surrogate, kept because it is ~25x cheaper and is what every
+        # measurement before this was taken with.
+        self.candidate_mode = candidate_mode
         self.n_jumps = int(n_jumps)
         # The adjoint's terminal loss. RDKit floors every undecodable graph at the
         # same value, and 84-98% of the head's one-shot draws are undecodable at the
@@ -453,6 +495,25 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
 
         self.ref_adapter = (ref_adapter if ref_adapter is not None
                             else self._frozen_adapter_ref())
+
+    def _composition(self, cond):
+        """The same composed policy the rollout samples from, for sub-rollouts."""
+        from .adapter import AdapterComposition, ConditionBranch
+        return AdapterComposition(
+            [ConditionBranch(self.adapter, cond, self.rollout_weight)],
+            base=self.base, mode=self.rollout_mode)
+
+    def _simulate_endpoints(self, X, E, nm, cond, t_int, reps):
+        """`reps` model trajectories from each row of (X, E), run to t=1 as one batch."""
+        bs = X.shape[0]
+        Xr, Er = X.repeat(reps, 1, 1), E.repeat(reps, 1, 1, 1)
+        nmr, cr = nm.repeat(reps, 1), cond.repeat(reps, 1)
+        yr = torch.zeros(bs * reps, 0, device=X.device)
+        return simulate_to_end(self.base, Xr, Er, yr, nmr, t_int,
+                               sample_steps=self.sample_steps,
+                               time_distortion=self.time_distortion,
+                               eta=self.eta, omega=0.0,
+                               composition=self._composition(cr))
 
     # ------------------------------------------------------------- helpers
     def _composed(self, adapter, noisy, extra, nm, cond, puX, puE):
@@ -516,6 +577,13 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                            sample_steps=self.sample_steps,
                            time_distortion=self.time_distortion)
         states = renoise_states(self.base, buf.X1, buf.E1, y0, nm, times)
+        # "simulate" needs to know WHERE on the grid each state sits, so the
+        # sub-rollout starts from the right step. Only t_sampler="match" carries that.
+        step_idx = idx if idx is not None else [None] * len(states)
+        if self.candidate_mode == "simulate" and idx is None:
+            raise ValueError("candidate_mode='simulate' requires t_sampler='match'; "
+                             "the other modes draw continuous t with no grid index to "
+                             "resume a sub-rollout from.")
 
         self.opt.zero_grad()
         n_states = max(1, len(states))
@@ -523,8 +591,8 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         resid_sum = {"resid_ratio": 0.0, "resid_nodes": 0.0, "resid_edges": 0.0,
                      "g_spread": 0.0}
         resid_n = {k: 0 for k in resid_sum}
-        for (X_t, E_t, t) in states:
-            loss, d = self._state_loss(X_t, E_t, t, nm, cond)
+        for (X_t, E_t, t), t_i in zip(states, step_idx):
+            loss, d = self._state_loss(X_t, E_t, t, nm, cond, t_i)
             (loss / n_states).backward()
             tot += float(loss.detach()) / n_states
             log_a_sum += d["log_a"] / n_states
@@ -547,7 +615,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         out["resid_gkl_edges"] = resid_sum["resid_edges"] / max(resid_n["resid_edges"], 1)
         return out
 
-    def _state_loss(self, X_t, E_t, t, nm, cond):
+    def _state_loss(self, X_t, E_t, t, nm, cond, t_int=None):
         base = self.base
 
         # --- at x: one shared unconditional forward, two conditional ones ---------
@@ -563,13 +631,24 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
 
         with torch.no_grad():
             # --- K clean draws at x: the self-normalised second factor -------------
-            lrs, gs = [], []
-            for _ in range(self.dam_k):
-                X1, E1 = self._draw_clean(polX, polE, nm)
-                lrs.append(self._log_ratio(refX, refE, polX, polE, X1, E1, nm))
-                gs.append(self._terminal_loss(X1, E1, nm, cond))
-            lr_X1 = torch.stack(lrs, -1)
-            g_X1 = torch.stack(gs, -1)
+            if self.candidate_mode == "simulate":
+                # DAM Alg. 1 line 6: K model TRAJECTORIES from X_t. The importance
+                # ratio is left at 1 -- that is Prop 2.3 / Eq. (12), the "original AM
+                # recipe" the paper names as the alternative to Eq. (13), and it needs
+                # no path likelihoods. Bias reduces over training.
+                K = self.dam_k
+                sX, sE = self._simulate_endpoints(X_t, E_t, nm, cond, t_int, K)
+                gk = self._terminal_loss(sX, sE, nm.repeat(K, 1), cond.repeat(K, 1))
+                g_X1 = gk.view(K, -1).t().contiguous()
+                lr_X1 = torch.zeros_like(g_X1)
+            else:
+                lrs, gs = [], []
+                for _ in range(self.dam_k):
+                    X1, E1 = self._draw_clean(polX, polE, nm)
+                    lrs.append(self._log_ratio(refX, refE, polX, polE, X1, E1, nm))
+                    gs.append(self._terminal_loss(X1, E1, nm, cond))
+                lr_X1 = torch.stack(lrs, -1)
+                g_X1 = torch.stack(gs, -1)
             g_spread = float(g_X1.std(dim=-1).mean())   # 0 => the adjoint is blind
 
             # --- m jump targets, evaluated in ONE batched forward -----------------
@@ -591,12 +670,17 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
             nm_r = nm.repeat(m, 1)
             cond_r = cond.repeat(m, 1)
 
-            pY, pYE, noisyY, extraY = _base_uncond_softmax(base, X_Y, E_Y, t_r, nm_r)
-            polYX, polYE = self._composed(self.adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
-            refYX, refYE = self._composed(self.ref_adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
-            Z_X, Z_E = self._draw_clean(polYX, polYE, nm_r)
-            lr_Z = self._log_ratio(refYX, refYE, polYX, polYE, Z_X, Z_E, nm_r)
-            g_Z = self._terminal_loss(Z_X, Z_E, nm_r, cond_r)
+            if self.candidate_mode == "simulate":
+                Z_X, Z_E = self._simulate_endpoints(X_Y, E_Y, nm_r, cond_r, t_int, 1)
+                g_Z = self._terminal_loss(Z_X, Z_E, nm_r, cond_r)
+                lr_Z = torch.zeros_like(g_Z)
+            else:
+                pY, pYE, noisyY, extraY = _base_uncond_softmax(base, X_Y, E_Y, t_r, nm_r)
+                polYX, polYE = self._composed(self.adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
+                refYX, refYE = self._composed(self.ref_adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
+                Z_X, Z_E = self._draw_clean(polYX, polYE, nm_r)
+                lr_Z = self._log_ratio(refYX, refYE, polYX, polYE, Z_X, Z_E, nm_r)
+                g_Z = self._terminal_loss(Z_X, Z_E, nm_r, cond_r)
 
             log_a, clamp_frac = discrete_adjoint(lr_Z, g_Z, lr_X1.repeat(m, 1),
                                                  g_X1.repeat(m, 1),
