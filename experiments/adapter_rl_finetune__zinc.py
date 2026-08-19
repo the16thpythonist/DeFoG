@@ -33,7 +33,7 @@ from pycomex.utils import file_namespace, folder_path
 from experiments.utils import build_encoders, pyg_data_to_mol, mol_to_smiles
 from defog.core import (
     DeFoGModel, AdaLNAdapter, AdapterComposition, ConditionBranch, AdaptedSampler,
-    Sampler, AdapterGDPOTrainer, PropertyHead,
+    Sampler, AdapterGDPOTrainer, AdapterRAMTrainer, AdapterDAMTrainer, PropertyHead,
 )
 from defog.core.data import dense_to_pyg, to_dense
 
@@ -187,6 +187,46 @@ KL_COEF: float = 0.1             # swept per-arm; KL to the pre-RL adapter
 EMA_DECAY: float = 0.9           # was 0.999 -> EMA lagged near-original on short runs; fast EMA tracks the live weights
 GRAD_CLIP: float = 1.0
 LAMBDA_EDGE: float = 1.0
+
+# --- estimator arm (docs/dam_design.md section 9 / D8) ---
+# :param ESTIMATOR: which RL estimator to fine-tune with.
+#     "gdpo" -- advantage-weighted CE at the states the rollout occupied (today).
+#     "ram"  -- the same loss, scored at states redrawn from p_{t|1}(.|G1).
+#     "dam"  -- Discrete Adjoint Matching: fit the RATE to u^base * adjoint.
+ESTIMATOR: str = "gdpo"
+# :param RL_ITERS: pin the loop to exactly this many iterations. 0 keeps the legacy
+#     wall-clock behaviour. The arms are NOT comparable unless this is set: the loop
+#     is `while it < MAX_ITERS and time.time() < deadline`, so a slower estimator
+#     silently takes fewer gradient steps under the same budget -- and PROBE_EVERY
+#     selects the snapshot that ships, so the confound reaches the deployed adapter.
+#     Must be a multiple of PROBE_EVERY, or the last partial block is dropped from
+#     early-stop selection. MAX_TIME_HOURS stays as a backstop; a run that hits it
+#     with RL_ITERS set FAILS rather than reporting a truncated arm.
+RL_ITERS: int = 0
+# :param RENOISE_DRAWS: ram/dam -- noise levels scored per rollout. A LITERAL, not a
+#     mirror of SUBSAMPLE_STEPS. In T_SAMPLER="match" the levels are distinct grid
+#     indices, so the effective count is min(RENOISE_DRAWS, ROLLOUT_STEPS).
+RENOISE_DRAWS: int = 16
+# :param T_SAMPLER: ram/dam -- "match" (the exact grid the GDPO arm scores at),
+#     "train" (the pretraining density, independent per trajectory), "ram"
+#     (t = 1 - sqrt(U), RAM's own recipe), "uniform".
+T_SAMPLER: str = "match"
+# :param DAM_K: dam -- adjoint samples per scored state (DAM Eq. 13).
+DAM_K: int = 12
+# :param DAM_LAMBDA: dam -- the inverse temperature. g = -DAM_LAMBDA * reward, and
+#     DAM has no kl_coef: its problem fixes the KL weight at 1. Default 0.3 rather
+#     than 1.0 because PropertyMatchReward spans [-10, 0]; measured on the tabular
+#     gate, KL to the tilted optimum is 0.0001 at 0.3 against 0.0156 at 1.0.
+DAM_LAMBDA: float = 0.3
+# :param DAM_DEBIAS: dam -- "snis" self-normalises Eq. (11)'s 1/p weight (O(1), the
+#     default); "raw" is Eq. (11) verbatim and needs GRAD_CLIP raised accordingly.
+DAM_DEBIAS: str = "snis"
+# :param BASE_TRAIN_DISTORTION: the distortion the BASE was trained with. DeFoGModel
+#     .load silently defaults this to "identity" when a checkpoint's hparams omit it,
+#     which the shipped zinc_kek base does -- so T_SAMPLER="match" cannot verify
+#     itself. Declare it here; a mismatch warns, it does not raise, because the true
+#     value is not recoverable from such a checkpoint.
+BASE_TRAIN_DISTORTION: str = ""
 # --- connectivity-FIRST reward: connected on-target > connected off-target >
 #     disconnected > invalid. prop term clamped so ANY connected molecule outranks
 #     ANY disconnected one, while property still gets a full gradient among connected. ---
@@ -552,14 +592,43 @@ def experiment(e: Experiment) -> None:
     # (guards against ever again shipping an unchanged adapter as a "result").
     input_state = {k: v.detach().clone() for k, v in adapter.state_dict().items()}
 
-    trainer = AdapterGDPOTrainer(
-        base, adapter, reward, kl_coef=e.KL_COEF, lr=e.LR, ema_decay=e.EMA_DECAY,
+    # Declared base training distortion. DeFoGModel.load defaults the hparam to
+    # "identity" when a checkpoint omits it, so T_SAMPLER="match" cannot self-verify.
+    _declared = e.BASE_TRAIN_DISTORTION or getattr(base.time_distorter, "train_distortion", "")
+    if e.ESTIMATOR in ("ram", "dam") and e.T_SAMPLER == "match" and _declared != e.TIME_DISTORTION:
+        e.log(f"WARNING: T_SAMPLER='match' assumes the base was trained with "
+              f"TIME_DISTORTION={e.TIME_DISTORTION!r}, but the base reports "
+              f"{_declared!r}. Set BASE_TRAIN_DISTORTION if you know better.")
+
+    _shared = dict(
+        lr=e.LR, ema_decay=e.EMA_DECAY,
         rollout_size=e.ROLLOUT_SIZE, sample_steps=e.ROLLOUT_STEPS, eta=e.ROLLOUT_ETA,
         omega=e.ROLLOUT_OMEGA, time_distortion=e.TIME_DISTORTION, condition_sampler=cond_sampler,
         subsample_steps=e.SUBSAMPLE_STEPS, minibatch_size=e.MINIBATCH, lambda_edge=e.LAMBDA_EDGE,
         crn=e.CRN, size_dist=size_dist,
         grad_clip=e.GRAD_CLIP, seed=e.SEED, device=device,
     )
+    if e.ESTIMATOR == "gdpo":
+        trainer = AdapterGDPOTrainer(base, adapter, reward, kl_coef=e.KL_COEF, **_shared)
+    elif e.ESTIMATOR == "ram":
+        trainer = AdapterRAMTrainer(base, adapter, reward, kl_coef=e.KL_COEF,
+                                    renoise_draws=e.RENOISE_DRAWS, t_sampler=e.T_SAMPLER,
+                                    **_shared)
+    elif e.ESTIMATOR == "dam":
+        # No kl_coef: DAM's problem fixes the KL weight at 1 and the anchor is
+        # structural (u^base multiplies the target). DAM_LAMBDA is the temperature.
+        trainer = AdapterDAMTrainer(base, adapter, reward, dam_k=e.DAM_K,
+                                    dam_lambda=e.DAM_LAMBDA, debias=e.DAM_DEBIAS,
+                                    renoise_draws=e.RENOISE_DRAWS, t_sampler=e.T_SAMPLER,
+                                    **_shared)
+    else:
+        raise ValueError(f"ESTIMATOR must be gdpo|ram|dam, got {e.ESTIMATOR!r}")
+    e.log(f"estimator={e.ESTIMATOR}"
+          + (f" (reinforce-adjoint-matching, renoise={e.RENOISE_DRAWS}, t={e.T_SAMPLER})"
+             if e.ESTIMATOR == "ram" else
+             f" (discrete-adjoint-matching, K={e.DAM_K}, lambda={e.DAM_LAMBDA}, "
+             f"renoise={e.RENOISE_DRAWS}, t={e.T_SAMPLER}, debias={e.DAM_DEBIAS})"
+             if e.ESTIMATOR == "dam" else ""))
 
     e.log(f"=== RL fine-tuning: max_time={e.MAX_TIME_HOURS}h rollout(K={e.ROLLOUT_SIZE},G={e.N_GROUPS},"
           f"per={e.ROLLOUT_SIZE // e.N_GROUPS},crn={e.CRN},eta={e.ROLLOUT_ETA},{e.ROLLOUT_STEPS} steps) "
@@ -599,10 +668,16 @@ def experiment(e: Experiment) -> None:
         return (float(np.mean(maes)) if maes else float("inf")), (min(valids) if valids else 0.0)
 
     t0 = time.time()
-    deadline = t0 + e.MAX_TIME_HOURS * 3600
+    deadline = t0 + e.MAX_TIME_HOURS * 3600   # backstop even when RL_ITERS pins the loop
+    if e.RL_ITERS and e.PROBE_EVERY and e.RL_ITERS % e.PROBE_EVERY:
+        raise ValueError(
+            f"RL_ITERS={e.RL_ITERS} is not a multiple of PROBE_EVERY={e.PROBE_EVERY}; "
+            "the last partial block would be silently dropped from early-stop selection."
+        )
+    _max_iters = e.RL_ITERS or e.MAX_ITERS
     history = []
     it = 0
-    while it < e.MAX_ITERS and time.time() < deadline:
+    while it < _max_iters and time.time() < deadline:
         m = trainer.step()
         history.append(m)
         if it % e.LOG_EVERY == 0:
@@ -622,7 +697,16 @@ def experiment(e: Experiment) -> None:
             e.log(f"[probe iter{it}] mae={mae:.3f} valid={valid:.1%} floor={pre_valid_floor:.1%} "
                   f"best={best['mae']:.3f}@{best['iter']} {'*NEW*' if improved else ''}")
         it += 1
-    e.log(f"RL done: {it} iterations in {(time.time()-t0)/60:.1f} min")
+    _wall = time.time() - t0
+    if e.RL_ITERS and it != e.RL_ITERS:
+        raise RuntimeError(
+            f"arm truncated: ran {it} of RL_ITERS={e.RL_ITERS} iterations in "
+            f"{_wall/3600:.2f}h, hitting the MAX_TIME_HOURS={e.MAX_TIME_HOURS} backstop. "
+            "Arms with different iteration counts are not comparable, and PROBE_EVERY "
+            "selects the snapshot that ships -- so this fails rather than reporting. "
+            "Raise MAX_TIME_HOURS and rerun."
+        )
+    e.log(f"RL done: {it} iterations in {_wall/60:.1f} min")
     e.commit_json("rl_history.json", history)
 
     # Deployment weights: the best early-stop snapshot (validity-gated probe minimum),
@@ -649,6 +733,11 @@ def experiment(e: Experiment) -> None:
 
     # -- compare + plot MAE pre vs post --------------------------------------
     summary = {"property": e.PROPERTY, "kl_coef": e.KL_COEF, "iterations": it,
+               "estimator": e.ESTIMATOR, "rl_iters_pinned": e.RL_ITERS,
+               "renoise_draws": e.RENOISE_DRAWS, "t_sampler": e.T_SAMPLER,
+               "dam_k": e.DAM_K, "dam_lambda": e.DAM_LAMBDA,
+               "wall_seconds": round(_wall, 1),
+               "probe_count": (it // e.PROBE_EVERY if e.PROBE_EVERY else 0),
                "reward_source": e.REWARD_SOURCE, "crn": e.CRN, "rollout_eta": e.ROLLOUT_ETA,
                "rollouts_per_group": e.ROLLOUT_SIZE // e.N_GROUPS,
                "early_stop_best_iter": (best["iter"] if e.EARLY_STOP else None),
