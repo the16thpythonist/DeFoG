@@ -104,6 +104,7 @@ from .feynman_kac import FeynmanKacSampler, JointGuidanceSampler, predict_clean
 from .property_head import PropertyHead, LearnedPropertyEnergy, fit_property_head
 from .spectrum import Band, SpectrumEnergy, band_masses
 from .dam import AdapterDAMTrainer
+from .ram import AdapterRAMTrainer
 from .renoise import draw_times, renoise_states
 from .rl import (
     RLTrainerBase,
@@ -221,6 +222,8 @@ __all__ = [
     "GDPOTrainer",
     # Discrete Adjoint Matching (arXiv:2602.07132)
     "AdapterDAMTrainer",
+    # Reinforce Adjoint Matching (arXiv:2605.10759) -- the ablation arm
+    "AdapterRAMTrainer",
     "draw_times",
     "renoise_states",
     "AdapterGDPOTrainer",

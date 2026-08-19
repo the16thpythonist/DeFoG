@@ -423,6 +423,17 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         self.renoise_draws = int(renoise_draws)
         self.t_sampler = t_sampler
         self.debias = debias
+        # `_choose_subsample()` counts from self.subsample_steps, and in "match" mode
+        # that is what decides how many noise levels we get -- so renoise_draws would
+        # be silently ignored there, making the RENOISE_DRAWS sweep in the experiment
+        # plan a no-op in the DEFAULT configuration. Point them at the same knob.
+        # subsample_steps has no other effect in this arm: it only feeds
+        # RolloutSampler's subsample_idx, which record_trace=False ignores.
+        self.subsample_steps = self.renoise_draws
+        # In "match" mode the levels are distinct grid indices, so the effective
+        # count is min(renoise_draws, sample_steps). That binds only on toy fixtures;
+        # production runs at sample_steps=250.
+
         self.ref_adapter = (ref_adapter if ref_adapter is not None
                             else self._frozen_adapter_ref())
 
