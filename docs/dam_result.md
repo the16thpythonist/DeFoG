@@ -116,8 +116,48 @@ Every measurement before this sat in the first corner, because runs used
 `subsample='late'` on the strength of an earlier "no signal below t~0.7" finding --
 which is itself suspect, having been derived from the head's ability to produce varied
 draws and therefore conflating "the endpoint is uncertain" with "the head produces
-garbage". A `subsample='early'` mode was added to probe the other corner; results
-below when available.
+garbage".
+
+### The t-band sweep
+
+`subsample='early'` was added to reach the other corner. Pre-RL base, simulated
+candidates, `n_jumps=2`, `K=8`, `lambda=0.3`, medians over iterations 3-6:
+
+| band | mean t | g_spread | log_a | resid nodes | resid edges | s/it |
+|---|---|---|---|---|---|---|
+| `late` | 0.85 | 0.413 | -0.057 | 2.113 | 1.931 | 161 |
+| `stratified` | 0.66 | 0.442 | -0.134 | 2.387 | 1.264 | 192 |
+| **`early`** | **0.46** | **0.541** | -0.072 | **1.099** | **1.065** | 266 |
+
+Signal does rise as `t` falls -- `g_spread` 0.413 -> 0.442 -> 0.541 -- confirming that
+the earlier "no signal below t~0.7" claim was an artifact of the head surrogate and
+not a property of the model.
+
+The residual is **best at low t**, at 1.099/1.065: the closest to neutral anything has
+reached. It is not monotone in `t` (`stratified` is the worst cell), so an interim
+reading of "more signal, worse update" taken from the first two points was wrong and
+the third point refutes it.
+
+**But it is still above 1, and 1.099 is not distinguishable from 1.0 at this sample
+size** -- 4 iterations per cell, against run-to-run variance that produced 1.615 and
+2.113 for nominally comparable configurations on the same base. The honest statement
+is that in the most favourable configuration tested -- the paper's own candidate
+generation, the base with the best reach, and the `t` band with the most signal -- the
+DAM update is at best **neutral**. It never helps.
+
+That best cell costs 266 s/iteration, against roughly 12 s for the one-shot variant
+and less for GDPO, so the neutral result is also the expensive one.
+
+## Verdict
+
+DAM is implemented faithfully enough to converge to `p_ref * e^-g / Z` on a tabular
+problem where the answer is known, and it does not steer DeFoG. Four candidate causes
+were eliminated by measurement and the fifth -- the reach ceiling of the
+x1-parameterisation, 0.6-0.9 across bands and bases -- is the one left standing: DAM
+computes a per-move instruction that DeFoG, which only controls its guess of the
+finished graph, has no way to express.
+
+No Run A was submitted. On this evidence it should not be.
 
 ## What is worth keeping
 
