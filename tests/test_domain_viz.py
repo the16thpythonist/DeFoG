@@ -143,9 +143,14 @@ def test_generic_generation_metrics_all_valid():
 # --------------------------------------------------------------------------- #
 
 class _FakeTrainer:
-    def __init__(self, sanity_checking, current_epoch):
+    def __init__(self, sanity_checking, current_epoch, is_global_zero=True):
         self.sanity_checking = sanity_checking
         self.current_epoch = current_epoch
+        # 967afc1 made the callbacks DDP-safe by guarding side-effects behind
+        # trainer.is_global_zero. Lightning's real Trainer always has it; this stub
+        # did not, so every test touching on_validation_epoch_end raised
+        # AttributeError instead of exercising the callback.
+        self.is_global_zero = is_global_zero
 
 
 class _FakeModule:
@@ -182,6 +187,19 @@ def test_callback_skips_sanity_check():
     cb.on_validation_epoch_end(_FakeTrainer(sanity_checking=True, current_epoch=0), module)
     assert cb._val_epoch_count == 0  # sanity pass not counted
     assert "title" not in captured
+
+
+def test_callback_renders_only_on_global_zero():
+    """The rank-0 guard added in 967afc1 has to actually skip: under DDP every rank
+    runs the callback, and rendering previews on all of them duplicates the work and
+    races on the output files."""
+    cb, captured = _make_callback()
+    module = _FakeModule([ethanol(), ethanol()])
+    for ep in range(30):
+        cb.on_validation_epoch_end(
+            _FakeTrainer(False, ep, is_global_zero=False), module)
+    assert "title" not in captured, "a non-zero rank rendered a preview"
+    assert cb._val_epoch_count == 0, "a non-zero rank advanced the epoch counter"
 
 
 def test_callback_round_epoch_labeling():
