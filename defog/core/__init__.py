@@ -103,6 +103,8 @@ from .guidance import (
 from .feynman_kac import FeynmanKacSampler, JointGuidanceSampler, predict_clean
 from .property_head import PropertyHead, LearnedPropertyEnergy, fit_property_head
 from .spectrum import Band, SpectrumEnergy, band_masses
+from .dam import AdapterDAMTrainer
+from .renoise import draw_times, renoise_states
 from .rl import (
     RLTrainerBase,
     GDPOTrainer,
@@ -217,6 +219,10 @@ __all__ = [
     # GDPO reinforcement-learning fine-tuning (arXiv:2402.16302)
     "RLTrainerBase",
     "GDPOTrainer",
+    # Discrete Adjoint Matching (arXiv:2602.07132)
+    "AdapterDAMTrainer",
+    "draw_times",
+    "renoise_states",
     "AdapterGDPOTrainer",
     "PropertyMatchReward",
     "HeadPropertyMatchReward",
