@@ -35,6 +35,7 @@ Two properties of that identity, both measured (see tests/test_dam_rate.py):
 See docs/dam_design.md sections 3 and 4.
 """
 
+import math
 from typing import Tuple
 
 import torch
@@ -44,6 +45,9 @@ __all__ = [
     "assert_valid_base_rate",
     "rate_basis",
     "marginal_rate",
+    "estimate_neg_value",
+    "discrete_adjoint",
+    "gkl",
     "REVERSIBLE_RDB",
 ]
 
@@ -186,3 +190,80 @@ def marginal_rate(
         torch.einsum("cbnj,bnc->bnj", BX, pX),
         torch.einsum("cbnmj,bnmc->bnmj", BE, pE),
     )
+
+
+# ===========================================================================
+# The discrete adjoint (DAM Prop 2.4 / Eq. 13) and the matching loss (Eq. 14)
+# ===========================================================================
+# These take PLAIN TENSORS -- no model, no trainer -- so the tabular gate in
+# tests/test_dam_estimator.py exercises the shipped estimator rather than a
+# re-implementation of it. Everything is in log space: the importance ratio is a
+# product over ~740 coordinates at n=38, so computing it directly overflows.
+
+
+def estimate_neg_value(log_ratio: torch.Tensor, g: torch.Tensor,
+                       dim: int = -1) -> torch.Tensor:
+    """Estimate ``-V_t(x) = log E_{p^base_{1|t}(.|x)}[e^{-g}]`` from model samples.
+
+    ``log_ratio[..., k] = log p^base_{1|t}(X1_k|x) - log p^theta_{1|t}(X1_k|x)`` and
+    ``g[..., k] = g(X1_k)``, with ``X1_k ~ p^theta_{1|t}(.|x)``. Importance sampling
+    then gives ``E_{p^base}[e^{-g}] = E_{p^theta}[(p^base/p^theta) e^{-g}]``, i.e. the
+    mean of ``w_k = exp(log_ratio_k - g_k)``.
+
+    THE ``e^{-g}`` IS PART OF THE WEIGHT. Dropping it -- using the bare density ratio
+    -- was measured 363x too large on a tabular problem with this repo's reward
+    tiering, and 517x with ``p^theta = p^base``, where the two forms coincide and the
+    error is invisible. Normalising the weights to sum to one rather than to mean one
+    is off by exactly ``1/K``.
+    """
+    K = log_ratio.shape[dim]
+    return torch.logsumexp(log_ratio - g, dim=dim) - math.log(K)
+
+
+def discrete_adjoint(
+    log_ratio_Z: torch.Tensor,
+    g_Z: torch.Tensor,
+    log_ratio_X1: torch.Tensor,
+    g_X1: torch.Tensor,
+    *,
+    clamp: float = 10.0,
+) -> Tuple[torch.Tensor, float]:
+    """``log a_hat(y, x)`` -- DAM Eq. (13), in log space.
+
+    Two factors, as in the paper:
+
+    * a single sample ``Z ~ p^theta_{1|t}(.|y)`` estimating
+      ``E_{p^base(.|y)}[e^{-g}]`` by plain importance sampling;
+    * ``K`` samples ``X1_k ~ p^theta_{1|t}(.|x)`` estimating ``e^{V_t(x)}`` by
+      self-normalised importance sampling -- the RECIPROCAL of
+      :func:`estimate_neg_value`.
+
+    Returns ``(log_a, clamp_fraction)``.
+
+    ``clamp`` is a saturating envelope, not a health metric. The true adjoint genuinely
+    reaches ``e^{10}`` at low ``t``, so a tighter bound would corrupt the target; and
+    the fraction is 0 by construction whenever ``lambda * reward_span <= clamp``, which
+    is the case at lambda = 1 for ``PropertyMatchReward`` (span [-10, 0]). The metric
+    that actually detects mis-tempering is ``E[a_hat]`` on a ``y = x`` control, where
+    the true adjoint is exactly 1.0; see docs/dam_design.md section 4.1.
+    """
+    log_a = (log_ratio_Z - g_Z) - estimate_neg_value(log_ratio_X1, g_X1)
+    if clamp is None:
+        return log_a, 0.0
+    frac = float((log_a.abs() > clamp).float().mean())
+    return log_a.clamp(-clamp, clamp), frac
+
+
+def gkl(u: torch.Tensor, w: torch.Tensor, *, eps: float = 1e-12) -> torch.Tensor:
+    """Generalized-KL Bregman divergence ``u - w + w log(w/u)`` -- DAM Eq. (14).
+
+    Elementwise; the caller reduces. Its minimiser in ``u`` is ``u = w``, and unlike an
+    l2 norm it respects the nonnegativity that rates must satisfy.
+
+    Because the minimiser matches ``E[w]`` rather than a median or a mode, a
+    heavy-tailed adjoint biases the fitted rate by its MEAN -- which is why the ``y = x``
+    control above is worth logging every run.
+    """
+    u = u.clamp_min(eps)
+    w = w.clamp_min(eps)
+    return u - w + w * (w.log() - u.log())
