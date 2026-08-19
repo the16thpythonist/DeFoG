@@ -401,7 +401,8 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
     def __init__(self, base, adapter, cond_reward, *, ref_adapter=None,
                  dam_k: int = 12, dam_lambda: float = 0.3,
                  adjoint_clamp: float = 10.0, renoise_draws: int = 16,
-                 n_jumps: int = 8,
+                 n_jumps: int = 8, scoring_head=None,
+                 head_scale: float = 1.0, head_clamp: float = 3.0,
                  t_sampler: str = "match", debias: str = "snis",
                  lr: float = 1e-5, weight_decay: float = 1e-5, ema_decay=0.999,
                  **gdpo_kw):
@@ -419,6 +420,20 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
             raise ValueError(f"debias must be 'snis' or 'raw', got {debias!r}")
 
         self.n_jumps = int(n_jumps)
+        # The adjoint's terminal loss. RDKit floors every undecodable graph at the
+        # same value, and 84-98% of the head's one-shot draws are undecodable at the
+        # noise levels we score at -- so g(Z) == g(X1_k) for nearly every sample, the
+        # adjoint collapses to 1, and there is nothing to learn. A scoring head fitted
+        # on those draws grades them instead. It is used ONLY here: the RL reward on
+        # rollout endpoints stays whatever cond_reward is, so the GDPO and RAM arms
+        # are unaffected and stay comparable.
+        self.head_scale, self.head_clamp = float(head_scale), float(head_clamp)
+        self.scoring_head = None
+        if scoring_head is not None:
+            from .property_head import PropertyHead
+            h = (PropertyHead.load(scoring_head, device=self.device)
+                 if isinstance(scoring_head, str) else scoring_head)
+            self.scoring_head = h.to(self.device).eval().requires_grad_(False)
         self.dam_k = int(dam_k)
         self.dam_lambda = float(dam_lambda)
         self.adjoint_clamp = adjoint_clamp
@@ -445,8 +460,19 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                                      puX, puE, self.rollout_weight, self.rollout_mode)
 
     def _terminal_loss(self, X1, E1, nm, cond):
-        """``g = -lambda * reward``, evaluated on the STRIPPED class space the reward
-        classes expect (a no-op for marginal noise)."""
+        """``g = -lambda * reward`` for a candidate clean graph.
+
+        With a scoring head this is ``-|head(G) - target|`` clamped -- the same shape
+        as :class:`PropertyMatchReward` but with no invalid floor and no disconnect
+        tier, because grading those is the entire reason the head exists. Without one
+        it falls back to ``cond_reward`` on the stripped class space.
+        """
+        if self.scoring_head is not None:
+            with torch.no_grad():
+                pred = self.scoring_head.predict(X1, E1, nm).reshape(-1)
+            tgt = cond.reshape(pred.shape[0], -1)[:, 0].to(pred.device)
+            r = -((pred - tgt).abs() / self.head_scale).clamp(max=self.head_clamp)
+            return -self.dam_lambda * r
         Xr, Er, _ = self.base.limit_dist.ignore_virtual_classes(X1.clone(), E1.clone())
         r = self.cond_reward(Xr, Er, nm, cond).to(self.device).float().reshape(-1)
         return -self.dam_lambda * r
@@ -494,7 +520,8 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         self.opt.zero_grad()
         n_states = max(1, len(states))
         tot, log_a_sum, clamp_sum = 0.0, 0.0, 0.0
-        resid_sum = {"resid_ratio": 0.0, "resid_nodes": 0.0, "resid_edges": 0.0}
+        resid_sum = {"resid_ratio": 0.0, "resid_nodes": 0.0, "resid_edges": 0.0,
+                     "g_spread": 0.0}
         resid_n = {k: 0 for k in resid_sum}
         for (X_t, E_t, t) in states:
             loss, d = self._state_loss(X_t, E_t, t, nm, cond)
@@ -514,6 +541,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
             adapter.train()
         out = {"loss": tot, "kl": 0.0, "grad_norm": float(gnorm),
                "log_adjoint": log_a_sum, "adjoint_clamp_frac": clamp_sum}
+        out["g_spread"] = resid_sum["g_spread"] / max(resid_n["g_spread"], 1)
         out["resid_gkl_ratio"] = resid_sum["resid_ratio"] / max(resid_n["resid_ratio"], 1)
         out["resid_gkl_nodes"] = resid_sum["resid_nodes"] / max(resid_n["resid_nodes"], 1)
         out["resid_gkl_edges"] = resid_sum["resid_edges"] / max(resid_n["resid_edges"], 1)
@@ -542,6 +570,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                 gs.append(self._terminal_loss(X1, E1, nm, cond))
             lr_X1 = torch.stack(lrs, -1)
             g_X1 = torch.stack(gs, -1)
+            g_spread = float(g_X1.std(dim=-1).mean())   # 0 => the adjoint is blind
 
             # --- m jump targets, evaluated in ONE batched forward -----------------
             # Eq. (11) is a single-sample estimate of Eq. (14)'s sum over ~n*dx +
@@ -601,6 +630,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         # single pooled number hides the only thing worth watching.
         return loss, {"log_a": float(log_a.mean()),
                       "clamp_frac": float(clamp_frac),
+                      "g_spread": g_spread,
                       "resid_ratio": resid,
                       "resid_nodes": _ratio(is_node),
                       "resid_edges": _ratio(~is_node)}

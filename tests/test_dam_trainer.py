@@ -169,3 +169,67 @@ def test_both_debias_modes_run_and_stay_finite(base_model, adapter, debias):
     tr = _trainer(base_model, adapter, debias=debias)
     m = tr.step()
     assert all(v == v for v in m.values()), f"non-finite metric under debias={debias}"
+
+
+# ================================================================ scoring head
+def _scoring_head(base_model):
+    """A randomly-initialised head. Its predictions are meaningless but CONTINUOUS,
+    which is the only property these tests depend on."""
+    from defog.core.property_head import PropertyHead
+    torch.manual_seed(SEED + 7)
+    return PropertyHead(base_model.limit_dist.num_node_classes,
+                        base_model.limit_dist.num_edge_classes,
+                        hid=32, layers=2, prop_mean=0.0, prop_std=1.0)
+
+
+def flooring_reward(X1, E1, node_mask, cond):
+    """Stands in for PropertyMatchReward on the draws it cannot decode: one flat
+    floor for everything, which is exactly the degeneracy the head exists to fix."""
+    return torch.full((X1.shape[0],), -10.0)
+
+
+def test_scoring_head_grades_what_a_flooring_reward_cannot(base_model, adapter):
+    """The mechanism, isolated. With a reward that floors every draw, the spread of g
+    across the K adjoint samples is exactly 0 -- so g(Z) == g(X1_k), the adjoint is 1,
+    and there is nothing to learn. With a head it must be positive."""
+    floored = _trainer(base_model, adapter, reward=flooring_reward)
+    m_floor = floored.step()
+    assert m_floor["g_spread"] == 0.0, \
+        f"a flooring reward should give zero spread, got {m_floor['g_spread']}"
+    assert abs(m_floor["log_adjoint"]) < 1e-6, "adjoint should collapse to 1"
+
+    headed = _trainer(base_model, _scoring_head_adapter(base_model),
+                      reward=flooring_reward, scoring_head=_scoring_head(base_model))
+    m_head = headed.step()
+    assert m_head["g_spread"] > 0.0, \
+        "the scoring head did not grade the draws the reward floors"
+
+
+def _scoring_head_adapter(base_model):
+    torch.manual_seed(SEED + 1)
+    from defog.core.adapter import AdaLNAdapter
+    a = AdaLNAdapter.for_base(base_model, cond_dim=2, time_conditioned=True)
+    with torch.no_grad():
+        for p in a.parameters():
+            p.add_(0.2 * torch.randn_like(p))
+    return a
+
+
+def test_scoring_head_leaves_the_rollout_reward_alone(base_model, adapter):
+    """The scope guarantee that keeps GDPO and RAM comparable: the head is used for
+    g(Z) and g(X1_k) INSIDE the adjoint, never for the reward on rollout endpoints."""
+    tr = _trainer(base_model, adapter, reward=edge_reward,
+                  scoring_head=_scoring_head(base_model))
+    buf = tr.rollout()
+    expected = edge_reward(*tr.base.limit_dist.ignore_virtual_classes(
+        buf.X1.clone(), buf.E1.clone())[:2], buf.node_mask, buf.y)
+    assert torch.allclose(buf.reward.cpu(), expected.cpu().float(), atol=1e-5), \
+        "the rollout reward is no longer cond_reward -- the arms are not comparable"
+
+
+def test_scoring_head_is_frozen_and_takes_no_gradient(base_model, adapter):
+    head = _scoring_head(base_model)
+    tr = _trainer(base_model, adapter, scoring_head=head)
+    tr.step()
+    assert all(not p.requires_grad for p in tr.scoring_head.parameters())
+    assert all(p.grad is None for p in tr.scoring_head.parameters())
