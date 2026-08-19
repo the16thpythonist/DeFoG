@@ -1,0 +1,1032 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reward fine-tuning as stochastic optimal control — a visual explanation</title>
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {
+    delimiters: [
+      {left: '$$', right: '$$', display: true},
+      {left: '$',  right: '$',  display: false}
+    ],
+    throwOnError: false
+  });"></script>
+
+<style>
+  :root {
+    --bg:               #fbfaf7;
+    --surface:          #ffffff;
+    --text:             #1a1a1a;
+    --text-secondary:   #4a4a4a;
+    --text-tertiary:    #8a8a8a;
+    --border:           #d4d2cd;
+    --accent-bg:        #f3f1ec;
+    --teal:             #2d8f8a;
+    --teal-bg:          #d4ebe9;
+    --coral:            #d77068;
+    --coral-bg:         #f5dbd8;
+    --gray:             #9a9a9a;
+    --gray-bg:          #e8e7e3;
+    --link:             #2d6f8a;
+    --gold:             #b08430;
+    --gold-bg:          #f2e6c9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:             #1a1a18;
+      --surface:        #25241f;
+      --text:           #ecebe2;
+      --text-secondary: #b0aea6;
+      --text-tertiary:  #8a8a82;
+      --border:         rgba(255,255,255,0.14);
+      --accent-bg:      #2a2925;
+      --teal:           #5dcaa5;
+      --teal-bg:        #1f4a42;
+      --coral:          #f0997b;
+      --coral-bg:       #4a2a22;
+      --gray:           #888780;
+      --gray-bg:        #36352f;
+      --link:           #7fb0d0;
+      --gold:           #d9b45f;
+      --gold-bg:        #40381f;
+    }
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    max-width: 820px;
+    margin: 40px auto 96px;
+    padding: 0 24px;
+    line-height: 1.65;
+    font-size: 16px;
+  }
+  h1 { font-size: 30px; font-weight: 600; margin-bottom: 8px; line-height: 1.25; }
+  h2 { font-size: 21px; font-weight: 600; margin-top: 48px; margin-bottom: 8px;
+       padding-top: 14px; border-top: 1px solid var(--border); }
+  h3 { font-size: 17px; font-weight: 600; margin-top: 28px; margin-bottom: 6px; }
+  h4 { font-size: 15px; font-weight: 600; margin-top: 20px; margin-bottom: 4px; color: var(--text); }
+  p  { margin: 12px 0; color: var(--text-secondary); }
+  .lede { font-size: 17.5px; color: var(--text); }
+  .kicker { font-size: 12px; letter-spacing: 0.09em; text-transform: uppercase;
+            color: var(--text-tertiary); font-weight: 600; margin-bottom: 4px; }
+  a { color: var(--link); text-decoration: underline; text-decoration-thickness: 0.5px; text-underline-offset: 2px; }
+  a:hover { text-decoration-thickness: 1.5px; }
+  ul, ol { color: var(--text-secondary); padding-left: 22px; }
+  li { margin: 7px 0; }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    background: var(--accent-bg);
+    padding: 2px 5px;
+    border-radius: 3px;
+    font-size: 13.5px;
+  }
+  .viz {
+    margin: 26px 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 16px 12px;
+    overflow-x: auto;
+  }
+  .viz svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+  .caption {
+    font-size: 13px;
+    color: var(--text-tertiary);
+    margin-top: 10px;
+    line-height: 1.5;
+  }
+  .caption b { color: var(--text-secondary); font-weight: 600; }
+  .katex-display { margin: 18px 0; overflow-x: auto; overflow-y: hidden; }
+  .svg-label  { font-family: inherit; font-size: 13px; fill: var(--text); }
+  .svg-axis   { font-family: inherit; font-size: 11px; fill: var(--text-tertiary); }
+  .svg-strong { font-family: inherit; font-size: 13px; font-weight: 600; fill: var(--text); }
+  .svg-small  { font-family: inherit; font-size: 10.5px; fill: var(--text-tertiary); }
+  .svg-mono   { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px; fill: var(--text-secondary); }
+
+  .box {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--teal);
+    background: var(--surface);
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin: 20px 0;
+  }
+  .box.warn  { border-left-color: var(--coral); }
+  .box.note  { border-left-color: var(--gold); }
+  .box p:first-child { margin-top: 0; }
+  .box p:last-child  { margin-bottom: 0; }
+  .box .hd { font-size: 13px; font-weight: 600; letter-spacing: 0.04em;
+             text-transform: uppercase; color: var(--text-tertiary); margin-bottom: 4px; }
+
+  table { border-collapse: collapse; width: 100%; margin: 20px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--text-tertiary); font-weight: 600; font-size: 12px;
+       text-transform: uppercase; letter-spacing: 0.05em; }
+  td { color: var(--text-secondary); }
+  td.yes { color: var(--teal); font-weight: 600; }
+  td.no  { color: var(--coral); font-weight: 600; }
+  .tblwrap { overflow-x: auto; }
+
+  .chip { display: inline-block; font-size: 11.5px; font-weight: 600; padding: 1px 7px;
+          border-radius: 10px; vertical-align: 1px; }
+  .chip.teal  { background: var(--teal-bg);  color: var(--teal); }
+  .chip.coral { background: var(--coral-bg); color: var(--coral); }
+  .chip.gray  { background: var(--gray-bg);  color: var(--text-secondary); }
+  .chip.gold  { background: var(--gold-bg);  color: var(--gold); }
+
+  .algo { background: var(--accent-bg); border: 1px solid var(--border); border-radius: 6px;
+          padding: 14px 18px; margin: 20px 0; font-size: 14.5px; }
+  .algo .hd { font-size: 12px; font-weight: 600; letter-spacing: 0.06em;
+              text-transform: uppercase; color: var(--text-tertiary); margin-bottom: 8px; }
+  .algo ol { margin: 0; color: var(--text-secondary); }
+
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 20px 0; }
+  @media (max-width: 640px) { .two { grid-template-columns: 1fr; } }
+  .card { border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; background: var(--surface); }
+  .card .hd { font-size: 12.5px; font-weight: 600; margin-bottom: 6px; }
+  .card.good .hd { color: var(--teal); }
+  .card.bad  .hd { color: var(--coral); }
+  .card p { font-size: 13.5px; margin: 6px 0; }
+  .drop { color: var(--coral); text-decoration: line-through; text-decoration-thickness: 1px; }
+
+  hr.soft { border: none; border-top: 1px solid var(--border); margin: 34px 0; }
+</style>
+</head>
+<body>
+
+<p class="kicker">Stochastic optimal control · reward fine-tuning · flow and diffusion models</p>
+<h1>Reward fine-tuning as stochastic optimal control</h1>
+<p class="lede">You have a trained image or molecule generator and a reward model. You want the generator to score higher without turning into a reward-hacking machine. There is now a small family of papers that answers this exactly rather than heuristically — and the answer turns out to hinge on a surprising detail: <em>you have to change the noise schedule before you start.</em></p>
+
+<div class="box note">
+  <div class="hd">What this covers</div>
+  <p>Five papers, read end to end, and how they fit together:
+  <a href="https://arxiv.org/abs/2409.08861">Adjoint Matching</a> (Domingo-Enrich, Drozdzal, Karrer &amp; Chen, ICLR 2025) — the load-bearing one;
+  <a href="https://arxiv.org/abs/2402.15194">entropy-regularized control</a> (Uehara et al., 2024) — where the anti-over-optimization argument comes from;
+  <a href="https://arxiv.org/abs/2403.06279">Tang &amp; Zhou</a> and
+  <a href="https://arxiv.org/abs/2412.18164">Han, Razaviyayn &amp; Xu</a> — the rigorous treatments;
+  <a href="https://arxiv.org/abs/2504.11713">Adjoint Sampling</a> (Havens et al., ICML 2025) — scaling it to Boltzmann samplers; and
+  <a href="https://arxiv.org/abs/2604.08580">a 2026 re-derivation</a> from the stochastic maximum principle that says exactly when the trick stops working.</p>
+  <p>Prerequisites: multivariable calculus, basic probability, and the idea that a diffusion model turns noise into data step by step. Stochastic differential equations, control, and value functions are built up from scratch as we go.</p>
+</div>
+
+<h2>1. The target: a tilted distribution</h2>
+
+<p>Start with what we actually want. You have a pre-trained generative model that samples from some distribution $p^{\text{base}}(x)$ — natural images, drug-like molecules, protein sequences. You also have a reward model $r(x)$ that scores samples. The thing you want is <em>not</em> "maximize $r$". Maximizing $r$ alone gives you a single point, the argmax, which is almost always garbage. What you want is the <b>tilted distribution</b>, sometimes called the exponentially-tilted or reward-tilted distribution:</p>
+
+$$ p^*(x) \;\propto\; p^{\text{base}}(x)\,\exp\!\big(r(x)\big) $$
+
+<p>This is exactly the target that RLHF for large language models optimizes, either explicitly or implicitly (<a href="https://arxiv.org/abs/2409.08861">Domingo-Enrich et al.</a>, Eq. 1). It reweights the base model rather than replacing it: regions the base model already likes get boosted in proportion to $e^{r}$, and regions the base model assigns zero probability stay at zero. The strength of the reweighting is a knob. Write $r(x) = \lambda \cdot \text{RewardModel}(x)$ and $\lambda$ controls how far you move; equivalently, other papers write $\exp(r(x)/\alpha)$ with a temperature $\alpha$, so $\lambda = 1/\alpha$. Both notations appear below and they mean the same thing.</p>
+
+<div class="viz">
+  <svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Exponential tilting of a base density by a reward model at four temperatures">
+    <title>Exponential tilting of a base density</title>
+    <desc>A three-mode base density is tilted by a reward function with a spurious peak in a low-density region. As the temperature alpha decreases, probability mass migrates onto the spurious peak: 4.8 percent of mass beyond x=2.2 for the base model, 45.4 percent at alpha=1, 99.2 percent at alpha=0.35, and 100 percent at alpha=0.12.</desc>
+
+    <!-- axes -->
+    <line x1="60" y1="200" x2="640" y2="200" stroke="var(--border)" stroke-width="1"/>
+    <line x1="466" y1="34" x2="466" y2="206" stroke="var(--coral)" stroke-width="1" stroke-dasharray="3 3" opacity="0.6"/>
+    <text class="svg-small" x="470" y="216">x = 2.2</text>
+
+    <!-- reward curve (background) -->
+    <polyline fill="none" stroke="var(--gold)" stroke-width="1.4" stroke-dasharray="5 3" opacity="0.85" points="60.0,199.9 71.6,199.8 83.2,199.7 94.8,199.6 106.4,199.4 118.0,199.1 129.6,198.7 141.2,198.2 152.8,197.5 164.4,196.5 176.0,195.4 187.6,193.9 199.2,192.1 210.8,190.0 222.4,187.5 234.0,184.7 245.6,181.5 257.2,178.1 268.8,174.5 280.4,170.7 292.0,167.0 303.6,163.4 315.2,160.1 326.8,157.2 338.4,154.6 350.0,152.5 361.6,150.7 373.2,149.1 384.8,147.2 396.4,144.7 408.0,141.0 419.6,135.5 431.2,127.8 442.8,117.6 454.4,105.1 466.0,90.6 477.6,75.2 489.2,60.3 500.8,47.5 512.4,38.4 524.0,34.2 535.6,35.7 547.2,43.1 558.8,55.6 570.4,72.1 582.0,91.1 593.6,110.8 605.2,129.7 616.8,146.8 628.4,161.2 640.0,172.9"/>
+    <text class="svg-small" x="524" y="26" text-anchor="middle" fill="var(--gold)">reward model r(x)</text>
+    <text class="svg-small" x="524" y="38" text-anchor="middle" fill="var(--gold)">spurious peak</text>
+
+    <!-- base -->
+    <polyline fill="none" stroke="var(--gray)" stroke-width="2" points="60.0,199.9 71.6,199.7 83.2,199.2 94.8,198.1 106.4,195.7 118.0,191.1 129.6,183.0 141.2,170.2 152.8,151.6 164.4,127.5 176.0,99.8 187.6,72.1 199.2,49.4 210.8,36.1 222.4,35.1 234.0,46.3 245.6,66.4 257.2,90.4 268.8,112.9 280.4,129.4 292.0,137.8 303.6,137.7 315.2,130.7 326.8,119.7 338.4,107.6 350.0,97.7 361.6,92.2 373.2,92.6 384.8,99.0 396.4,110.4 408.0,125.1 419.6,140.9 431.2,156.1 442.8,169.2 454.4,179.4 466.0,186.5 477.6,190.6 489.2,191.7 500.8,190.5 512.4,188.2 524.0,186.4 535.6,186.5 547.2,188.6 558.8,192.0 570.4,195.3 582.0,197.7 593.6,199.0 605.2,199.7 616.8,199.9 628.4,200.0 640.0,200.0"/>
+
+    <!-- alpha = 1.0 -->
+    <polyline fill="none" stroke="var(--teal)" stroke-width="2" opacity="0.9" points="60.0,200.0 71.6,199.9 83.2,199.9 94.8,199.7 106.4,199.2 118.0,198.4 129.6,196.9 141.2,194.5 152.8,190.9 164.4,186.1 176.0,180.2 187.6,173.8 199.2,167.7 210.8,162.9 222.4,160.3 234.0,160.2 245.6,162.5 257.2,166.4 268.8,170.7 280.4,173.9 292.0,174.7 303.6,172.3 315.2,166.5 326.8,158.1 338.4,148.6 350.0,139.9 361.6,133.7 373.2,131.1 384.8,132.1 396.4,135.7 408.0,140.9 419.6,146.4 431.2,151.5 442.8,155.9 454.4,159.5 466.0,161.7 477.6,160.2 489.2,148.7 500.8,118.8 512.4,72.8 524.0,37.2 531.7,36.4 539.5,57.0 547.2,91.4 554.9,128.1 562.7,158.2 570.4,178.4 578.1,190.0 585.9,195.8 593.6,198.4 601.3,199.4 612.9,199.9 628.4,200.0 640.0,200.0"/>
+
+    <!-- alpha = 0.35 -->
+    <polyline fill="none" stroke="var(--coral)" stroke-width="2" opacity="0.9" points="60.0,200.0 200.0,200.0 340.0,199.8 400.3,199.6 431.2,199.4 450.5,198.8 466.0,197.4 477.6,194.3 489.2,185.2 496.9,169.8 504.7,140.3 512.4,96.3 520.1,52.1 527.9,34.0 535.6,56.2 543.3,104.4 551.1,150.7 558.8,180.0 566.5,193.4 574.3,198.2 582.0,199.6 593.6,200.0 640.0,200.0"/>
+
+    <!-- alpha = 0.12 -->
+    <polyline fill="none" stroke="var(--coral)" stroke-width="2.4" stroke-dasharray="4 2" points="60.0,200.0 400.0,200.0 470.0,200.0 485.3,199.9 493.1,199.0 500.8,193.5 508.5,169.3 516.3,108.3 524.0,41.9 527.9,34.5 531.7,51.9 539.5,126.0 547.2,180.0 554.9,197.0 562.7,199.7 574.3,200.0 640.0,200.0"/>
+
+    <!-- legend -->
+    <g transform="translate(64,232)">
+      <line x1="0" y1="0" x2="22" y2="0" stroke="var(--gray)" stroke-width="2"/>
+      <text class="svg-small" x="28" y="4">base model — 4.8% of mass right of the line</text>
+      <line x1="0" y1="17" x2="22" y2="17" stroke="var(--teal)" stroke-width="2"/>
+      <text class="svg-small" x="28" y="21">tilted, α = 1.0 — 45.4%</text>
+      <line x1="0" y1="34" x2="22" y2="34" stroke="var(--coral)" stroke-width="2"/>
+      <text class="svg-small" x="28" y="38">tilted, α = 0.35 — 99.2%</text>
+      <line x1="0" y1="51" x2="22" y2="51" stroke="var(--coral)" stroke-width="2.4" stroke-dasharray="4 2"/>
+      <text class="svg-small" x="28" y="55">tilted, α = 0.12 — 100.0%</text>
+    </g>
+  </svg>
+  <div class="caption"><b>The knob and the cliff.</b> A one-dimensional worked example: a three-mode base density (grey), tilted by $\exp(r(x)/\alpha)$ for a reward model whose global maximum sits on a tiny, low-probability bump at $x \approx 3.4$. Curves are rescaled to equal peak height so you can compare <em>shape</em>; the percentages are true probability mass to the right of the dashed line. At $\alpha = 1$ the tilt is a reweighting. By $\alpha = 0.35$ the base model's two real modes have been abandoned. This is reward hacking in one dimension: the base density is the only thing keeping you inside the region where the reward model was ever trained to be accurate.</div>
+</div>
+
+<p>The temperature is the entire safety mechanism, and everything in this family of papers is downstream of that observation. Two things follow. First, <em>how</em> you enforce the tilt matters — get the mathematics wrong and you converge to a different distribution than the one you designed. Second, the tilt has to be against the base model specifically, not against a uniform prior, because the base model's support is a proxy for "the region where the reward model was fit and is therefore trustworthy."</p>
+
+<h2>2. The generator is a stochastic differential equation</h2>
+
+<p>To fine-tune the sampling process rather than the samples, we need the generative model written as a continuous-time process. Both Flow Matching and denoising diffusion admit a common form, and the unification in <a href="https://arxiv.org/abs/2409.08861">Adjoint Matching</a> §3 is worth walking through, because the memoryless result is a statement about exactly this family.</p>
+
+<h3>The reference flow</h3>
+<p>Fix noise $\bar X_0 \sim \mathcal{N}(0, I)$ and data $\bar X_1$, and interpolate between them:</p>
+$$ \bar X_t = \beta_t \bar X_0 + \alpha_t \bar X_1, \qquad \alpha_0 = \beta_1 = 0,\;\; \alpha_1 = \beta_0 = 1 $$
+<p>The common linear ("rectified flow") choice is $\alpha_t = t$, $\beta_t = 1-t$. The job of a generative model is to build a Markov process $X_t$ starting from pure noise whose <em>time marginals</em> match this reference flow at every $t$ — so that at $t=1$ you have the data distribution. Note the time convention: $t=0$ is noise, $t=1$ is data. Several papers in this family run time the other way; watch for it.</p>
+
+<h3>Two samplers, one SDE</h3>
+<p>Flow Matching in its plainest form is an ODE, $dX_t = v(X_t,t)\,dt$, with no noise at all. Denoising diffusion (in the DDIM parameterization) is an SDE. Writing both in terms of the score function $s(x,t) = \nabla_x \log p_t(x)$ collapses them into one equation:</p>
+
+$$ dX_t = b(X_t,t)\,dt + \sigma(t)\,dB_t, \qquad X_0 \sim \mathcal{N}(0,I) $$
+$$ b(x,t) = \kappa_t\,x + \Big(\tfrac{\sigma(t)^2}{2} + \eta_t\Big) s(x,t), \qquad
+   \kappa_t = \frac{\dot\alpha_t}{\alpha_t}, \qquad
+   \eta_t = \beta_t\Big(\frac{\dot\alpha_t}{\alpha_t}\beta_t - \dot\beta_t\Big) $$
+
+<p>Everything model-specific is now in two scalars, $\kappa_t$ and $\eta_t$, plus a <em>free choice</em> of diffusion coefficient $\sigma(t)$. The freedom is real: the $\sigma(t)^2/2$ term in the drift exactly compensates the added noise, so all choices of $\sigma(t)$ give the same time marginals and therefore the same sample distribution. Flow Matching normally takes $\sigma \equiv 0$; DDIM normally takes something small; DDPM corresponds to one specific choice. Hold on to this: <b>$\sigma(t)$ is free, and different choices produce the same samples.</b> Section 5 is about why that stops being true the moment you fine-tune.</p>
+
+<div class="tblwrap">
+<table>
+  <thead><tr><th>Generative process</th><th>$\kappa_t$</th><th>$\eta_t$</th><th>Diffusion $\sigma(t)$</th><th>$X_1 \perp X_0$?</th></tr></thead>
+  <tbody>
+    <tr><td>Flow Matching</td><td>$\dot\alpha_t/\alpha_t$</td><td>$\beta_t(\tfrac{\dot\alpha_t}{\alpha_t}\beta_t - \dot\beta_t)$</td><td>free, commonly $0$</td><td class="no">No</td></tr>
+    <tr><td><b>Memoryless</b> Flow Matching</td><td>$\dot\alpha_t/\alpha_t$</td><td>$\beta_t(\tfrac{\dot\alpha_t}{\alpha_t}\beta_t - \dot\beta_t)$</td><td>$\sqrt{2\eta_t}$</td><td class="yes">Yes</td></tr>
+    <tr><td>DDIM</td><td>$\dot{\bar\alpha}_t/2\bar\alpha_t$</td><td>$\dot{\bar\alpha}_t/2\bar\alpha_t$</td><td>free, commonly $0$</td><td class="no">No</td></tr>
+    <tr><td>DDPM</td><td>$\dot{\bar\alpha}_t/2\bar\alpha_t$</td><td>$\dot{\bar\alpha}_t/2\bar\alpha_t$</td><td>$\sqrt{2\eta_t}$</td><td class="yes">Yes</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="caption" style="margin-top:-8px">Reproduced from <a href="https://arxiv.org/abs/2409.08861">Adjoint Matching</a>, Table 1. The last column is the punchline of Section 5 and will not make sense yet.</p>
+
+<h2>3. Stochastic optimal control in one section</h2>
+
+<p>Stochastic optimal control (SOC) asks: given a stochastic process I can nudge, how should I nudge it to minimize a cost? The specific instance we need is called the <em>control-affine, quadratic-cost</em> problem:</p>
+
+$$ \min_{u \in \mathcal{U}} \;\; \mathbb{E}\!\left[\int_0^1 \Big(\tfrac{1}{2}\|u(X^u_t,t)\|^2 + f(X^u_t,t)\Big) dt \;+\; g(X^u_1)\right] $$
+$$ \text{subject to}\quad dX^u_t = \big(b(X^u_t,t) + \sigma(t)\,u(X^u_t,t)\big)dt + \sigma(t)\,dB_t, \qquad X^u_0 \sim p_0 $$
+
+<p>Read it piece by piece. $b$ is the <b>base drift</b> — the pre-trained model, fixed. $u$ is the <b>control</b>, a vector field you get to learn, added to the drift and scaled by $\sigma(t)$. The <b>terminal cost</b> $g(X_1)$ is what you actually care about; for reward fine-tuning you set $g = -r$, so minimizing cost means maximizing reward. The <b>running state cost</b> $f$ is zero for our purposes. And the <b>control cost</b> $\tfrac{1}{2}\|u\|^2$ penalizes nudging: the more you steer, the more you pay.</p>
+
+<div class="viz">
+  <svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The stochastic optimal control problem for reward fine-tuning">
+    <title>The SOC problem for reward fine-tuning</title>
+    <desc>A timeline from t=0 (Gaussian noise) to t=1 (samples). A grey base trajectory follows the pre-trained drift b. A teal controlled trajectory follows b plus sigma times u and ends in a high-reward region. Annotations mark the control cost accumulated along the path and the terminal reward.</desc>
+
+    <!-- time axis -->
+    <line x1="90" y1="250" x2="620" y2="250" stroke="var(--border)" stroke-width="1.2"/>
+    <text class="svg-axis" x="90"  y="268" text-anchor="middle">t = 0</text>
+    <text class="svg-axis" x="620" y="268" text-anchor="middle">t = 1</text>
+    <text class="svg-small" x="90"  y="282" text-anchor="middle">noise</text>
+    <text class="svg-small" x="620" y="282" text-anchor="middle">sample</text>
+
+    <!-- noise blob -->
+    <ellipse cx="90" cy="150" rx="17" ry="46" fill="var(--gray-bg)" stroke="var(--border)"/>
+    <text class="svg-small" x="90" y="92" text-anchor="middle">X₀ ~ N(0, I)</text>
+
+    <!-- reward landscape at t=1 -->
+    <path d="M604,200 C612,200 614,120 622,120 C630,120 632,196 640,196" fill="none" stroke="var(--gold)" stroke-width="1.6" opacity="0.8"/>
+    <text class="svg-small" x="655" y="118" fill="var(--gold)">high r</text>
+    <text class="svg-small" x="655" y="200" fill="var(--gold)">low r</text>
+
+    <!-- base trajectory -->
+    <polyline fill="none" stroke="var(--gray)" stroke-width="2" stroke-linejoin="round"
+      points="90,142 130,158 165,138 200,166 240,150 275,178 315,162 355,186 395,172 435,192 475,180 515,196 555,186 600,196"/>
+    <circle cx="600" cy="196" r="4.5" fill="var(--gray)"/>
+    <text class="svg-small" x="352" y="205" fill="var(--gray)">base process:  dX = b dt + σ dB</text>
+
+    <!-- controlled trajectory -->
+    <polyline fill="none" stroke="var(--teal)" stroke-width="2.4" stroke-linejoin="round"
+      points="90,158 130,150 165,160 200,140 240,152 275,132 315,144 355,124 395,136 435,118 475,128 515,116 555,122 600,120"/>
+    <circle cx="600" cy="120" r="4.5" fill="var(--teal)"/>
+    <text class="svg-strong" x="300" y="104" fill="var(--teal)">controlled:  dX = (b + σu) dt + σ dB</text>
+
+    <!-- nudge arrows -->
+    <g stroke="var(--teal)" stroke-width="1.3" opacity="0.75">
+      <line x1="200" y1="163" x2="200" y2="146" marker-end="url(#ar)"/>
+      <line x1="355" y1="183" x2="355" y2="130" marker-end="url(#ar)"/>
+      <line x1="515" y1="193" x2="515" y2="122" marker-end="url(#ar)"/>
+    </g>
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--teal)"/>
+      </marker>
+    </defs>
+    <text class="svg-small" x="378" y="152" fill="var(--teal)">u</text>
+    <text class="svg-small" x="538" y="152" fill="var(--teal)">u</text>
+
+    <!-- cost brackets -->
+    <path d="M120,232 L120,224 L590,224 L590,232" fill="none" stroke="var(--coral)" stroke-width="1.2"/>
+    <text class="svg-small" x="355" y="243" text-anchor="middle" fill="var(--coral)">running control cost  ∫ ½‖u‖² dt   =   KL( controlled ‖ base )</text>
+
+    <line x1="612" y1="120" x2="612" y2="196" stroke="var(--coral)" stroke-width="1.2"/>
+    <text class="svg-small" x="632" y="160" fill="var(--coral)">g(X₁) = −r(X₁)</text>
+  </svg>
+  <div class="caption"><b>The whole optimization in one picture.</b> The base drift $b$ is frozen. You learn a vector field $u$ that pushes trajectories toward high reward at $t=1$. Every push costs $\tfrac12\|u\|^2$, and by Girsanov's theorem that accumulated cost <em>is</em> the KL divergence between the controlled and base path measures — so "pay for steering" and "stay near the pre-trained model" are literally the same constraint.</div>
+</div>
+
+<h3>The value function</h3>
+<p>Define the expected remaining cost from state $x$ at time $t$ under a control $u$ — the <b>cost functional</b>:</p>
+$$ J(u; x,t) := \mathbb{E}_{X \sim p^u}\!\left[\int_t^1 \Big(\tfrac12\|u(X_s,s)\|^2 + f(X_s,s)\Big)ds + g(X_1)\;\Big|\;X_t = x\right] $$
+<p>Minimizing over controls gives the <b>value function</b> $V(x,t) := \min_u J(u;x,t)$. Two classical facts do most of the work in this literature. First, the value function has a closed form as an expectation over the <em>uncontrolled</em> process — this is the path-integral or Feynman–Kac identity:</p>
+$$ V(x,t) = -\log \mathbb{E}_{X\sim p^{\text{base}}}\!\left[\exp\!\Big(-\!\int_t^1 \!f(X_s,s)ds - g(X_1)\Big)\;\Big|\;X_t = x\right] $$
+<p>Second, the optimal control is the (negated, $\sigma$-scaled) gradient of the value function:</p>
+$$ u^*(x,t) = -\sigma(t)^\top \nabla_x V(x,t) $$
+<p>That second identity is the seed of the whole Adjoint Matching algorithm in Section 6: if you can estimate $\nabla_x V$, you can regress your network onto it.</p>
+
+<h3>Why the control cost is a KL divergence</h3>
+<p>Girsanov's theorem says that the likelihood ratio between two SDEs that differ only in drift is an exponential of exactly the quadratic control cost. Conditioned on the same starting point,</p>
+$$ D_{\mathrm{KL}}\!\big(p^u(X|X_0)\,\big\|\,p^{\text{base}}(X|X_0)\big) \;=\; \mathbb{E}_{X^u \sim p^u}\!\left[\int_0^1 \tfrac12\|u(X^u_t,t)\|^2 dt\right] $$
+<p>So the SOC problem can be rewritten as KL-regularized reward maximization — the continuous-time analogue of what RLHF does for language models:</p>
+$$ \max_{u} \;\; \mathbb{E}\Big[\, r(X^u_1) \;-\; D_{\mathrm{KL}}\big(p^u(X|X_0)\,\|\,p^{\text{base}}(X|X_0)\big)\Big] $$
+<p>At this point everything looks solved. It is not.</p>
+
+<h2>4. The trap: initial value function bias</h2>
+
+<p>Here is the part that a reasonable person would skip and thereby get wrong. Solve the KL-regularized problem above and you can write down the optimal <em>path</em> distribution in closed form. Setting $f=0$ and $g=-r$, the optimum over full trajectories is</p>
+$$ p^*(X) = p^{\text{base}}(X)\,\exp\!\big(r(X_1) + V(X_0,0)\big) $$
+<p>and looking only at the two endpoints,</p>
+$$ p^*(X_0, X_1) = p^{\text{base}}(X_0,X_1)\,\exp\!\big(r(X_1) + V(X_0, 0)\big) $$
+
+<p>Compare that with the target from Section 1. We wanted $p^*(X_1) \propto p^{\text{base}}(X_1)e^{r(X_1)}$. What we got has an extra factor $e^{V(X_0,0)}$ — the value function evaluated on the <em>initial noise</em>. Where does it come from? The normalization constant of the conditional optimum is $\exp(-V(X_0,0))$, and it depends on $X_0$. Different noise seeds have different amounts of "reward reachable from here", and the KL-regularized solution re-weights the seeds accordingly.</p>
+
+<p>That factor does not go away when you marginalize out $X_0$, because in general $p^{\text{base}}(X_0, X_1)$ does not factor. The noise and the sample are correlated — in a deterministic sampler, perfectly correlated. So the fine-tuned model converges to <em>something</em>, but not to the tilted distribution you designed.</p>
+
+<div class="viz">
+  <svg viewBox="0 0 700 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Why the noise-sample dependency biases fine-tuning, and how independence removes it">
+    <title>The initial value function bias, and the memoryless fix</title>
+    <desc>Left panel: with a deterministic or low-noise sampler, X0 and X1 are dependent, so the exp(V(X0,0)) factor cannot be integrated out and the terminal distribution is biased. Right panel: with the memoryless noise schedule X0 and X1 are independent, the factor integrates to a constant, and the terminal law is exactly the tilted distribution.</desc>
+
+    <!-- LEFT PANEL -->
+    <rect x="14" y="14" width="330" height="300" rx="8" fill="var(--coral-bg)" opacity="0.35"/>
+    <text class="svg-strong" x="34" y="40" fill="var(--coral)">σ(t) = 0, or any σ you like</text>
+    <text class="svg-small" x="34" y="56">Flow Matching ODE / standard DDIM</text>
+
+    <circle cx="78"  cy="108" r="26" fill="var(--surface)" stroke="var(--coral)" stroke-width="1.6"/>
+    <text class="svg-label" x="78" y="113" text-anchor="middle">X₀</text>
+    <circle cx="278" cy="108" r="26" fill="var(--surface)" stroke="var(--coral)" stroke-width="1.6"/>
+    <text class="svg-label" x="278" y="113" text-anchor="middle">X₁</text>
+
+    <line x1="106" y1="102" x2="250" y2="102" stroke="var(--coral)" stroke-width="2" marker-end="url(#arc)"/>
+    <line x1="250" y1="116" x2="106" y2="116" stroke="var(--coral)" stroke-width="2" marker-end="url(#arc)"/>
+    <defs>
+      <marker id="arc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--coral)"/>
+      </marker>
+    </defs>
+    <text class="svg-small" x="178" y="92"  text-anchor="middle" fill="var(--coral)">invertible</text>
+    <text class="svg-small" x="178" y="135" text-anchor="middle" fill="var(--coral)">the seed determines the sample</text>
+
+    <text class="svg-mono" x="34" y="180">p*(X₀,X₁) = p(X₀,X₁) · e^r(X₁) · e^V(X₀,0)</text>
+    <rect x="222" y="167" width="106" height="18" fill="none" stroke="var(--coral)" stroke-width="1.2" rx="3"/>
+    <text class="svg-small" x="34" y="205" fill="var(--coral)">this factor depends on the seed and</text>
+    <text class="svg-small" x="34" y="219" fill="var(--coral)">will not integrate away</text>
+
+    <line x1="34" y1="236" x2="324" y2="236" stroke="var(--border)"/>
+    <text class="svg-small" x="34" y="258">⇒  terminal law is not  p(X₁)·e^r(X₁)</text>
+    <text class="svg-small" x="34" y="280" fill="var(--coral)">⇒  with σ(t) = 0 exactly, fine-tuning has</text>
+    <text class="svg-small" x="34" y="294" fill="var(--coral)">     no effect at all: X₀ fixes X₁ already.</text>
+
+    <!-- RIGHT PANEL -->
+    <rect x="356" y="14" width="330" height="300" rx="8" fill="var(--teal-bg)" opacity="0.35"/>
+    <text class="svg-strong" x="376" y="40" fill="var(--teal)">σ(t) = √(2η_t) — memoryless</text>
+    <text class="svg-small" x="376" y="56">Memoryless Flow Matching / DDPM</text>
+
+    <circle cx="420" cy="108" r="26" fill="var(--surface)" stroke="var(--teal)" stroke-width="1.6"/>
+    <text class="svg-label" x="420" y="113" text-anchor="middle">X₀</text>
+    <circle cx="620" cy="108" r="26" fill="var(--surface)" stroke="var(--teal)" stroke-width="1.6"/>
+    <text class="svg-label" x="620" y="113" text-anchor="middle">X₁</text>
+    <line x1="450" y1="108" x2="590" y2="108" stroke="var(--teal)" stroke-width="2" stroke-dasharray="3 5" opacity="0.5"/>
+    <text class="svg-strong" x="520" y="102" text-anchor="middle" fill="var(--teal)">⫫</text>
+    <text class="svg-small" x="520" y="135" text-anchor="middle" fill="var(--teal)">huge early noise erases the seed</text>
+
+    <text class="svg-mono" x="376" y="180">p(X₀,X₁) = p(X₀) · p(X₁)</text>
+    <text class="svg-mono" x="376" y="205">∫ p(X₀) e^V(X₀,0) dX₀ = const</text>
+
+    <line x1="376" y1="236" x2="666" y2="236" stroke="var(--border)"/>
+    <text class="svg-small" x="376" y="258" fill="var(--teal)">⇒  terminal law is exactly  p(X₁)·e^r(X₁)</text>
+    <text class="svg-small" x="376" y="280">⇒  and afterwards you may sample with</text>
+    <text class="svg-small" x="376" y="294">     any σ you like, including σ = 0.</text>
+  </svg>
+  <div class="caption"><b>The mechanism, not a metaphor.</b> The bias term $e^{V(X_0,0)}$ is a per-seed reweighting. It cancels if and only if the seed carries no information about the sample. Getting to the right-hand panel is not an approximation or a regularizer — it is an exact algebraic condition on $\sigma(t)$.</div>
+</div>
+
+<div class="box warn">
+  <div class="hd">The sharpest version of the problem</div>
+  <p>Take the noiseless Flow Matching sampler, $\sigma(t) = 0$. Then $X_0$ determines $X_1$ completely, and the "KL-regularized fine-tuning" objective is stationary at $u = 0$: naïve fine-tuning has <em>literally no effect</em>. This is why the standard RLHF recipe, ported directly from language models, does not transfer. Language models have no latent noise variable that determines the output; dynamical generative models do.</p>
+</div>
+
+<p>This bias is not new to Adjoint Matching — <a href="https://arxiv.org/abs/2402.15194">Uehara et al.</a> saw it too, and Section 8 covers their answer. Their fix is to <em>learn</em> the optimal initial distribution $\nu^*(x) \propto e^{v_0^*(x)/\alpha}\nu_{\text{ini}}(x)$, which cancels the bias by tilting the noise as well as the drift. That works, but it costs you an auxiliary model and a second control problem. Adjoint Matching's contribution is to notice that you can instead make the bias vanish for free.</p>
+
+<h2>5. The fix: the memoryless noise schedule</h2>
+
+<p>Call a generative process <b>memoryless</b> if the noise and the sample are independent: $p^{\text{base}}(X_0, X_1) = p^{\text{base}}(X_0)\,p^{\text{base}}(X_1)$. Under that condition, the offending factor integrates out to a constant,</p>
+$$ p^*(X_1) = \int p^{\text{base}}(X_0)p^{\text{base}}(X_1)e^{r(X_1)+V(X_0,0)}\,dX_0 \;\propto\; p^{\text{base}}(X_1)e^{r(X_1)} $$
+<p>and you land exactly on the target. So: which $\sigma(t)$ makes the process memoryless? The answer is essentially unique.</p>
+
+<div class="box">
+  <div class="hd">Proposition 1 (memoryless noise schedules)</div>
+  <p>Within the family $dX_t = b(X_t,t)dt + \sigma(t)dB_t$ with $b$ as in Section 2, the process is memoryless if and only if
+  $\sigma(t)^2 = 2\eta_t + \chi(t)$ where $\chi$ satisfies $\lim_{t'\to 0^+}\alpha_{t'}\exp\big(-\!\int_{t'}^{t}\tfrac{\chi(s)}{2\beta_s^2}ds\big) = 0$ for all $t \in (0,1]$.
+  The canonical choice — <b>the memoryless noise schedule</b> — is $\sigma(t) = \sqrt{2\eta_t}$.</p>
+</div>
+
+<div class="box warn">
+  <div class="hd">Theorem 1 (why it is mandatory, not optional)</div>
+  <p>To fine-tune with the SOC objective and still generate the tilted distribution — while retaining the freedom to sample afterwards with <em>any</em> noise schedule, including $\sigma = 0$ — you <b>must</b> fine-tune with $\sigma(t) = \sqrt{2\eta_t}$. It is the only schedule that preserves the relationship between velocity and score that makes the post-hoc conversion valid.</p>
+</div>
+
+<p>Let us make it concrete. For linear Flow Matching, $\alpha_t = t$ and $\beta_t = 1-t$, so $\dot\alpha_t = 1$, $\dot\beta_t = -1$, and</p>
+$$ \eta_t = (1-t)\left(\frac{1-t}{t} + 1\right) = \frac{1-t}{t}, \qquad\text{hence}\qquad \boxed{\;\sigma(t) = \sqrt{\frac{2(1-t)}{t}}\;} $$
+
+<div class="viz">
+  <svg viewBox="0 0 700 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The memoryless noise schedule sigma of t for linear flow matching">
+    <title>The memoryless noise schedule</title>
+    <desc>Plot of sigma(t) = sqrt(2(1-t)/t) against t from 0 to 1. The curve is unbounded as t approaches 0, passes through sigma = 1.41 at t = 0.5, and falls to 0 at t = 1. Constant schedules sigma = 1.0 and sigma = 0.2 and the flow matching ODE sigma = 0 are shown as flat reference lines.</desc>
+
+    <!-- grid -->
+    <g stroke="var(--border)" stroke-width="0.6" opacity="0.6">
+      <line x1="70" y1="30"  x2="630" y2="30"/>
+      <line x1="70" y1="66"  x2="630" y2="66"/>
+      <line x1="70" y1="102" x2="630" y2="102"/>
+      <line x1="70" y1="138" x2="630" y2="138"/>
+      <line x1="70" y1="174" x2="630" y2="174"/>
+    </g>
+    <line x1="70" y1="210" x2="630" y2="210" stroke="var(--border)" stroke-width="1.2"/>
+    <line x1="70" y1="26"  x2="70"  y2="210" stroke="var(--border)" stroke-width="1.2"/>
+
+    <!-- y ticks -->
+    <g class="svg-axis" text-anchor="end">
+      <text x="62" y="214">0</text><text x="62" y="178">1</text><text x="62" y="142">2</text>
+      <text x="62" y="106">3</text><text x="62" y="70">4</text><text x="62" y="34">5</text>
+    </g>
+    <text class="svg-axis" x="26" y="120" transform="rotate(-90 26 120)" text-anchor="middle">σ(t)</text>
+    <!-- x ticks -->
+    <g class="svg-axis" text-anchor="middle">
+      <text x="70"  y="228">0</text><text x="210" y="228">0.25</text><text x="350" y="228">0.5</text>
+      <text x="490" y="228">0.75</text><text x="630" y="228">1</text>
+    </g>
+    <text class="svg-axis" x="350" y="246" text-anchor="middle">t   (0 = noise,  1 = data)</text>
+
+    <!-- reference lines -->
+    <line x1="70" y1="174"   x2="630" y2="174"   stroke="var(--gray)" stroke-width="1.6" stroke-dasharray="5 4"/>
+    <text class="svg-small" x="636" y="177" fill="var(--gray)">σ = 1.0</text>
+    <line x1="70" y1="202.8" x2="630" y2="202.8" stroke="var(--gray)" stroke-width="1.6" stroke-dasharray="2 3"/>
+    <text class="svg-small" x="636" y="206" fill="var(--gray)">σ = 0.2</text>
+    <text class="svg-small" x="636" y="219" fill="var(--coral)">σ = 0  (ODE)</text>
+
+    <!-- memoryless curve -->
+    <polyline fill="none" stroke="var(--teal)" stroke-width="2.6" points="112.0,31.2 121.0,49.1 129.9,62.9 138.9,74.1 147.8,83.3 156.8,91.1 165.8,97.9 174.7,103.8 183.7,109.1 192.6,113.9 201.6,118.1 210.6,122.1 219.5,125.6 228.5,129.0 237.4,132.0 246.4,134.9 255.4,137.6 264.3,140.2 273.3,142.6 282.2,144.8 291.2,147.0 300.2,149.1 309.1,151.0 318.1,152.9 327.0,154.7 336.0,156.5 345.0,158.2 353.9,159.8 362.9,161.4 371.8,162.9 380.8,164.4 389.8,165.9 398.7,167.3 407.7,168.7 416.6,170.1 425.6,171.4 434.6,172.7 443.5,174.0 452.5,175.3 461.4,176.6 470.4,177.9 479.4,179.1 488.3,180.4 497.3,181.6 506.2,182.9 515.2,184.1 524.2,185.4 533.1,186.7 542.1,188.0 551.0,189.4 560.0,190.8 569.0,192.2 578.1,193.7 586.9,195.3 595.8,197.0 604.8,198.9 613.8,201.2 622.7,204.2 629.4,208.4 630.0,210.0"/>
+    <text class="svg-strong" x="126" y="26" fill="var(--teal)">σ(t) = √(2(1−t)/t) → ∞</text>
+
+    <!-- annotations -->
+    <circle cx="350" cy="159.1" r="3.5" fill="var(--teal)"/>
+    <text class="svg-small" x="358" y="155" fill="var(--teal)">σ(0.5) = 1.41</text>
+    <circle cx="574" cy="193.0" r="3.5" fill="var(--teal)"/>
+    <text class="svg-small" x="500" y="190" text-anchor="end" fill="var(--teal)">σ(0.9) = 0.47</text>
+
+    <path d="M120,60 Q160,44 200,52" fill="none" stroke="var(--text-tertiary)" stroke-width="0.9"/>
+    <text class="svg-small" x="206" y="52">mix hard here — destroy any memory of the seed</text>
+    <path d="M600,178 Q560,166 520,168" fill="none" stroke="var(--text-tertiary)" stroke-width="0.9"/>
+    <text class="svg-small" x="514" y="166" text-anchor="end">go quiet here — do not destroy the sample</text>
+  </svg>
+  <div class="caption"><b>The schedule that erases the seed.</b> Computed from $\sigma(t)=\sqrt{2\eta_t}$ with $\eta_t = (1-t)/t$ for the linear reference flow. The endpoint constraints on $(\alpha_t,\beta_t)$ force $\sigma \to \infty$ at $t=0$ and $\sigma \to 0$ at $t=1$, for every model in this family. Constant-$\sigma$ schedules (grey) do not have this shape, and Adjoint Matching's Figure 2 shows they converge to visibly wrong distributions in 1D.</div>
+</div>
+
+<p>The shape is the argument. Near $t=0$ the process mixes violently, so whatever seed you started from is thermalized away; near $t=1$ the noise vanishes, so the sample is not smeared. That is precisely "independent endpoints, correct marginals".</p>
+
+<div class="box">
+  <div class="hd">The practical upshot</div>
+  <p>Fine-tune with the memoryless schedule. <em>Sample</em> however you like. The theorem guarantees that after fine-tuning you can plug $v^{\text{finetune}}$ or $\epsilon^{\text{finetune}}$ back into the ODE sampler ($\sigma=0$), or DDIM, or anything else, and still be drawing from the tilted distribution. In the DDIM parameterization the memoryless schedule is exactly the continuous-time limit of DDPM sampling — so for diffusion models the fix is "fine-tune in DDPM mode, ship in DDIM mode". The <a href="https://github.com/microsoft/soc-fine-tuning-sd">reference implementation</a> states the rule for practitioners directly: any DDIM schedule with the stochasticity parameter $\eta \ge 1$ is memoryless, and its configs use $\eta = 1$.</p>
+  <p style="font-size:14px"><b>Notation warning.</b> That DDIM $\eta$ (a scalar knob on sampler stochasticity) is a different object from the $\eta_t$ in $\sigma(t)=\sqrt{2\eta_t}$ above. Same letter, unrelated meanings.</p>
+</div>
+
+<p>Finally, you never parameterize $u$ directly. You parameterize the fine-tuned velocity or noise predictor, and read the control off it. For memoryless Flow Matching,</p>
+$$ b(x,t) + \sigma(t)u(x,t) = 2v^{\text{finetune}}(x,t) - \frac{\dot\alpha_t}{\alpha_t}x, \qquad
+   u(x,t) = \sqrt{\tfrac{2}{\eta_t}}\,\big(v^{\text{finetune}}(x,t) - v^{\text{base}}(x,t)\big) $$
+<p>so the control is literally "how far the fine-tuned velocity has moved from the pre-trained one", scaled by the schedule. Initialize $v^{\text{finetune}} = v^{\text{base}}$ and you start at $u = 0$, which is the honest starting point: no steering yet.</p>
+
+<h2>6. From control to regression: Adjoint Matching</h2>
+
+<p>We have a well-posed control problem. Now we have to solve it, in millions of dimensions, with a neural network. There were two established families of methods, each with a fatal flaw, and Adjoint Matching is a hybrid that takes the good half of each.</p>
+
+<h3>Option A — differentiate through the simulation</h3>
+<p>The obvious move: simulate the SDE, evaluate the objective, backpropagate. Two implementations exist. <b>Discrete adjoint</b> ("discretize then differentiate") stores the entire solver graph and backprops through it — correct, but the memory cost scales with the number of sampling steps and typically forces gradient checkpointing. <b>Continuous adjoint</b> ("differentiate then discretize") avoids storing the graph by deriving an ODE for the gradient itself. Define the <b>adjoint state</b>, the gradient of the sampled objective with respect to the intermediate state:</p>
+$$ a(t;X,u) := \nabla_{X_t}\left[\int_t^1\Big(\tfrac12\|u(X_{t'},t')\|^2 + f(X_{t'},t')\Big)dt' + g(X_1)\right] $$
+<p>which satisfies a backward ODE with terminal condition $a(1;X,u) = \nabla g(X_1)$:</p>
+$$ \frac{d}{dt}a(t;X,u) = -\Big[a(t;X,u)^\top \nabla_x\big(b(X_t,t) + \sigma(t)u(X_t,t)\big) + \nabla_x f(X_t,t) + \tfrac12\nabla_x\|u(X_t,t)\|^2\Big] $$
+<p>Both are scalable, and both are gradient descent on a badly non-convex landscape. Multiple groups report they train unstably.</p>
+
+<h3>Option B — regress onto the optimal control</h3>
+<p>Since $u^*=-\sigma^\top\nabla V$, why not just regress? Methods like stochastic optimal control matching build an importance-weighted least-squares objective, $\int\|u - \hat u^*\|^2 dt \times \omega(u,X)$, where $\omega$ corrects for the fact that you are sampling from the current process rather than the optimal one. The landscape is convex and training is stable. But the variance of $\omega$ grows exponentially with dimension. For text-to-image latents this is not a slow method, it is a broken one.</p>
+
+<h3>The synthesis</h3>
+<p>Two observations get you the best of both. First: <em>you do not need to regress onto $u^*$.</em> Regressing onto the gradient of the cost functional under the <em>current</em> control is enough, because $u^*$ is the unique fixed point of $u(x,t) = -\sigma(t)^\top\nabla_x J(u;x,t)$. That kills the importance weights outright. The resulting "basic" objective, with a stop-gradient on the trajectory-generating control,</p>
+$$ \mathcal{L}_{\text{Basic-AM}}(u;X) = \tfrac12\int_0^1\big\|u(X_t,t) + \sigma(t)^\top a(t;X,\bar u)\big\|^2 dt, \qquad X\sim p^{\bar u},\;\bar u = \texttt{stopgrad}(u) $$
+<p>has gradient <em>identical</em> to the continuous adjoint method, and its only critical point is $u^*$. That is a reframing, not yet an algorithm. The second observation is the actual contribution.</p>
+
+<h3>The lean adjoint</h3>
+<p>At the optimum, the least-squares minimizer is the conditional expectation of its target, $u^*(x,t) = \mathbb{E}[-\sigma^\top a(t;X,u^*)\mid X_t = x]$. Multiply both sides by $\nabla_x u^*$ and rearrange, and you get</p>
+$$ \mathbb{E}\Big[\underbrace{u^{*\top}\nabla_x u^* + a^\top\sigma\nabla_x u^*}_{\text{expectation zero at the optimum}}\;\Big|\;X_t=x\Big] = 0 $$
+<p>Those two terms are exactly the $u$-dependent pieces of the adjoint ODE. They contribute nothing in expectation at convergence — but they do contribute variance, and they require a Jacobian of the control network. So delete them. What remains is the <b>lean adjoint state</b> $\tilde a$:</p>
+
+<div class="two">
+  <div class="card bad">
+    <div class="hd">Full adjoint (continuous adjoint method)</div>
+    <p style="font-size:13px">$\frac{d}{dt}a = -\big[a^\top\nabla_x b \;$<span class="drop">$+\; a^\top\sigma\nabla_x u \;+\; \tfrac12\nabla_x\|u\|^2$</span>$\;+\;\nabla_x f\big]$</p>
+    <p style="font-size:13px">$a(1;X,u) = \nabla g(X_1)$</p>
+    <p>Needs the Jacobian of the <em>control network</em> at every backward step. Its expectation equals $\nabla_x J$, so it is the true gradient — including the noise.</p>
+  </div>
+  <div class="card good">
+    <div class="hd">Lean adjoint (Adjoint Matching)</div>
+    <p style="font-size:13px">$\frac{d}{dt}\tilde a = -\big[\tilde a^\top\nabla_x b \;+\; \nabla_x f\big]$</p>
+    <p style="font-size:13px">$\tilde a(1;X) = \nabla g(X_1)$</p>
+    <p>Only the Jacobian of the frozen <em>base drift</em>. Cheaper per step, and lower variance at convergence. No longer equal to $\nabla_x J$ except at the optimum — which is fine, because the optimum is all we want.</p>
+  </div>
+</div>
+
+<p>Plug the lean adjoint into the least-squares objective and you have the method:</p>
+$$ \mathcal{L}_{\text{Adj-Match}}(u;X) = \tfrac12\int_0^1 \big\|u(X_t,t) + \sigma(t)^\top\tilde a(t;X)\big\|^2 dt,\qquad X\sim p^{\bar u},\;\bar u=\texttt{stopgrad}(u) $$
+<p>Its unique critical point is still the optimal control. Note what this is not: it is not a fixed regression target. $\tilde a$ depends on the trajectories, which depend on the current control, so the target moves as training proceeds. It is a consistency loss — you are solving for a fixed point, not fitting a dataset.</p>
+
+<div class="viz">
+  <svg viewBox="0 0 700 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Comparison of three ways to optimize the control: discrete adjoint, continuous adjoint, and adjoint matching">
+    <title>Three ways to optimize the control</title>
+    <desc>Three columns. Discrete adjoint stores the full solver graph and backpropagates through it. Continuous adjoint integrates a backward adjoint ODE requiring Jacobians of both the base drift and the control network. Adjoint Matching integrates a lean adjoint ODE requiring only the base drift Jacobian, then performs an ordinary least-squares regression per timestep.</desc>
+
+    <g class="svg-strong" text-anchor="middle">
+      <text x="120" y="24">Discrete adjoint</text>
+      <text x="350" y="24">Continuous adjoint</text>
+      <text x="580" y="24" fill="var(--teal)">Adjoint Matching</text>
+    </g>
+
+    <!-- forward row -->
+    <text class="svg-small" x="14" y="60">forward</text>
+    <g fill="var(--gray-bg)" stroke="var(--border)">
+      <rect x="42"  y="46" width="30" height="22" rx="3"/><rect x="80"  y="46" width="30" height="22" rx="3"/><rect x="118" y="46" width="30" height="22" rx="3"/><rect x="156" y="46" width="30" height="22" rx="3"/>
+      <rect x="272" y="46" width="30" height="22" rx="3"/><rect x="310" y="46" width="30" height="22" rx="3"/><rect x="348" y="46" width="30" height="22" rx="3"/><rect x="386" y="46" width="30" height="22" rx="3"/>
+      <rect x="502" y="46" width="30" height="22" rx="3"/><rect x="540" y="46" width="30" height="22" rx="3"/><rect x="578" y="46" width="30" height="22" rx="3"/><rect x="616" y="46" width="30" height="22" rx="3"/>
+    </g>
+    <g class="svg-small" text-anchor="middle">
+      <text x="114" y="86">simulate SDE, keep whole graph</text>
+      <text x="344" y="86">simulate SDE, no graph</text>
+      <text x="574" y="86">simulate SDE, no graph</text>
+    </g>
+    <rect x="38" y="42" width="152" height="30" fill="none" stroke="var(--coral)" stroke-width="1.4" stroke-dasharray="3 2" rx="4"/>
+    <text class="svg-small" x="114" y="100" text-anchor="middle" fill="var(--coral)">memory ∝ #steps</text>
+
+    <!-- backward row -->
+    <text class="svg-small" x="14" y="140">backward</text>
+    <g>
+      <path d="M186,130 L46,130" stroke="var(--coral)" stroke-width="2" marker-end="url(#arb)"/>
+      <path d="M416,130 L276,130" stroke="var(--coral)" stroke-width="2" marker-end="url(#arb)"/>
+      <path d="M646,130 L506,130" stroke="var(--teal)"  stroke-width="2" marker-end="url(#art)"/>
+    </g>
+    <defs>
+      <marker id="arb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--coral)"/></marker>
+      <marker id="art" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--teal)"/></marker>
+    </defs>
+    <g class="svg-small" text-anchor="middle">
+      <text x="114" y="152">autodiff through the solver</text>
+      <text x="344" y="152">adjoint ODE for a(t)</text>
+      <text x="574" y="152" fill="var(--teal)">lean adjoint ODE for ã(t)</text>
+      <text x="344" y="168" fill="var(--coral)">needs ∇b  and  ∇u</text>
+      <text x="574" y="168" fill="var(--teal)">needs ∇b  only</text>
+    </g>
+
+    <!-- update row -->
+    <line x1="14" y1="196" x2="686" y2="196" stroke="var(--border)"/>
+    <text class="svg-small" x="14" y="220">update</text>
+    <g class="svg-small" text-anchor="middle">
+      <text x="114" y="222">gradient step on L(u;X)</text>
+      <text x="344" y="222">gradient step on L(u;X)</text>
+    </g>
+    <rect x="470" y="206" width="212" height="66" rx="5" fill="var(--teal-bg)" stroke="var(--teal)" stroke-width="1.2" opacity="0.9"/>
+    <text class="svg-label" x="576" y="228" text-anchor="middle" fill="var(--teal)">least-squares regression</text>
+    <text class="svg-mono"  x="576" y="248" text-anchor="middle">u(Xt,t)  ←  −σ(t) ã(t)</text>
+    <text class="svg-small" x="576" y="264" text-anchor="middle">one target per timestep, per trajectory</text>
+
+    <!-- verdict -->
+    <g class="svg-small" text-anchor="middle">
+      <text x="114" y="300" fill="var(--coral)">stable-ish, memory hungry</text>
+      <text x="344" y="300" fill="var(--coral)">memory-light, reported unstable</text>
+      <text x="574" y="300" fill="var(--teal)">memory-light, convex-looking loss,</text>
+      <text x="574" y="314" fill="var(--teal)">lower variance at convergence</text>
+    </g>
+  </svg>
+  <div class="caption"><b>What actually changes.</b> All three simulate the same forward SDE. The difference is what happens on the way back: storing a graph, integrating a full adjoint that touches the control network's Jacobian, or integrating a lean adjoint that touches only the frozen base drift and then doing a plain regression. Adjoint Matching keeps the memory profile of the continuous adjoint and the loss shape of a matching objective.</div>
+</div>
+
+<div class="algo">
+  <div class="hd">Algorithm — Adjoint Matching for Flow Matching models</div>
+  <ol>
+    <li>Initialize $v^{\text{finetune}} \leftarrow v^{\text{base}}$ (so the initial control is zero).</li>
+    <li>Sample $m$ trajectories with the <b>memoryless</b> schedule: $X_{t+h} = X_t + h\big(2v^{\text{finetune}}_\theta(X_t,t) - \tfrac{\dot\alpha_t}{\alpha_t}X_t\big) + \sqrt{h}\,\sigma(t)\varepsilon_t$, with $\sigma(t) = \sqrt{2\eta_t}$, $X_0\sim\mathcal{N}(0,I)$. No gradients.</li>
+    <li>For each trajectory, integrate the lean adjoint <em>backwards</em> from $\tilde a_1 = -\nabla_{X_1} r(X_1)$: $\;\tilde a_{t-h} = \tilde a_t + h\,\tilde a_t^\top\nabla_{X_t}\big(2v^{\text{base}}(X_t,t) - \tfrac{\dot\alpha_t}{\alpha_t}X_t\big)$. No gradients.</li>
+    <li>Regress: $\;\mathcal{L}(\theta) = \sum_t \big\|\tfrac{\sigma(t)}{2}\big(v^{\text{finetune}}_\theta(X_t,t) - v^{\text{base}}(X_t,t)\big) + \sigma(t)\tilde a_t\big\|^2$, take a gradient step, repeat.</li>
+  </ol>
+  <p style="font-size:13px; color:var(--text-tertiary); margin:8px 0 0">One implementation note from the paper: $\sigma(t)$ must be slightly offset near $t=0$ to avoid dividing by zero — the memoryless schedule is genuinely singular there.</p>
+</div>
+
+<p>The one requirement this inherits is a <b>differentiable reward</b>: the terminal condition is $\nabla r(X_1)$. If your reward is a black box or a simulator you cannot differentiate, this exact recipe does not apply. (Section 12 has a recent development on that.)</p>
+
+<h2>7. Does it work?</h2>
+
+<p>The paper's headline experiment is a latent Flow Matching text-to-image model with ImageReward as the reward model, fine-tuned on 40 000 prompts and evaluated on 1 000 held-out ones. The reward is scaled, $r(x) = \lambda\cdot\text{RewardModel}(x)$, and $\lambda$ is the temperature knob from Section 1. The evaluation deliberately separates three things that reward fine-tuning usually conflates: text-to-image consistency (ClipScore, PickScore), generalization to a human-preference model <em>never seen during fine-tuning</em> (HPSv2), and sample diversity (mean pairwise DreamSim distance).</p>
+
+<div class="viz">
+  <svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Scatter plot of human preference score against sample diversity for eight fine-tuning methods">
+    <title>Preference score versus diversity, text-to-image fine-tuning</title>
+    <desc>Scatter of HPSv2 against DreamSim diversity. The base model sits at high diversity and low preference. DRaFT-1 reaches HPSv2 24.37 but collapses diversity to 27.4. Adjoint Matching at lambda 12500 reaches HPSv2 24.49 at diversity 37.2, dominating DRaFT-1 on both axes, and its three lambda values trace a smooth frontier.</desc>
+
+    <!-- axes -->
+    <line x1="80" y1="250" x2="650" y2="250" stroke="var(--border)" stroke-width="1.2"/>
+    <line x1="80" y1="34"  x2="80"  y2="250" stroke="var(--border)" stroke-width="1.2"/>
+    <g stroke="var(--border)" stroke-width="0.5" opacity="0.5">
+      <line x1="80" y1="225.3" x2="650" y2="225.3"/><line x1="80" y1="175.9" x2="650" y2="175.9"/>
+      <line x1="80" y1="126.5" x2="650" y2="126.5"/><line x1="80" y1="77.1"  x2="650" y2="77.1"/>
+    </g>
+    <g class="svg-axis" text-anchor="end">
+      <text x="72" y="229">18</text><text x="72" y="180">20</text><text x="72" y="130">22</text><text x="72" y="81">24</text>
+    </g>
+    <text class="svg-axis" x="26" y="140" transform="rotate(-90 26 140)" text-anchor="middle">HPSv2  (unseen preference model) →</text>
+    <g class="svg-axis" text-anchor="middle">
+      <text x="95.6" y="268">25</text><text x="173.3" y="268">30</text><text x="251.1" y="268">35</text><text x="328.9" y="268">40</text>
+      <text x="406.7" y="268">45</text><text x="484.4" y="268">50</text><text x="562.2" y="268">55</text><text x="640" y="268">60</text>
+    </g>
+    <text class="svg-axis" x="365" y="288" text-anchor="middle">DreamSim diversity →</text>
+
+    <!-- AM frontier -->
+    <polyline fill="none" stroke="var(--teal)" stroke-width="1.6" stroke-dasharray="4 3" points="377.1,94.6 327.0,74.1 286.0,65.0"/>
+
+    <!-- baselines -->
+    <g fill="var(--gray)">
+      <circle cx="586.0" cy="228.0" r="5.5"/>
+      <circle cx="548.4" cy="242.6" r="5.5"/>
+      <circle cx="215.2" cy="100.3" r="5.5"/>
+      <circle cx="274.9" cy="75.6"  r="5.5"/>
+      <circle cx="536.7" cy="182.6" r="5.5"/>
+      <circle cx="459.7" cy="142.8" r="5.5"/>
+    </g>
+    <g class="svg-small" fill="var(--text-secondary)">
+      <text x="596" y="232">base model</text>
+      <text x="558" y="247">DPO</text>
+      <text x="207" y="104" text-anchor="end">ReFL</text>
+      <text x="267" y="66"  text-anchor="end">DRaFT-40</text>
+      <text x="529" y="186" text-anchor="end">discrete adjoint</text>
+      <text x="452" y="146" text-anchor="end">continuous adjoint</text>
+    </g>
+
+    <!-- DRaFT-1 highlighted -->
+    <circle cx="132.7" cy="67.9" r="6" fill="var(--coral)"/>
+    <text class="svg-small" x="142" y="60" fill="var(--coral)">DRaFT-1 — best baseline</text>
+    <text class="svg-small" x="142" y="73" fill="var(--coral)">diversity 27.4</text>
+
+    <!-- AM points -->
+    <g fill="var(--teal)">
+      <circle cx="377.1" cy="94.6" r="6"/><circle cx="327.0" cy="74.1" r="6"/><circle cx="286.0" cy="65.0" r="7"/>
+    </g>
+    <g class="svg-small" fill="var(--teal)">
+      <text x="386" y="98">AM, λ = 1 000</text>
+      <text x="336" y="78">AM, λ = 2 500</text>
+      <text x="296" y="56">AM, λ = 12 500</text>
+    </g>
+
+    <!-- dominance arrow -->
+    <path d="M280,68 L140,68" stroke="var(--teal)" stroke-width="1.2" stroke-dasharray="2 2"/>
+    <text class="svg-small" x="210" y="88" text-anchor="middle" fill="var(--teal)">same preference score, 36% more diversity</text>
+
+    <text class="svg-small" x="640" y="46" text-anchor="end">↑ better</text>
+    <text class="svg-small" x="640" y="59" text-anchor="end">→ more diverse</text>
+  </svg>
+  <div class="caption"><b>The trade-off curve, from <a href="https://arxiv.org/abs/2409.08861">Adjoint Matching</a> Table 2</b> (rows sampled with $\sigma=0$; all methods fine-tuned with the memoryless schedule). The best baseline, DRaFT-1, buys its preference score by collapsing diversity from 56.5 to 27.4. Adjoint Matching at $\lambda=12\,500$ scores <em>higher</em> on the unseen preference model (24.49 vs 24.37) at 37.2 diversity — it dominates on both axes. And the three $\lambda$ values trace a smooth frontier, which is the real claim: $\lambda$ is a principled dial, whereas the baselines' only dial is when to stop training.</div>
+</div>
+
+<p>That last point deserves emphasis, because it is easy to miss underneath the benchmark numbers. Reward-gradient baselines like DRaFT and ReFL have no term in their objective that pulls toward the base model; they rely on early stopping to avoid collapse. Early stopping is a hyperparameter with no meaning — it is "how much damage have we done so far". The KL-regularized formulation replaces it with $\lambda$, which names a specific target distribution. You can reason about $\lambda$; you cannot reason about iteration 3 700.</p>
+
+<h2>8. The other branch: entropy regularization and reward over-optimization</h2>
+
+<p>Adjoint Matching arrives at KL-regularized control from the "how do I get the tilted distribution exactly" direction. <a href="https://arxiv.org/abs/2402.15194">Uehara, Zhao, Black, Hajiramezanali, Scalia, Diamant, Tseng, Biancalani and Levine</a> arrive at the same objective from the opposite direction: <em>why does naïve reward maximization produce garbage?</em> Their paper (arXiv preprint, February 2024) predates Adjoint Matching and is where the anti-over-optimization argument is made most carefully.</p>
+
+<p>Their framing is worth stating precisely, because it explains what the KL term is <em>for</em>. The reward $r$ you optimize is a <b>nominal</b> reward — a neural network fit on a finite dataset $\{x^{(i)}, r^\star(x^{(i)})\}$ to approximate a <b>genuine</b> reward $r^\star$ (real human aesthetic judgment, real fluorescence, real binding affinity). Standard learning theory gives you $\mathbb{E}_{x\sim p_{\text{data}}}[(r^\star - r)^2] = O(\sqrt{\text{Cap}(\mathcal{F})/n})$ — small error <em>on the support of the training distribution</em>. It says nothing outside. So a fine-tuning procedure that walks off that support is optimizing a function that has no relationship to what you want. That is not a subtle failure mode: it is adversarial examples, found by gradient descent, on purpose.</p>
+
+<p>Their optimization problem is the same tilted target with an explicit temperature:</p>
+$$ p_{\text{tar}} = \arg\max_{p} \;\; \mathbb{E}_{x\sim p}[r(x)] - \alpha\,D_{\mathrm{KL}}\big(p\,\|\,p_{\text{data}}\big), \qquad p_{\text{tar}}(x) = \frac{1}{C}\exp\!\big(r(x)/\alpha\big)p_{\text{data}}(x) $$
+<p>and the case analysis on $\alpha$ is the argument in miniature. As $\alpha \to 0$, $p_{\text{tar}}$ collapses to a point mass at $\arg\max_{x:\,p_{\text{data}}(x)>0} r(x)$ — the best point <em>inside the support</em>. But if you set $\alpha = 0$ outright, the solution is $\arg\max_{x\in\mathbb{R}^d} r(x)$, with no support constraint at all. The KL term is not a nicety that improves diversity; it is the only thing distinguishing "the best real image" from "the adversarial example that scores 9.8".</p>
+
+<div class="viz">
+  <svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Nominal versus genuine reward for six fine-tuning methods on the TFBind task">
+    <title>Nominal reward versus genuine reward, TFBind</title>
+    <desc>Grouped bar chart. For each method the left bar is the nominal (learned) reward that was optimized and the right bar is the genuine reward measured by the true oracle. Methods without KL regularization saturate the nominal reward at 1.00 while achieving genuine reward of only 0.76 to 0.78. PPO with KL reaches 0.84 genuine and ELEGANT reaches 0.88 genuine.</desc>
+
+    <!-- gridlines -->
+    <g stroke="var(--border)" stroke-width="0.6" opacity="0.65">
+      <line x1="72" y1="220"   x2="660" y2="220"/>
+      <line x1="72" y1="167"   x2="660" y2="167"/>
+      <line x1="72" y1="113.9" x2="660" y2="113.9"/>
+      <line x1="72" y1="60.9"  x2="660" y2="60.9"/>
+    </g>
+    <g class="svg-axis" text-anchor="end">
+      <text x="66" y="224">0.70</text><text x="66" y="171">0.80</text><text x="66" y="118">0.90</text><text x="66" y="65">1.00</text>
+    </g>
+    <line x1="72" y1="220" x2="660" y2="220" stroke="var(--border)" stroke-width="1.2"/>
+
+    <!-- bars -->
+    <g>
+      <rect x="90"  y="60.9"  width="26" height="159.1" fill="var(--coral)" opacity="0.85"/>
+      <rect x="120" y="188.2" width="26" height="31.8"  fill="var(--gray)"/>
+      <rect x="178" y="161.7" width="26" height="58.3"  fill="var(--coral)" opacity="0.85"/>
+      <rect x="208" y="188.2" width="26" height="31.8"  fill="var(--gray)"/>
+      <rect x="266" y="60.9"  width="26" height="159.1" fill="var(--coral)" opacity="0.85"/>
+      <rect x="296" y="182.9" width="26" height="37.1"  fill="var(--gray)"/>
+      <rect x="354" y="60.9"  width="26" height="159.1" fill="var(--coral)" opacity="0.85"/>
+      <rect x="384" y="177.6" width="26" height="42.4"  fill="var(--gray)"/>
+      <rect x="442" y="67.8"  width="26" height="152.2" fill="var(--teal)" opacity="0.55"/>
+      <rect x="472" y="145.8" width="26" height="74.2"  fill="var(--gray)"/>
+      <rect x="530" y="66.7"  width="26" height="153.3" fill="var(--teal)"/>
+      <rect x="560" y="124.5" width="26" height="95.5"  fill="var(--gray)"/>
+    </g>
+
+    <!-- gap brackets -->
+    <g stroke="var(--coral)" stroke-width="1.1">
+      <line x1="133" y1="66"  x2="133" y2="186"/>
+      <line x1="309" y1="66"  x2="309" y2="181"/>
+      <line x1="397" y1="66"  x2="397" y2="176"/>
+    </g>
+    <text class="svg-small" x="137" y="128" fill="var(--coral)">−0.24</text>
+    <text class="svg-small" x="313" y="128" fill="var(--coral)">−0.23</text>
+    <text class="svg-small" x="401" y="128" fill="var(--coral)">−0.22</text>
+    <g stroke="var(--teal)" stroke-width="1.1">
+      <line x1="485" y1="72" x2="485" y2="144"/>
+      <line x1="573" y1="72" x2="573" y2="122"/>
+    </g>
+    <text class="svg-small" x="489" y="112" fill="var(--teal)">−0.15</text>
+    <text class="svg-small" x="577" y="100" fill="var(--teal)">−0.11</text>
+
+    <!-- labels -->
+    <g class="svg-small" text-anchor="middle">
+      <text x="118" y="236">NO KL</text>
+      <text x="206" y="236">Guidance</text>
+      <text x="294" y="236">Random</text>
+      <text x="382" y="236">Truncation</text>
+      <text x="470" y="236">PPO + KL</text>
+      <text x="558" y="236" fill="var(--teal)">ELEGANT</text>
+    </g>
+
+    <!-- legend -->
+    <g transform="translate(90,258)">
+      <rect x="0" y="-9" width="14" height="12" fill="var(--coral)" opacity="0.85"/>
+      <text class="svg-small" x="20" y="1">nominal reward r — the learned proxy you optimize</text>
+      <rect x="330" y="-9" width="14" height="12" fill="var(--gray)"/>
+      <text class="svg-small" x="350" y="1">genuine reward r★ — the true oracle</text>
+    </g>
+    <text class="svg-small" x="90" y="282">The gap between the bars is the over-optimization. Note that three methods hit r = 1.00 exactly — a saturated proxy.</text>
+  </svg>
+  <div class="caption"><b>Reward hacking, measured.</b> From <a href="https://arxiv.org/abs/2402.15194">Uehara et al.</a>, Table 3 — the TFBind DNA-binding task, where the genuine reward $r^\star$ is known but withheld from every algorithm ($\alpha = 0.01$). Fine-tuning without KL regularization saturates the nominal reward at 1.00 while delivering a genuine reward of 0.76 &mdash; tied for the lowest genuine score in the table, and with a measured diversity of exactly 0.0: it emits the same sequence every time. &ldquo;Random&rdquo; and &ldquo;Truncation&rdquo; are the heuristic fixes &mdash; AlignProp- and DRaFT-K-style gradient truncation, which update the drift only on part of the time interval &mdash; and on this task they do not help: 0.77 and 0.78. Entropy-regularized control gets the best genuine reward, 0.88, while <em>not</em> topping the proxy. The bar you can measure is the one that lies to you.</div>
+</div>
+
+<h3>What their solution costs</h3>
+<p>Uehara et al. hit the same initial-value bias described in Section 4 and solve it by optimizing over the initial distribution too. Their control problem has two decision variables, drift $u$ and initial law $\nu$:</p>
+$$ u^*, \nu^* = \arg\max_{u,\nu}\;\mathbb{E}\big[r(x_T)\big] - \frac{\alpha}{2}\mathbb{E}\!\left[\int_0^T\frac{\|u(t,x_t)\|^2}{\sigma^2(t)}dt + \log\frac{\nu(x_0)}{\nu_{\text{ini}}(x_0)}\right] $$
+<p>and the optimal initial law turns out to be $\nu^*(x) \propto \exp(v_0^*(x)/\alpha)\,\nu_{\text{ini}}(x)$ — exactly the tilt-by-the-initial-value-function that Section 4 identified as the bias. Their algorithm, ELEGANT, therefore has three stages: regress a value-function estimate $\hat v_0$ on initial noise; solve a control problem <em>backwards in time</em> from $-T$ to $0$ to build a sampler for $\nu^*$; then solve the main control problem forward with that learned initial distribution.</p>
+
+<p>Two structural results make the framework attractive independent of the algorithm. The optimal marginals are tilted by the value function at every time, $P^*_t(x) = \exp(v_t^*(x)/\alpha)P^{\text{data}}_t(x)/C$, with a normalizing constant that does not depend on $t$. And the <b>bridges are preserved</b>: $P^*_{\cdot|T}(\cdot|x_T) = P^{\text{data}}_{\cdot|T}(\cdot|x_T)$ — conditioned on where you land, the fine-tuned process takes exactly the same paths as the pre-trained one. Only the terminal distribution changes. That is a strong statement about how little damage entropy-regularized fine-tuning does.</p>
+
+<div class="box note">
+  <div class="hd">Where these two papers disagree</div>
+  <p>Not on the objective — both optimize KL-regularized reward and both target $p^{\text{base}}e^{r}$. They disagree on how to kill the initial-value bias. Uehara et al. <em>cancel</em> it by learning a tilted noise distribution: an auxiliary model plus a second SOC problem. Adjoint Matching <em>eliminates</em> it by choosing $\sigma(t)$ so the bias term is constant: no auxiliary model, no second problem, one line of code changed in the sampler. Adjoint Matching's own framing is direct — the prior approach "requires learning a value function, and solving two stochastic optimal control problems". Both are correct. One is cheaper.</p>
+</div>
+
+<h2>9. Making it rigorous</h2>
+
+<p>Two papers take the entropy-regularized formulation and supply the analysis that the applied papers assume.</p>
+
+<h3>Tang &amp; Zhou — well-posedness, and beyond KL</h3>
+<p><a href="https://arxiv.org/abs/2403.06279">Wenpin Tang and Fuzhong Zhou</a> give a self-contained treatment of exactly Uehara et al.'s construction: existence and regularity of the HJB solution, verification that the decoupled two-stage control problem really recovers $p_{\text{ftune}}$, and a quantitative bound on how far the fine-tuned model can drift from the data:</p>
+$$ D_{TV}\big(p_{\text{ftune}}, p_{\text{data}}\big) \;\le\; \underbrace{D_{TV}\big(p_{\text{pre}}, p_{\text{data}}\big)}_{\text{how good the pre-trained model is}} \;+\; \tfrac12\sqrt{\mathbb{E}_{p_{\text{pre}}}\big[e^{2r(Y)/\alpha}\big]} $$
+<p>Read the second term. For a reward bounded by $\bar r$ it is at most $\tfrac12 e^{\bar r/\alpha}$, which diverges as $\alpha \to 0$. That is a formal statement of the picture in Section 1: the guarantee that you stay near the data <em>degrades exponentially</em> in the inverse temperature. Their second contribution is to redo the analysis with a general $f$-divergence regularizer in place of KL. Interestingly, the generalization is not symmetric — because $f$-divergences lack KL's chain rule, the extra structure shows up as a modified reward $r_f$ rather than as a modified path-space penalty.</p>
+
+<h3>Han, Razaviyayn &amp; Xu — a convergence rate</h3>
+<p><a href="https://arxiv.org/abs/2412.18164">Yinbin Han, Meisam Razaviyayn and Renyuan Xu</a> (ICML 2025) argue that since fine-tuning always builds on a pre-trained model shipped in discrete time, the analysis should be discrete-time too. They formulate DDPM's reverse chain as linear dynamics, treat the fine-tuned score as the control, and regularize with a per-step KL that reduces to a clean quadratic:</p>
+$$ D_{\mathrm{KL}}\big(p_{t+1|t}\,\|\,p^{\text{pre}}_{t+1|t}\big) = \frac{(1-\alpha_t)^2}{2\alpha_t\sigma_t^2}\big\|u_t(y_t) - s^{\text{pre}}_t(y_t)\big\|_2^2 $$
+<p>The KL term makes the one-step Bellman problem concave for a suitably chosen regularization coefficient, and from that they get a policy-iteration algorithm (PI-FT) with <b>global convergence at a linear rate</b> — to their knowledge the first convergence guarantee for diffusion fine-tuning. The technically hard part is not the rate but showing that the iterates <em>stay</em> regular: prior analyses assume Lipschitz value functions throughout training; they prove it by a coupled induction. The trade-off they surface is honest and practical: faster convergence requires a larger regularization coefficient $\beta_t$, which pins you closer to the pre-trained model. You cannot have a fast guarantee and a large move.</p>
+
+<h2>10. Scaling it: Adjoint Sampling</h2>
+
+<p><a href="https://arxiv.org/abs/2504.11713">Adjoint Sampling</a> (Havens, Miller, Yan, Domingo-Enrich, Sriram, Wood, Levine, Hu, Amos, Karrer, Fu, Liu and Chen; ICML 2025) changes the problem in a way that makes the machinery dramatically cheaper. Instead of fine-tuning a pre-trained model toward a reward, learn a sampler for a Boltzmann distribution $\mu(x) \propto \exp(-E(x)/\tau)$ given only the energy $E$ — no data at all. This is the same SOC problem with a different terminal cost, $g(x) = \log p_1^{\text{base}}(x) + \tfrac{1}{\tau}E(x)$, and the target path measure is the Schrödinger bridge between a Dirac and $\mu$.</p>
+
+<p>The key structural simplification: take the base process to be pure Brownian motion, $dX_t = \sigma(t)dB_t$, so the base drift is $b \equiv 0$. Then the lean adjoint ODE becomes $\tfrac{d}{dt}\tilde a = 0$ with terminal condition $\nabla g(X_1)$ — so $\tilde a(t;X) = \nabla g(X_1)$ for all $t$, in closed form. <b>The backward pass disappears entirely.</b> The loss collapses to</p>
+$$ \mathcal{L}_{\text{AM}}(u) = \mathbb{E}_{X\sim p^{\bar u}}\int_0^1 \tfrac12\big\|u(X_t,t) + \sigma(t)\nabla g(X_1)\big\|^2 dt $$
+<p>which reads: for every intermediate state on a trajectory, regress the control onto the negative gradient of the terminal cost at that trajectory's endpoint. As the endpoints move toward low energy over training, the targets move with them.</p>
+
+<p>The second trick is what buys the scaling. The loss only depends on pairs $(X_t, X_1)$, not on whole trajectories. At the optimum those pairs are distributed as $p^{\text{base}}_{t|1}(X_t|X_1)\mu(X_1)$ — a known Gaussian bridge times the target. So <em>project</em>: draw $X_1$ from the current model, then draw $X_t$ from the closed-form base posterior rather than from the actual trajectory. This is the <b>Reciprocal Adjoint Matching</b> objective, and it decouples "generate a sample and evaluate its energy" from "take a gradient step".</p>
+
+<div class="viz">
+  <svg viewBox="0 0 700 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The Adjoint Sampling outer and inner loop">
+    <title>Adjoint Sampling: expensive outer loop, cheap inner loop</title>
+    <desc>An outer loop simulates the controlled SDE to produce endpoint samples and evaluates the energy gradient once per sample, storing pairs in a replay buffer. An inner loop repeatedly draws pairs from the buffer, samples an intermediate state from a closed-form Gaussian bridge, and performs a least-squares regression step. Many inner steps run per outer step.</desc>
+
+    <!-- outer loop box -->
+    <rect x="20" y="26" width="290" height="180" rx="8" fill="var(--coral-bg)" opacity="0.4" stroke="var(--coral)" stroke-width="1.2"/>
+    <text class="svg-strong" x="40" y="50" fill="var(--coral)">Outer loop — expensive</text>
+    <text class="svg-small"  x="40" y="76">1.  Simulate the controlled SDE with the</text>
+    <text class="svg-small"  x="40" y="90">     current drift ū to get endpoints X₁</text>
+    <text class="svg-small"  x="40" y="112">2.  Evaluate the energy gradient ∇g(X₁)</text>
+    <text class="svg-small"  x="40" y="126">     — once per sample, never again</text>
+    <text class="svg-small"  x="40" y="148">3.  Push the pairs into the replay buffer</text>
+    <rect x="40" y="164" width="250" height="30" rx="4" fill="var(--surface)" stroke="var(--border)"/>
+    <text class="svg-mono" x="165" y="183" text-anchor="middle">buffer B = { (X₁, ∇g(X₁)) }</text>
+
+    <!-- arrow -->
+    <path d="M318,116 L378,116" stroke="var(--text-tertiary)" stroke-width="1.6" marker-end="url(#arn)"/>
+    <defs><marker id="arn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--text-tertiary)"/></marker></defs>
+
+    <!-- inner loop box -->
+    <rect x="386" y="26" width="294" height="180" rx="8" fill="var(--teal-bg)" opacity="0.4" stroke="var(--teal)" stroke-width="1.2"/>
+    <text class="svg-strong" x="406" y="50" fill="var(--teal)">Inner loop — cheap, run many times</text>
+    <text class="svg-small"  x="406" y="76">a.  Draw (X₁, ∇g) from the buffer</text>
+    <text class="svg-small"  x="406" y="98">b.  Draw Xₜ ~ p_base(Xₜ | X₁)  —  a</text>
+    <text class="svg-small"  x="406" y="112">     closed-form Gaussian, no simulation</text>
+    <text class="svg-small"  x="406" y="134">c.  Regression step:</text>
+    <rect x="406" y="144" width="252" height="30" rx="4" fill="var(--surface)" stroke="var(--teal)"/>
+    <text class="svg-mono" x="532" y="163" text-anchor="middle">u(Xₜ,t)  ←  −σ(t) ∇g(X₁)</text>
+    <path d="M666,116 C690,116 690,196 532,196 L532,182" fill="none" stroke="var(--teal)" stroke-width="1.4" marker-end="url(#art2)"/>
+    <defs><marker id="art2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--teal)"/></marker></defs>
+
+    <text class="svg-small" x="350" y="106" text-anchor="middle">refresh</text>
+    <text class="svg-small" x="350" y="132" text-anchor="middle">rarely</text>
+
+    <text class="svg-small" x="350" y="236" text-anchor="middle">Because the base drift is zero, the lean adjoint is constant: ã(t) = ∇g(X₁). There is no backward sweep anywhere in this diagram.</text>
+  </svg>
+  <div class="caption"><b>Decoupling the expensive part.</b> Adjoint Sampling is described by its authors as the first on-policy method that permits far more gradient updates than energy evaluations. That matters when the "reward" is a neural potential or a physics simulation. For comparison, on the same synthetic benchmarks the closest competitor (iDEM) uses on the order of $10^5$ times more energy evaluations per gradient update, because it estimates the score by Monte Carlo.</div>
+</div>
+
+<p>The framework also absorbs the structure that molecular problems need — graph and Euclidean symmetries, and periodic boundary conditions for torsion-angle representations — and scales to amortized conformer generation across the SPICE dataset, with <a href="https://github.com/facebookresearch/adjoint_sampling">code</a> and <a href="https://huggingface.co/facebook/adjoint_sampling">models</a> released. Note that this branch inherits Adjoint Matching's guarantees without needing a memoryless schedule at all: there is no pre-trained model whose noise–sample dependency could bias anything, because the base process is Brownian motion by construction.</p>
+
+<h2>11. How the family fits together</h2>
+
+<div class="viz">
+  <svg viewBox="0 0 700 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Lineage diagram of the reward fine-tuning as stochastic optimal control literature">
+    <title>Lineage of the SOC reward fine-tuning papers</title>
+    <desc>Two lanes across a time axis. The upper lane holds objective and theory papers: Uehara et al. February 2024, Tang and Zhou March 2024, Han Razaviyayn and Xu December 2024. The lower lane holds algorithms: Adjoint Matching September 2024, Adjoint Sampling April 2025, and the stochastic maximum principle re-derivation in 2026. Arrows show which paper builds on which.</desc>
+
+    <text class="svg-small" x="16" y="30" fill="var(--text-tertiary)">OBJECTIVE &amp; THEORY</text>
+    <text class="svg-small" x="16" y="230" fill="var(--text-tertiary)">ALGORITHMS</text>
+
+    <!-- time ruler -->
+    <line x1="20" y1="176" x2="680" y2="176" stroke="var(--border)" stroke-width="1.2"/>
+    <g class="svg-small" text-anchor="middle" fill="var(--text-tertiary)">
+      <text x="86"  y="192">Feb 2024</text>
+      <text x="240" y="192">Mar 2024</text>
+      <text x="380" y="192">Sep 2024</text>
+      <text x="500" y="192">Dec 2024</text>
+      <text x="600" y="192">2025 – 2026</text>
+    </g>
+    <g fill="var(--border)">
+      <circle cx="86" cy="176" r="3"/><circle cx="240" cy="176" r="3"/><circle cx="380" cy="176" r="3"/>
+      <circle cx="500" cy="176" r="3"/><circle cx="600" cy="176" r="3"/>
+    </g>
+
+    <!-- upper lane boxes -->
+    <rect x="16" y="42" width="150" height="86" rx="6" fill="var(--teal-bg)" stroke="var(--teal)" stroke-width="1.3" opacity="0.95"/>
+    <text class="svg-strong" x="28" y="62">Uehara et al.</text>
+    <text class="svg-small"  x="28" y="78">Entropy-regularized control</text>
+    <text class="svg-small"  x="28" y="94">• KL-to-pretrained = the fix</text>
+    <text class="svg-small"  x="28" y="108">  for reward over-optimization</text>
+    <text class="svg-small"  x="28" y="122">• learns the initial law ν*</text>
+
+    <rect x="180" y="42" width="150" height="86" rx="6" fill="var(--surface)" stroke="var(--border)" stroke-width="1.3"/>
+    <text class="svg-strong" x="192" y="62">Tang &amp; Zhou</text>
+    <text class="svg-small"  x="192" y="78">Rigorous treatment</text>
+    <text class="svg-small"  x="192" y="94">• well-posedness, HJB</text>
+    <text class="svg-small"  x="192" y="108">• TV bound blows up as α→0</text>
+    <text class="svg-small"  x="192" y="122">• general f-divergences</text>
+
+    <rect x="430" y="42" width="180" height="86" rx="6" fill="var(--surface)" stroke="var(--border)" stroke-width="1.3"/>
+    <text class="svg-strong" x="442" y="62">Han, Razaviyayn &amp; Xu</text>
+    <text class="svg-small"  x="442" y="78">Optimality · regularity · convergence</text>
+    <text class="svg-small"  x="442" y="94">• discrete time, DDPM dynamics</text>
+    <text class="svg-small"  x="442" y="108">• PI-FT policy iteration</text>
+    <text class="svg-small"  x="442" y="122">• global linear rate</text>
+
+    <!-- lower lane boxes -->
+    <rect x="240" y="242" width="180" height="86" rx="6" fill="var(--coral-bg)" stroke="var(--coral)" stroke-width="1.6"/>
+    <text class="svg-strong" x="252" y="262" fill="var(--coral)">Adjoint Matching</text>
+    <text class="svg-small"  x="252" y="278">ICLR 2025 · the load-bearing one</text>
+    <text class="svg-small"  x="252" y="294">• memoryless schedule is necessary</text>
+    <text class="svg-small"  x="252" y="308">• SOC → least-squares regression</text>
+    <text class="svg-small"  x="252" y="322">• first FM reward fine-tuning</text>
+
+    <rect x="440" y="242" width="152" height="86" rx="6" fill="var(--surface)" stroke="var(--border)" stroke-width="1.3"/>
+    <text class="svg-strong" x="452" y="262">Adjoint Sampling</text>
+    <text class="svg-small"  x="452" y="278">ICML 2025 · Boltzmann targets</text>
+    <text class="svg-small"  x="452" y="294">• b ≡ 0 ⇒ ã in closed form</text>
+    <text class="svg-small"  x="452" y="308">• reciprocal projection + buffer</text>
+    <text class="svg-small"  x="452" y="322">• amortized conformers</text>
+
+    <rect x="606" y="242" width="80" height="86" rx="6" fill="var(--gold-bg)" stroke="var(--gold)" stroke-width="1.3"/>
+    <text class="svg-small" x="616" y="262" fill="var(--gold)">SMP</text>
+    <text class="svg-small" x="616" y="276" fill="var(--gold)">re-derivation</text>
+    <text class="svg-small" x="616" y="294">2026 —</text>
+    <text class="svg-small" x="616" y="308">finds where</text>
+    <text class="svg-small" x="616" y="322">lean AM fails</text>
+
+    <!-- arrows -->
+    <defs><marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--text-tertiary)"/></marker></defs>
+    <g stroke="var(--text-tertiary)" stroke-width="1.3" fill="none">
+      <path d="M166,85 L174,85" marker-end="url(#ag)"/>
+      <path d="M330,72 L424,72" marker-end="url(#ag)"/>
+      <path d="M420,285 L434,285" marker-end="url(#ag)"/>
+      <path d="M592,285 L600,285" marker-end="url(#ag)"/>
+    </g>
+    <path d="M91,130 C91,210 200,214 236,262" stroke="var(--coral)" stroke-width="1.6" fill="none" stroke-dasharray="5 3" marker-end="url(#agc)"/>
+    <defs><marker id="agc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--coral)"/></marker></defs>
+    <text class="svg-small" x="120" y="222" fill="var(--coral)">same bias — cheaper fix</text>
+    <text class="svg-small" x="352" y="66"  text-anchor="middle" fill="var(--text-tertiary)">discrete time + rates</text>
+  </svg>
+  <div class="caption"><b>Two lanes, one objective.</b> Everything here optimizes KL-regularized reward and targets $p^{\text{base}}e^{r}$. The upper lane asks what that objective <em>is</em> and whether it is well-posed; the lower lane asks how to actually solve it at scale. The interesting edge is the dashed one: Uehara et al. identified the initial-value bias first and paid for it with an auxiliary model, and Adjoint Matching removed it by construction.</div>
+</div>
+
+<div class="tblwrap">
+<table>
+  <thead>
+    <tr><th>Paper</th><th>Setting</th><th>Handles the bias by</th><th>Gives you</th><th>Implement from it if…</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><a href="https://arxiv.org/abs/2409.08861"><b>Adjoint Matching</b></a><br><span class="chip coral">ICLR 2025</span></td>
+      <td>Continuous-time SDE; FM and diffusion; differentiable reward</td>
+      <td>Choosing $\sigma(t)=\sqrt{2\eta_t}$ so $X_0 \perp X_1$</td>
+      <td>An exact target, a regression loss, a principled $\lambda$ knob</td>
+      <td class="yes">…you are reward fine-tuning a real image / video / molecule generator. This is the default.</td>
+    </tr>
+    <tr>
+      <td><a href="https://arxiv.org/abs/2402.15194"><b>Uehara et al.</b></a><br><span class="chip gray">preprint, Feb 2024</span></td>
+      <td>Continuous-time SDE; diffusion only (needs a diffusion term)</td>
+      <td>Learning the tilted initial law $\nu^*$ via a second SOC problem</td>
+      <td>The over-optimization argument, bridge preservation, marginal tilting at all $t$</td>
+      <td>…you want the clearest statement of <em>why</em> KL regularization is load-bearing, or you work on sequences/proteins.</td>
+    </tr>
+    <tr>
+      <td><a href="https://arxiv.org/abs/2403.06279"><b>Tang &amp; Zhou</b></a><br><span class="chip gray">math.OC</span></td>
+      <td>Continuous-time; formalizes the above</td>
+      <td>Same as Uehara et al. (it is the analysis of that construction)</td>
+      <td>Well-posedness, a TV bound in $\alpha$, the $f$-divergence generalization</td>
+      <td>…you need to cite an actual proof, or want a non-KL regularizer.</td>
+    </tr>
+    <tr>
+      <td><a href="https://arxiv.org/abs/2412.18164"><b>Han, Razaviyayn &amp; Xu</b></a><br><span class="chip gray">ICML 2025</span></td>
+      <td><b>Discrete</b> time; DDPM as linear dynamics</td>
+      <td>Not its focus — it studies the KL-regularized problem as posed</td>
+      <td>PI-FT and a global linear convergence rate; regularity preserved along iterates</td>
+      <td>…you care about convergence guarantees, or your sampler is irreducibly discrete-step.</td>
+    </tr>
+    <tr>
+      <td><a href="https://arxiv.org/abs/2504.11713"><b>Adjoint Sampling</b></a><br><span class="chip gray">ICML 2025</span></td>
+      <td>No pre-trained model; sample $e^{-E/\tau}$ from the energy alone</td>
+      <td>Not applicable — base process is Brownian motion, so $X_0$ is a Dirac</td>
+      <td>Closed-form adjoint, replay buffer, many gradient steps per energy call</td>
+      <td class="yes">…your "reward" is an expensive energy function and you have no data. Conformers, Boltzmann generators.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2>12. What is settled, what is not, and what to watch</h2>
+
+<h3>The lean adjoint has a precise domain of validity</h3>
+<p>This is the most important caveat, and it is recent. <a href="https://arxiv.org/abs/2604.08580">Domingo-Enrich and Han (2026)</a> re-derive Adjoint Matching from the <b>stochastic maximum principle</b> rather than constructing it heuristically. Their framing is explicit that the original derivation was after-the-fact: adjoint matching "was originally proposed heuristically within the control-affine quadratic-cost setting, and its optimality was verified a posteriori rather than derived from first principles." They give a general Hamiltonian objective for SOC with control-dependent drift <em>and diffusion</em>, show its first variation matches the true SOC objective, and recover the lean loss as the special case where <b>the diffusion depends on time only</b>.</p>
+
+<div class="box warn">
+  <div class="hd">Where it breaks</div>
+  <p>Once $\sigma$ depends on the <em>state</em> — as in simplex diffusions built on Cox–Ingersoll–Ross or Jacobi processes, or multiplicative models on geometric Brownian motion — the terms the lean adjoint discards are no longer zero in expectation, and dropping them costs you. On a controlled GBM steering problem with a three-component Gaussian-mixture target at $d=20$, the paper reports that the lean objective "assigns essentially zero mass to one target component" while the full first-order objective retains mass in all three. If you are porting this machinery to a non-Gaussian forward process, do not assume the lean adjoint carries over.</p>
+</div>
+
+<p>The same paper adds an interpretation that was previously missing: gradient descent on the lean loss is precisely a continuous-time <em>method of successive approximations</em> induced by the SMP — and it sidesteps the intractable martingale term that has historically blocked SMP-based algorithms in the stochastic setting. So the answer to "why does this regression converge to a control-theoretic optimum" is no longer "empirically, it does".</p>
+
+<h3>The cost is being attacked from two directions</h3>
+<ul>
+  <li><b>Cheaper simulation.</b> <a href="https://arxiv.org/abs/2605.11480">Efficient Adjoint Matching</a> (2026) observes that both bottlenecks — stochastic rollouts under memoryless dynamics, and the backward adjoint sweep — trace back to the non-trivial base drift inherited from the pre-trained model. Reformulating the SOC problem with a <em>linear</em> base drift and a compensating terminal cost recovers a closed-form adjoint and allows few-step deterministic ODE sampling during training; they report up to 4× faster convergence at matched or better metrics. This is the same structural insight that makes Adjoint Sampling cheap, applied back to fine-tuning.</li>
+  <li><b>No reward gradients at all.</b> <a href="https://arxiv.org/abs/2605.10759">Reinforce Adjoint Matching</a> (Bergmeister, Jegelka, Nüsken, Domingo-Enrich &amp; Pidstrigach, 2026) combines the adjoint-matching optimality condition with a REINFORCE identity. The observation is that under KL-regularized reward maximization the optimal process tilts the <em>clean-endpoint</em> distribution and leaves the noising law unchanged — so you can draw an endpoint from the current model, score it, re-noise it exactly as in pre-training, and regress. No SDE rollouts, no backward sweeps, no differentiable reward. They report reaching Flow-GRPO's peak reward on Stable Diffusion 3.5M in up to 50× fewer training steps. If your reward is a black box, this is the branch to read.</li>
+</ul>
+
+<h3>Honest limitations</h3>
+<ul>
+  <li><b>Everything here is continuous-state.</b> The memoryless argument is a statement about a diffusion coefficient in $\mathbb{R}^d$; "$\sigma(t)\to\infty$ as $t\to0$" has no literal analogue in a discrete-state CTMC or a masked-token sampler. Whether an equivalent "the seed carries no information" condition exists for discrete generative processes, and what it looks like, is not answered by these papers.</li>
+  <li><b>$\lambda$ is principled but still a hyperparameter.</b> The formulation tells you what distribution each $\lambda$ targets. It does not tell you which $\lambda$ you want, and Adjoint Matching's own results show diversity falling monotonically from 43.1 to 37.2 as $\lambda$ goes from 1 000 to 12 500. You still sweep.</li>
+  <li><b>Guidance after fine-tuning is off-theory.</b> Adjoint Matching applies classifier-free guidance post-hoc and says so plainly: it is "not principled as only the conditional model is fine-tuned" — with the fair rejoinder that it is unclear what distribution any guided model samples from anyway.</li>
+  <li><b>The reward model is still the ceiling.</b> None of this makes a bad reward model good. It makes the tilt exact and bounds how far you travel from the base distribution. The Uehara chart in Section 8 shows a method that gets the <em>best</em> genuine reward while <em>not</em> topping the proxy — that is the shape of success here, and it is only visible if you hold out a genuine reward you can measure. Most real deployments cannot.</li>
+</ul>
+
+<div class="box">
+  <div class="hd">If you only remember three things</div>
+  <p><b>1.</b> Reward fine-tuning done right targets $p^{\text{base}}e^{r}$, and the KL-to-pretrained term is not a regularizer bolted on for safety — it is what defines the target and what keeps you inside the region where the reward model means anything.</p>
+  <p><b>2.</b> Naïvely optimizing that objective on a flow or diffusion model converges to the <em>wrong</em> distribution, because the initial noise and the final sample are dependent. Switching to the memoryless schedule $\sigma(t)=\sqrt{2\eta_t}$ during fine-tuning — and only during fine-tuning — makes the bias vanish exactly.</p>
+  <p><b>3.</b> The resulting control problem does not need policy gradients or importance weights. Simulate forward without gradients, integrate a lean adjoint backward without gradients, and regress. That reduction is what makes it work at text-to-image scale, and it is valid whenever the diffusion coefficient depends on time alone.</p>
+</div>
+
+<hr class="soft">
+<p style="font-size:13px;color:var(--text-tertiary)">Sources are linked inline throughout. Reference implementations: <a href="https://github.com/microsoft/soc-fine-tuning-sd">microsoft/soc-fine-tuning-sd</a> (Adjoint Matching on Stable Diffusion 1.5), <a href="https://github.com/facebookresearch/adjoint_sampling">facebookresearch/adjoint_sampling</a>, <a href="https://github.com/AndreasBergmeister/ram">AndreasBergmeister/ram</a>. Every equation and number in this page was taken from the paper PDFs read for it; the 1-D tilting figure and the $\sigma(t)$ curve are computed from the formulas given in the text.</p>
+
+</body>
+</html>
