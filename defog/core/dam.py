@@ -573,7 +573,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
             def _ratio(mask):
                 if not bool(mask.any()):
                     return float("nan")
-                return float((per[mask].sum() / noop[mask].sum().clamp_min(1e-12)).clamp(0, 1e6))
+                return float((per[mask].detach().sum() / noop[mask].sum().clamp_min(1e-12)).clamp(0, 1e6))
             resid = float((per.sum() / noop.sum().clamp_min(1e-12)).clamp(0, 1e6))
         # Split by coordinate type: calibration on the real base shows the node and
         # edge channels move in OPPOSITE directions with t -- the node gap sits at

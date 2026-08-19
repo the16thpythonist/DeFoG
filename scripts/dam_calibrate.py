@@ -49,7 +49,13 @@ from defog.core.rl import PropertyMatchReward, _score_logprob        # noqa: E40
 from defog.domains.molecule import build_encoders                    # noqa: E402
 
 
-DEFAULT_BASE = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
+# zinc-kek is the model of record. Its vocabulary differs from the older
+# zinc_uncond_4e-4_connectivity base in TWO ways that silently mis-decode if crossed:
+# no AROMATIC bond (4 classes, not 5) and a different atom ORDER
+# (C N O F P S Cl Br I, not C N O S F Cl Br I P). See docs/zinc_kek_shipping.md.
+DEFAULT_BASE = os.path.expanduser("~/Downloads/zinc_kek_1.0.0.ckpt")
+KEK_ATOMS = ["C", "N", "O", "F", "P", "S", "Cl", "Br", "I"]
+KEK_BONDS = ["SINGLE", "DOUBLE", "TRIPLE"]
 
 
 # --------------------------------------------------------------------------- reward
@@ -205,6 +211,8 @@ def main():
     ap.add_argument("--reward", default="standin", choices=("standin", "real"),
                     help="'real' uses PropertyMatchReward with RDKit decoding")
     ap.add_argument("--property", default="logp", choices=("logp", "qed", "tpsa"))
+    ap.add_argument("--atom-types", default=",".join(KEK_ATOMS))
+    ap.add_argument("--bond-types", default=",".join(KEK_BONDS))
     ap.add_argument("--endpoint-steps", type=int, default=100,
                     help="denoising steps used to draw the endpoints the states re-noise from")
     args = ap.parse_args()
@@ -258,8 +266,15 @@ def main():
 
     reward_fn = None
     if args.reward == "real":
-        ATOM = ["C", "N", "O", "S", "F", "Cl", "Br", "I", "P"]
-        BOND = ["SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
+        ATOM = args.atom_types.split(",")
+        BOND = args.bond_types.split(",")
+        if len(ATOM) != dx or len(BOND) != de - 1:
+            raise SystemExit(
+                f"vocabulary mismatch: base has dx={dx}, de={de} (so {de - 1} bond "
+                f"types + none), but --atom-types gives {len(ATOM)} and --bond-types "
+                f"{len(BOND)}. Decoding with the wrong vocabulary silently produces "
+                "garbage rather than raising."
+            )
         torch.manual_seed(0)
         tgts = (torch.rand(args.graphs) * 4.0 - 1.0).tolist()   # logP-ish spread
         reward_fn = real_reward(ATOM, BOND, args.property, tgts, dev)
