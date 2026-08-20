@@ -58,6 +58,14 @@ PROP_FNS = {
 }
 
 
+# TOLERANCE. 1e-6, not the 1e-3 that AdaLNAdapter.check_compatible warns at. base_token
+# is a deterministic sum over a fixed weight, so a matching base matches EXACTLY -- there
+# is no reason to allow slack, and 1e-3 allows 0.095 here while ckpts/zinc_e1_seed42_kek
+# (the base the launchers name as the one to avoid) sits just 0.0607 away. It passed.
+# This is the same tolerance the training launcher's own preflight uses.
+_TOKEN_RTOL = 1e-6
+
+
 def draw_targets(split: str, n: int, seed: int, prop_fn):
     """The 100 target values, from real molecules in `split`.
 
@@ -335,8 +343,11 @@ def main() -> int:
         adapter_module.check_compatible(loaded.base)     # dims / n_layers, raises
         from defog.core.adapter import _base_token as _bt
         tok = _bt(loaded.base)
-        if adapter_module.base_token is None or \
-                abs(tok - adapter_module.base_token) > 1e-3 * (1 + abs(adapter_module.base_token)):
+        if adapter_module.base_token is None:
+            sys.exit(f"REFUSING: {args.adapter_ckpt} records no base_token, so there is no "
+                     f"way to tell which base it was trained on. Retrain it with a current "
+                     f"AdaLNAdapter.for_base, which records one.")
+        if abs(tok - adapter_module.base_token) > _TOKEN_RTOL * (1 + abs(adapter_module.base_token)):
             sys.exit(f"REFUSING: {args.adapter_ckpt} was trained on a different base "
                      f"(token {adapter_module.base_token} != {tok} for {args.base}). "
                      f"A raw checkpoint skips the store's compatibility gate, so this is "
@@ -356,14 +367,14 @@ def main() -> int:
         # a plausible number. Hard-fail instead.
         from defog.core.adapter import _base_token
         base_dev = next(loaded.base.parameters()).device
-        guide_module.to(base_dev)
+        guide_module.to(base_dev).eval()
         guide_module.check_compatible(loaded.base)   # dims / n_layers, raises on mismatch
         tok = _base_token(loaded.base)
         if guide_module.base_token is None:
             sys.exit(f"REFUSING: guide {args.guide} carries no base_token, so there is no "
                      f"way to tell whether it was trained on {args.base}. Retrain it with a "
                      f"current AdaLNAdapter.for_base, which records one.")
-        if abs(tok - guide_module.base_token) > 1e-3 * (1 + abs(guide_module.base_token)):
+        if abs(tok - guide_module.base_token) > _TOKEN_RTOL * (1 + abs(guide_module.base_token)):
             sys.exit(f"REFUSING: guide {args.guide} was trained on a DIFFERENT base "
                      f"(token {guide_module.base_token:.8g} != {tok:.8g} for {args.base}). "
                      f"Autoguidance requires the guide to share the model's flaws; a guide "
@@ -420,14 +431,24 @@ def main() -> int:
     # test builds AdapterComposition directly. So watch the constructor itself.
     # molsmith imports AdapterComposition INSIDE sample(), so patching the attribute here
     # is picked up on the next call.
+    # Installed for the raw-checkpoint path too, not just for --guide. That path
+    # deliberately bypasses the store's compatibility gate, and if the injected key ever
+    # failed to match, molsmith would set composition=None and fall through to a plain
+    # UNGUIDED Sampler -- the run completes, the MAE is plausible, and the JSON still
+    # records "adapter_ckpt": "<path>". This is the one hop in this file that was not
+    # probed, in a file whose whole idiom is to probe the hop.
     _probe = None
-    if guide_module is not None:
+    if guide_module is not None or adapter_module is not None:
         import defog.core as _dc
-        _probe = {"real": _dc.AdapterComposition, "built": False, "guided": False}
+        _probe = {"real": _dc.AdapterComposition, "built": False, "guided": False,
+                  "adapter_is_ours": None}
 
         def _probe_ctor(*a, **kw):
             _probe["built"] = True
             _probe["guided"] = kw.get("guide") is not None
+            branches = a[0] if a else kw.get("branches", [])
+            if adapter_module is not None and branches:
+                _probe["adapter_is_ours"] = branches[0].adapter is adapter_module
             return _probe["real"](*a, **kw)
 
         _dc.AdapterComposition = _probe_ctor
@@ -441,13 +462,23 @@ def main() -> int:
             _dc.AdapterComposition = _probe["real"]          # restore before anything else
             if not _probe["built"]:
                 sys.exit("REFUSING: no AdapterComposition was constructed during sampling, "
-                         "so the run was not adapter-guided at all. Check --adapter.")
-            if not _probe["guided"]:
+                         "so the run was NOT steered at all -- molsmith fell through to a "
+                         "plain unguided Sampler. The output would have looked normal.")
+            if adapter_module is not None and _probe["adapter_is_ours"] is not True:
+                sys.exit(f"REFUSING: the composition's branch adapter is not the module "
+                         f"loaded from {args.adapter_ckpt}. The injected key "
+                         f"{adapter_key!r} did not reach the sampler.")
+            if guide_module is not None and not _probe["guided"]:
                 sys.exit("REFUSING: molsmith's sample() built the composition WITHOUT the "
                          "guide -- this run is plain CFG and would have been recorded as "
                          "autoguidance. The installed molsmith has the SamplingConfig.guide "
                          "field but does not pass it through. Update molsmith.")
-            print("guide wiring check: AdapterComposition received the guide", flush=True)
+            what = []
+            if adapter_module is not None:
+                what.append("the raw-ckpt adapter")
+            if guide_module is not None:
+                what.append("the guide")
+            print(f"wiring check: AdapterComposition received {' and '.join(what)}", flush=True)
         if k == 0 and args.method == "fk" and float(cfg.adapters[0].scale) == 1.0:
             # The per-target configs are built fresh, so the one that just sampled is the
             # only thing that proves the energy was normalised. Checking probe_cfg alone
@@ -493,7 +524,14 @@ def main() -> int:
     # that nails mid-range while failing the ends posts a fine pooled number.
     order = np.argsort([r["target"] for r in rows])
     thirds = np.array_split(order, 3)
-    by_third = [float(np.nanmean([rows[i]["mae"] for i in part])) for part in thirds]
+    def _third_mae(part):
+        # A third can be empty (n < 3) or entirely dead (every target produced zero valid
+        # molecules), and np.nanmean warns and returns NaN for both. NaN is the honest
+        # answer; the warning is noise that has appeared in real runs.
+        vals = [rows[i]["mae"] for i in part if np.isfinite(rows[i]["mae"])]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    by_third = [_third_mae(part) for part in thirds]
 
     summary = {
         "adapter": args.adapter or adapter_key, "adapter_ckpt": args.adapter_ckpt,
@@ -515,7 +553,7 @@ def main() -> int:
                 "ess_frac": args.fk_ess, "rejuvenate": args.fk_rejuvenate,
                 "jump_length": args.fk_jump} if args.method == "fk" else None),
         "mae_pooled": float(np.mean(all_err)) if all_err else float("nan"),
-        "mae_per_target_mean": float(finite.mean()),
+        "mae_per_target_mean": float(finite.mean()) if finite.size else float("nan"),
         "mae_low_third": by_third[0], "mae_mid_third": by_third[1],
         "mae_high_third": by_third[2],
         "validity": float(val.mean()),

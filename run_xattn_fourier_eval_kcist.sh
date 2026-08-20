@@ -46,13 +46,29 @@ ETA=25
 BASELINE_JSON="adapter_improvements/blend_results/e2_prob_w2.0.json"
 
 # Set ADAPTER_CKPT, or the newest training result is used.
+# The preflight below refuses a checkpoint missing either mechanism, so a plain FiLM
+# adapter cannot slip through -- but a DIFFERENT xattn+fourier run (an ablation arm, or a
+# re-run) would be accepted silently, and "newest" is not the same as "the one I meant".
+# So the fallback refuses when it is ambiguous instead of guessing. Stage 1 prints the
+# exact ADAPTER_CKPT= line to use.
 ADAPTER_CKPT="${ADAPTER_CKPT:-}"
 if [ -z "$ADAPTER_CKPT" ]; then
-    ADAPTER_CKPT=$(ls -t experiments/results/adapter_training__zinc/*/clogp_adapter.ckpt 2>/dev/null | head -1)
+    mapfile -t _CANDS < <(ls -t experiments/results/adapter_training__zinc/*/clogp_adapter.ckpt 2>/dev/null)
+    if [ "${#_CANDS[@]}" -eq 0 ]; then
+        echo "ERROR: no adapter checkpoint found. Run run_xattn_fourier_train_kcist.sh"
+        echo "       first, or set ADAPTER_CKPT=/path/to/clogp_adapter.ckpt"
+        exit 1
+    elif [ "${#_CANDS[@]}" -gt 1 ]; then
+        echo "ERROR: ${#_CANDS[@]} candidate checkpoints; refusing to guess which one this"
+        echo "       job is meant to evaluate. Set ADAPTER_CKPT= explicitly:"
+        printf '         %s\n' "${_CANDS[@]}"
+        exit 1
+    fi
+    ADAPTER_CKPT="${_CANDS[0]}"
+    echo "note: ADAPTER_CKPT not set; using the only candidate found"
 fi
-if [ -z "$ADAPTER_CKPT" ] || [ ! -f "$ADAPTER_CKPT" ]; then
-    echo "ERROR: no adapter checkpoint. Run run_xattn_fourier_train_kcist.sh first, or"
-    echo "       set ADAPTER_CKPT=/path/to/clogp_adapter.ckpt"
+if [ ! -f "$ADAPTER_CKPT" ]; then
+    echo "ERROR: ADAPTER_CKPT=$ADAPTER_CKPT does not exist"
     exit 1
 fi
 
