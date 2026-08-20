@@ -614,7 +614,10 @@ def test_fourier_widens_the_condition_path_and_keeps_the_raw_scalar():
     # The name claims the raw scalar is RETAINED -- check it reaches the trunk, by
     # capturing the trunk's actual input rather than trusting the concatenation order.
     seen = {}
-    ff.trunk.register_forward_pre_hook(lambda m, inp: seen.setdefault("x", inp[0]))
+    def _capture(m, inp):
+        seen.setdefault("x", inp[0])
+        return None          # a non-None return REPLACES the input on the next call
+    ff.trunk.register_forward_pre_hook(_capture)
     ff(c, t=torch.zeros(1, 1))
     assert torch.allclose(seen["x"][:, :1], ff.normalize(c), atol=1e-6), \
         "raw normalised scalar is not slot 0 of the trunk input"
@@ -735,8 +738,19 @@ def test_xattn_is_nonlinear_in_node_content_unlike_film():
         f"-- this is a broadcast, not content-addressed routing")
     # and the FiLM path, on the same model, MUST satisfy the identity it is being
     # contrasted with, or the contrast means nothing
-    m0 = mod.layers[0]
-    film = lambda X: m0["gateX"][:, None] * (m0["scaleX"][:, None] * X + m0["shiftX"][:, None])
+    # Through the REAL Modulation.apply, not a lambda copy of it -- the same reason the
+    # test this one replaced was defective. It needs a FiLM-ONLY adapter: `mod` above
+    # carries both deltas, and their SUM is not affine, which is the very thing being
+    # demonstrated. So the contrast is between two real modulations, one per mechanism.
+    em = torch.ones(bs, n, n, 1)
+    film_only = _wake_gates(AdaLNAdapter.for_base(model, cond_dim=1, hidden=32).eval(),
+                            seed=23)
+    fmod = film_only(torch.full((bs, 1), 0.7), t=noisy["t"])
+    assert fmod.xattn is None, "the FiLM-only control picked up a cross-attention path"
+    def film(Z):
+        out, _, _ = fmod.apply(0, Z.clone(), torch.zeros(bs, n, n, a.dims["de"]),
+                               torch.zeros(bs, a.dims["dy"]), xm, em)
+        return out - Z
     f_resid = (film(X1) + film(X2) - film(torch.zeros_like(X1)) - film(X1 + X2)).abs().max().item()
     assert f_resid < 1e-5, f"FiLM is not affine ({f_resid:.2e}); the contrast is invalid"
     return (f"xattn breaks affinity (residual {resid/scale:.1%} of scale) while FiLM "
@@ -754,7 +768,14 @@ def test_xattn_starts_as_a_near_broadcast_at_init():
     noisy, extra, mask, bs = a_noisy(model, loader)
     a = _wake_xattn(AdaLNAdapter.for_base(model, cond_dim=1, hidden=32, xattn_tokens=8,
                                           xattn_dim=32, xattn_heads=4).eval(), seed=22)
-    xa, tokens = a.xattn[0], a.tok(torch.randn(bs, a.hidden)).view(bs, 8, a.xattn_dim)
+    # Tokens from the REAL trunk, as the eval preflight builds them. Random tokens are
+    # ~4x larger, which makes the attention look ~10x sharper than it is at init and put
+    # this test's number on the other side of the preflight's warning line.
+    cn = a.normalize(torch.full((bs, 1), 0.7))
+    parts = [cn] + ([a._fourier(cn)] if a.cond_fourier else [])
+    parts.append(timestep_embedding(noisy["t"].reshape(-1, 1), a.time_emb_dim))
+    xa = a.xattn[0]
+    tokens = a.tok(a.trunk(torch.cat(parts, dim=-1))).view(bs, 8, a.xattn_dim)
     X = torch.randn(bs, mask.size(1), a.dims["dx"])
     h, dh = xa.n_heads, xa.dx // xa.n_heads
     q = xa.q(xa.norm(X)).view(bs, -1, h, dh).transpose(1, 2)
@@ -765,6 +786,44 @@ def test_xattn_starts_as_a_near_broadcast_at_init():
     assert ent > 0.97 * math.log(8), f"entropy {ent:.4f} unexpectedly far below uniform"
     return (f"attention entropy at init {ent:.4f} vs uniform max {math.log(8):.4f} "
             f"-- near-broadcast until trained")
+
+
+def test_film_delta_is_masked_on_padded_nodes_and_edges():
+    """Direct test of the FiLM delta's masking, on the delta itself.
+
+    A forward-level test CANNOT see this. Padded contamination needs >= 3 layers of
+    message passing to reach real nodes and the fixture is 2 layers deep, so the whole
+    suite stays green with x_mask and e_mask deleted from Modulation.apply outright --
+    verified by mutation. Giving the fixture real padding was necessary but not
+    sufficient; this is the sufficient half, and it mirrors what
+    test_xattn_masks_padded_nodes already does for the cross-attention path.
+
+    The invariant is load-bearing on the production model: dropping the mask moves REAL
+    node predictions by up to 8e-3 (X) and 1.6e-2 (E) at 9 layers, because junk padding
+    states feed the next step's RRWP features."""
+    model, loader = build_tiny_model()
+    noisy, extra, mask, bs = a_noisy(model, loader)
+    a = _wake_gates(AdaLNAdapter.for_base(model, cond_dim=1, hidden=32).eval(), seed=31)
+    mod = a(torch.full((bs, 1), 0.7), t=noisy["t"])
+    n = mask.size(1)
+    x_mask = mask.unsqueeze(-1)
+    e_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(1)
+    n_pad = int((~mask).sum().item())
+    assert n_pad > 0, "vacuous: the fixture has no padded nodes"
+    X = torch.randn(bs, n, a.dims["dx"])
+    E = torch.randn(bs, n, n, a.dims["de"])
+    y = torch.randn(bs, a.dims["dy"])
+    X2, E2, _ = mod.apply(0, X.clone(), E.clone(), y.clone(), x_mask, e_mask)
+    dX, dE = X2 - X, E2 - E
+    em = e_mask.squeeze(-1).bool()
+    # both halves matter: zero on padding AND non-zero elsewhere, or a mask that zeroed
+    # everything would pass the first assertion alone
+    assert dX[~mask].abs().max().item() == 0.0, "a padded node received a FiLM delta"
+    assert dX[mask].abs().max().item() > 0.0, "no delta on real nodes; gates are not live"
+    assert dE[~em].abs().max().item() == 0.0, "a masked edge received a FiLM delta"
+    assert dE[em].abs().max().item() > 0.0, "no delta on real edges; gates are not live"
+    return (f"FiLM delta is exactly zero on {n_pad} padded nodes and "
+            f"{int((~em).sum().item())} masked edges, non-zero elsewhere")
 
 
 def test_xattn_masks_padded_nodes():
@@ -927,6 +986,7 @@ if __name__ == "__main__":
         test_xattn_matches_reference_attention,
         test_xattn_is_nonlinear_in_node_content_unlike_film,
         test_xattn_starts_as_a_near_broadcast_at_init,
+        test_film_delta_is_masked_on_padded_nodes_and_edges,
         test_xattn_masks_padded_nodes,
         test_xattn_only_touches_its_own_group_in_a_stacked_forward,
         test_xattn_bypass_rows_silences_it,

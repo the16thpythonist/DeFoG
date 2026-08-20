@@ -262,6 +262,13 @@ class NodeConditionCrossAttention(nn.Module):
     def forward(self, X: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
         """``X`` (B,n,dx), ``tokens`` (B,m,d_tok) -> delta (B,n,dx)."""
         B, n, _ = X.shape
+        if tokens.dim() == 3 and tokens.size(1) < 2:
+            # The AdaLNAdapter-level guard covers the normal path, but this module can be
+            # constructed directly: softmax over a single key is identically 1.0, so every
+            # node gets the same value and the query path receives no gradient.
+            raise ValueError(
+                f"cross-attention needs >= 2 condition tokens, got {tokens.size(1)}: "
+                f"softmax over one key is constant, so this degenerates to a broadcast.")
         if tokens.dim() != 3 or tokens.size(0) != B:
             # `.view(B, -1, h, dh)` would SUCCEED on a mismatched batch by silently
             # reinterpreting one graph's tokens as several graphs' -- no error, a wrong
