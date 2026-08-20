@@ -1,180 +1,169 @@
 # DAM on DeFoG: measured outcome
 
-**Status:** negative result. Recorded so it is not re-derived.
+**Status:** the earlier negative result is **withdrawn**. It was produced by a metric
+whose best attainable value is 1.0 and a learning rate 10x production. Re-measured
+against a matched null control, the DAM update carries a small but real directional
+signal. Whether it *steers* is still untested.
 **Plan:** [`dam_design.md`](dam_design.md) · **Code:** `defog/core/dam.py`, branch `feat/dam-rl`
 
-Discrete Adjoint Matching (arXiv:2602.07132) was implemented against DeFoG and does
-not move the policy toward its own target on either zinc-kek base. No cluster
-experiment was run beyond one 2-GPU head-fitting job; every number below is local or
-from that job.
+## What went wrong with the first conclusion
 
-## The measurement that decides it
+Three faults, compounding. None is in the method; all three are in how it was measured.
 
-`resid` is the gKL distance from the fitted rate to DAM's target, divided by the same
-distance for the untouched base rate. **Below 1 = the update helped. Above 1 = it
-moved away.** Medians over iterations 3-8, `n_jumps=8`, `lambda=0.3`, `K=12`:
+### 1. `resid` cannot go below 1 unless the target has learnable signal
 
-| base | terminal loss | g_spread | log_a | resid nodes | resid edges |
+`dam.py:689-710` builds `target = u_base * exp(log_a)` from an adjoint redrawn every
+iteration, then scores the policy and the base against that same draw and takes the
+ratio. `u_base` cancels, so `resid` is a function of policy drift and target noise
+only. Verified in closed form and on the real model:
+
+| adjoint | resid at `u_theta = u_base` | best achievable |
+|---|---|---|
+| pure noise, mean 1, sd 0.2-1.0 | 1.0000 | **1.0000** |
+
+When the adjoint carries no state-dependent signal, **staying at the base is optimal**
+and `resid = 1.000` is the CEILING. The pass mark was set at "below 1". It was
+unreachable by construction, and drift enters quadratically:
+
+| drift sd | 0.05 | 0.10 | 0.20 | 0.30 | 0.45 |
 |---|---|---|---|---|---|
-| shipped (2x sanity-RL) | RDKit | 0.487 | -0.187 | 1.200 | 0.978 |
-| shipped | scoring head | 0.013 | -0.011 | 2.209 | 1.081 |
-| pre-RL (E1 seed42) | RDKit | 0.478 | -0.165 | 1.057 | 1.117 |
-| pre-RL | scoring head | 0.016 | -0.011 | 2.455 | 1.500 |
+| resid (signal-free target) | 1.006 | 1.023 | 1.094 | 1.214 | 1.482 |
 
-Nothing reaches below 1. The best cell in the table is the pre-RL base with the
-ordinary RDKit reward, at 1.057.
+Every previously reported cell -- 1.057, 1.099, 1.200, 1.379, 1.615, 2.113, 2.387,
+2.455 -- lies on that curve.
 
-## What was ruled out, in order
+### 2. Every probe ran at 10x the production learning rate
 
-1. **The algebra.** `test_dam_reaches_kl_optimum` converges to `p_ref * e^-g / Z`
-   (KL 0.0001 at lambda=0.3) and goes red under three deliberate mistranscriptions
-   and under breaking the shipped function in memory. Eq. (11) and Eq. (13) were
-   read off the typeset PDF, not a text extraction that was dropping a superscript.
-2. **Estimator variance.** Eq. (11) is a one-sample estimate of a sum over ~3.2k
-   reachable jumps. Averaging m=8 narrowed the node residual from [0.87, 7.03] to
-   [1.01, 2.42] and did not move the median (1.295 -> 1.284).
-3. **Reachability.** The pre-RL base expresses far more of an arbitrary tilt than the
-   shipped one -- node projection gap 0.09-0.58 against 0.65-0.87, same vocabulary,
-   differing only by two sanity-RL rounds. Its residual is still 1.057. Better reach
-   did not convert into a better update, so reachability was never the binding
-   constraint. (The RL rounds do measurably reduce steerability, which is worth
-   knowing independently.)
-4. **Reward degeneracy.** Tested and rejected -- see below. The RDKit floor does not
-   collapse `g` (spread 0.44-0.51, not 0), and a head fitted to grade the floored
-   region made both the spread and the residual markedly worse.
-5. **The candidate surrogate.** The one-shot head draw was replaced with the paper's
-   actual procedure -- simulated model trajectories. The residual does not improve;
-   see below for what it did reveal instead.
+`accept.py`, `sim.py`, `lowt.py` and `early.py` all set `lr=1e-3`. Production is
+`LR = 1e-4` (`experiments/adapter_rl_finetune__zinc.py:185`). At `1e-3` drift alone
+contributes +0.13 to +0.20 and buries everything else.
 
-## Two wrong diagnoses, in order
+### 3. The `y = x` control returns 0.0 for any input
 
-### First: reward degeneracy (wrong)
+`tests/test_dam_estimator.py:215` -- the one test meant to separate "lambda is too hot"
+from "the reward is doing work", and whose docstring claims it "is not zero by
+construction" -- computes `A - A`:
 
-84-98% of one-shot clean-graph draws fail to decode, and RDKit floors every failure
-at the same value. The hypothesis was that this makes `g(Z) == g(X1_k)`, so the
-adjoint is 1 and there is nothing to learn.
+```
+A = 0.3961801528930664   second factor = 0.3961801528930664
+log_a = 0.0    IDENTICALLY ZERO? True
+```
 
-Falsified twice over. The floor does **not** collapse `g` -- measured `g_spread` under
-RDKit is 0.44-0.51, not 0, because the 5-15% of draws that decode still vary. And
-grading the floored region made things **worse**: a PropertyHead fitted on 30k draws
-(~50% own-labelled, ~50% surrogate) drove `g_spread` DOWN ~30x to 0.013 and pushed the
-residual from 1.20 to 2.21 (shipped) and 1.06 to 2.46 (pre-RL).
+It passes for any reward, any lambda, any model. The failure mode it existed to detect
+went undetected because the test was inert.
 
-The head's training target was also ill-posed, which is the transferable lesson. A
-broken graph has no logP, so it was labelled with the logP of the endpoint it was
-corrupted from -- **not a property of the graph being scored**. The same broken graph
-reached from two ancestors gets two labels, so it is not a function of the input at
-all. Mixed with own-logP labels on valid draws, the set asks two contradictory
-questions; the heads land at MAE 1.57 and 1.61 against truth SDs of 1.04 and 1.15,
-i.e. worse than predicting the mean.
+## The measurement that replaces it
 
-The floor is arguably correct: under the real objective invalid structures **are** all
-equally worthless, and inventing a graded score for them manufactures signal the
-objective does not contain.
+`AdapterDAMTrainer(..., null_adjoint=True)` draws `Z` from `X_t` instead of `X_Y`, so
+numerator and denominator sample the same law and **the true adjoint is identically 1**
+-- while picks, rates, gKL support, seed and RNG consumption stay bit-for-bit the real
+arm's. `resid(real) - resid(null)` at matched step size isolates the signal. This is the
+control `test_adjoint_is_one_at_y_equals_x` was supposed to be.
 
-### Second: the candidate surrogate (real, but not the cause either)
+Pre-RL zinc-kek base, RDKit logP, head candidates, `n_jumps=8`, `K=12`, `lambda=0.3`,
+12 iterations, median over the last 8 (`scratchpad/lrpair.py`):
 
-DAM Alg. 1 line 6 draws candidates by simulating **model trajectories** from `X_t`.
-This implementation substituted a one-shot draw from the factorised clean-graph head
--- ~25x cheaper, and not the same object. The head is a good marginal and a poor
-joint, so sampling ~740 coordinates independently produces almost nothing valid. That
-substitution was listed as a risk in `dam_design.md` section 11.3 and then built upon
-without being tested.
+| lr | arm | drift | E[a] | resid nodes | resid edges |
+|---|---|---|---|---|---|
+| 3e-5 | real | 0.010 | 1.169 | 1.003 | 0.992 |
+| 3e-5 | null | 0.005 | 1.051 | 0.999 | 1.000 |
+| | **diff** | x1.95 | | **+0.004** | **-0.007** |
+| 1e-4 | real | 0.029 | 1.163 | 0.995 | 0.980 |
+| 1e-4 | null | 0.016 | 1.065 | 1.001 | 1.000 |
+| | **diff** | x1.76 | | **-0.006** | **-0.021** |
+| 3e-4 | real | 0.058 | 1.161 | 1.000 | 0.965 |
+| 3e-4 | null | 0.045 | 1.063 | 1.017 | 1.017 |
+| | **diff** | x1.29 | | **-0.017** | **-0.051** |
 
-It never bites in DAM's own experiments because those are masked diffusion **language**
-models: every completion is a valid token sequence and no invalid state exists.
-Validity is a hard constraint here and independent per-slot sampling destroys it.
+The paired difference **grows monotonically with step size** in both channels. That
+dose-response is the result: noise gives no reason for the real-minus-null gap to widen
+systematically as the policy moves further. The null degrades as a signal-free target
+should (1.000 -> 1.000 -> 1.017); the real arm improves (0.992 -> 0.980 -> 0.965).
 
-`simulate_to_end` implements the paper's version. It does not fix the residual:
+Four-arm run on both bases (`scratchpad/power.py`, 8 iterations):
 
-| base | candidates | g_spread | log_a | resid nodes | resid edges | s/it |
-|---|---|---|---|---|---|---|
-| shipped | one-shot head | 0.439 | -0.239 | 1.379 | 1.077 | 12.4 |
-| shipped | **simulated** | 0.282 | -0.033 | 1.380 | 1.040 | 147.3 |
-| pre-RL | one-shot head | 0.507 | -0.196 | 1.474 | 1.208 | 12.4 |
-| pre-RL | **simulated** | 0.399 | -0.051 | 1.615 | 1.058 | 136.0 |
+| base | arm | drift | E[a] | resid nodes | resid edges | orc_flat | orc_state |
+|---|---|---|---|---|---|---|---|
+| pre-RL | lr=0 real | 0.000 | 1.209 | **1.000** | **1.000** | 0.943 | 0.608 |
+| pre-RL | lr=1e-4 real | 0.021 | 1.209 | 0.998 | 0.979 | 0.940 | 0.551 |
+| pre-RL | lr=1e-3 real | 0.197 | 1.128 | 1.176 | 1.157 | 0.993 | 0.700 |
+| pre-RL | lr=1e-3 null | 0.092 | 1.068 | 1.119 | 1.095 | 0.972 | 0.777 |
+| shipped | lr=0 real | 0.000 | 1.125 | **1.000** | **1.000** | 0.982 | 0.743 |
+| shipped | lr=1e-4 real | 0.019 | 1.082 | 1.001 | 1.002 | 0.992 | 0.768 |
+| shipped | lr=1e-3 real | 0.129 | 1.070 | 1.238 | 1.130 | 1.041 | 0.781 |
+| shipped | lr=1e-3 null | 0.153 | 1.065 | 1.273 | 1.455 | 1.044 | 0.722 |
 
-## What the simulated candidates actually revealed
+`lr=0` pins `resid` at exactly 1.000 on both bases, confirming it is a step-size meter.
+`orc_flat` -- the best a *uniform rescale of the rate tensor with no state information*
+can do -- is 0.94-1.04, i.e. as good as or better than every number in the withdrawn
+table. On the shipped base it is >= 1: even that buys nothing there.
 
-`g_spread` went **down** with real candidates (0.44 -> 0.28, 0.51 -> 0.40) and `log_a`
-moved **toward** 0 (-0.24 -> -0.03, -0.20 -> -0.05). The prediction was the opposite.
+## Established / not established
 
-The explanation reframes the whole investigation. Candidates simulated from the same
-`X_t` are valid molecules with **similar properties**: at the `t` these runs scored at,
-the endpoint is already nearly determined, so every continuation lands on much the
-same molecule and there is genuinely little to compare. The one-shot draws only looked
-more varied because they were varied *garbage* -- spread of noise, read as signal.
+**Established.** `resid`'s ceiling is 1.0 and its pass mark was unreachable. Every
+historical cell is reproduced by drift against a near-signal-free target. Against a
+matched null, the adjoint carries directional signal, edge-dominated, with a monotone
+dose-response across three step sizes. `E[a_hat]` is 1.06-1.21 and never 1.
 
-That exposes a squeeze:
+**Not established.** That DAM steers DeFoG. A 5% residual reduction is not a property
+shift; no molecules were generated and no logP was measured in any of this. The effect
+is absent on the shipped base (1.001/1.002 at production LR). The `grad x` ratio does
+not replicate across bases (pre-RL 1.3-2.0x, shipped 0.84x) and should not be read as a
+signal detector on its own.
 
-* **high t** -- simulation is cheap (short sub-rollouts) but the endpoint is settled,
-  so the adjoint has nothing to say;
-* **low t** -- the endpoint is genuinely uncertain, so the adjoint should have real
-  signal, but only a real sub-rollout can score it and those are long.
+## The suppressor worth removing first
 
-Every measurement before this sat in the first corner, because runs used
-`subsample='late'` on the strength of an earlier "no signal below t~0.7" finding --
-which is itself suspect, having been derived from the head's ability to produce varied
-draws and therefore conflating "the endpoint is uncertain" with "the head produces
-garbage".
+DAM Alg. 1 line 7 (PDF p.5): *"Set (Y, Z) as the first and last jumps of one of the
+trajectory X^(k)"* -- `Z` is a **member of the K-candidate denominator set**, which
+forces `E[a_hat] = 1` identically. `dam.py:662` draws `Y` independently and `:674`
+simulates a fresh `Z`, so the coupling is gone and `E[a_hat]` runs at 1.06-1.21.
 
-### The t-band sweep
+`dam_design.md:244` records the same bias offline (1.06 / 12.21 / 93202 at
+lambda = 0.3 / 1.0 / 2.0) and **`lambda` was pinned at 0.3 to suppress it**. But
+`lambda` is the only knob that puts spread into `g`. So the temperature was cut 3x to
+buy off a bias the paper's own coupling removes for free, and every measurement to date
+was taken at one third the intended signal.
 
-`subsample='early'` was added to reach the other corner. Pre-RL base, simulated
-candidates, `n_jumps=2`, `K=8`, `lambda=0.3`, medians over iterations 3-6:
+## What was wrong in the withdrawn verdict
 
-| band | mean t | g_spread | log_a | resid nodes | resid edges | s/it |
-|---|---|---|---|---|---|---|
-| `late` | 0.85 | 0.413 | -0.057 | 2.113 | 1.931 | 161 |
-| `stratified` | 0.66 | 0.442 | -0.134 | 2.387 | 1.264 | 192 |
-| **`early`** | **0.46** | **0.541** | -0.072 | **1.099** | **1.065** | 266 |
+The old conclusion named the "reach ceiling of the x1-parameterisation, 0.6-0.9" as the
+surviving cause. That number is wrong: `projection_gap` (`dam_calibrate.py:187`) sums
+gKL over the **full** rate tensor including the `j == x_t` entry, which DAM Eq. (14)
+excludes (`Sum_{y != x}`) and which DeFoG's sampler overwrites at `model.py:1121-1123`.
+At eta=1 with `rdb='general'` (`rate_matrix.py:293-294`, `x_mask = ones_like`) that
+entry carries full weight. The correct-support numbers were already in
+`dam_design.md:161` -- **0.281 / 0.246 / 0.566** -- under the conclusion *"the family is
+not the binding constraint"*. The verdict also eliminated reachability and then named
+it as the cause.
 
-Signal does rise as `t` falls -- `g_spread` 0.413 -> 0.442 -> 0.541 -- confirming that
-the earlier "no signal below t~0.7" claim was an artifact of the head surrogate and
-not a property of the model.
+## Next
 
-The residual is **best at low t**, at 1.099/1.065: the closest to neutral anything has
-reached. It is not monotone in `t` (`stratified` is the worst cell), so an interim
-reading of "more signal, worse update" taken from the first two points was wrong and
-the third point refutes it.
-
-**But it is still above 1, and 1.099 is not distinguishable from 1.0 at this sample
-size** -- 4 iterations per cell, against run-to-run variance that produced 1.615 and
-2.113 for nominally comparable configurations on the same base. The honest statement
-is that in the most favourable configuration tested -- the paper's own candidate
-generation, the base with the best reach, and the `t` band with the most signal -- the
-DAM update is at best **neutral**. It never helps.
-
-That best cell costs 266 s/iteration, against roughly 12 s for the one-shot variant
-and less for GDPO, so the neutral result is also the expensive one.
-
-## Verdict
-
-DAM is implemented faithfully enough to converge to `p_ref * e^-g / Z` on a tabular
-problem where the answer is known, and it does not steer DeFoG. Four candidate causes
-were eliminated by measurement and the fifth -- the reach ceiling of the
-x1-parameterisation, 0.6-0.9 across bands and bases -- is the one left standing: DAM
-computes a per-move instruction that DeFoG, which only controls its guess of the
-finished graph, has no way to express.
-
-No Run A was submitted. On this evidence it should not be.
+1. Implement Alg. 1 line-7 coupling: draw `Y` and `Z` from one of the K trajectories.
+   Verify `E[a_hat] = 1.00` in the null arm before anything else.
+2. Raise `lambda` toward 1.0 once the bias is gone, and re-run the paired sweep.
+3. Only then measure something real -- generated logP against the conditioning target,
+   the way the GDPO and adapter arms are scored. `resid` is a debugging instrument, not
+   an outcome, and should never again be the acceptance criterion.
+4. Fix `test_adjoint_is_one_at_y_equals_x` to use the `null_adjoint` path.
+5. Fix `projection_gap` to sum over `y != x`.
 
 ## What is worth keeping
 
-* `RLTrainerBase` and the frozen-copy parity gate (`tests/test_rl_parity.py`).
-* `defog/core/renoise.py` -- the re-noising step, verified against the kernel for all
-  three noise types, with `mode="match"` reproducing a recorded rollout at atol=0.
 * `dam.rate_basis` / `dam.marginal_rate` -- DeFoG's rate as an EXACT linear functional
-  of the clean-graph head, differentiable where `compute_rate_matrices` is not. This
-  is independent of DAM and is the reusable result.
-* `AdapterRAMTrainer` -- unaffected by any of the above, since it uses GDPO's loss and
-  never touches rate space. The GDPO-vs-RAM comparison ("do re-noised states beat
-  trajectory states?") remains open and cheap.
-* The kek vocabulary guard: kek is de=4 with a different atom order, and mismatches
-  previously mis-decoded silently.
+  of the clean-graph head, differentiable where `compute_rate_matrices` is not.
+  Independent of DAM and the reusable result.
+* `defog/core/renoise.py`, verified against the kernel for all three noise types.
+* `RLTrainerBase` and the frozen-copy parity gate (`tests/test_rl_parity.py`).
+* `null_adjoint` and the six drift/adjoint/oracle diagnostics -- the reason any of this
+  was diagnosable.
+* `AdapterRAMTrainer` -- untouched by all of the above; it uses GDPO's loss and never
+  enters rate space. GDPO-vs-RAM remains open and cheap.
+* The kek vocabulary guard: kek is de=4 with a different atom order.
 
-## Not tested
+## Method note
 
-A reward-shaped rather than white-noise tilt in the projection-gap measurement; a
-graded validity term in place of the floor; and whether the reach ceiling moves once
-an adapter has trained away from its starting point.
+Three conclusions in this investigation were drawn from two data points and each was
+overturned by the third: "reward degeneracy", "the candidate surrogate", and "more
+signal, worse update". The fix that worked was not more thinking, it was building the
+matched null -- a control that pins the metric at its known value when the quantity
+under test is absent. Nothing here was diagnosable until that existed.

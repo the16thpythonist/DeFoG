@@ -440,6 +440,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                  candidate_mode: str = "head",
                  head_scale: float = 1.0, head_clamp: float = 3.0,
                  t_sampler: str = "match", debias: str = "snis",
+                 null_adjoint: bool = False,
                  lr: float = 1e-5, weight_decay: float = 1e-5, ema_decay=0.999,
                  **gdpo_kw):
         super().__init__(base, adapter, cond_reward, ref_adapter=None, kl_coef=0.0,
@@ -461,6 +462,16 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         # one-shot surrogate, kept because it is ~25x cheaper and is what every
         # measurement before this was taken with.
         self.candidate_mode = candidate_mode
+        # Paired null control. The adjoint's numerator draws Z from the state AFTER the
+        # jump (X_Y) and its denominator draws the K candidates from the state BEFORE it
+        # (X_t); the ratio is therefore an estimate of exp(V(x) - V(y)). Setting this
+        # draws Z from X_t as well, so numerator and denominator sample the same law and
+        # the TRUE adjoint is identically 1 -- while the picks, the rates, the gKL
+        # support and the optimiser step stay bit-for-bit the real arm's. Anything the
+        # diagnostics still report in this mode is estimator noise, not signal. This is
+        # the y = x control that `test_adjoint_is_one_at_y_equals_x` was meant to be and
+        # is not: that test computes A - A and returns 0.0 for any reward or lambda.
+        self.null_adjoint = bool(null_adjoint)
         self.n_jumps = int(n_jumps)
         # The adjoint's terminal loss. RDKit floors every undecodable graph at the
         # same value, and 84-98% of the head's one-shot draws are undecodable at the
@@ -589,7 +600,8 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         n_states = max(1, len(states))
         tot, log_a_sum, clamp_sum = 0.0, 0.0, 0.0
         resid_sum = {"resid_ratio": 0.0, "resid_nodes": 0.0, "resid_edges": 0.0,
-                     "g_spread": 0.0}
+                     "g_spread": 0.0, "drift": 0.0, "drift_nodes": 0.0,
+                     "a_mean": 0.0, "a_sd": 0.0, "orc_flat": 0.0, "orc_state": 0.0}
         resid_n = {k: 0 for k in resid_sum}
         for (X_t, E_t, t), t_i in zip(states, step_idx):
             loss, d = self._state_loss(X_t, E_t, t, nm, cond, t_i)
@@ -613,6 +625,8 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         out["resid_gkl_ratio"] = resid_sum["resid_ratio"] / max(resid_n["resid_ratio"], 1)
         out["resid_gkl_nodes"] = resid_sum["resid_nodes"] / max(resid_n["resid_nodes"], 1)
         out["resid_gkl_edges"] = resid_sum["resid_edges"] / max(resid_n["resid_edges"], 1)
+        for k in ("drift", "drift_nodes", "a_mean", "a_sd", "orc_flat", "orc_state"):
+            out[k] = resid_sum[k] / max(resid_n[k], 1)
         return out
 
     def _state_loss(self, X_t, E_t, t, nm, cond, t_int=None):
@@ -670,12 +684,15 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
             nm_r = nm.repeat(m, 1)
             cond_r = cond.repeat(m, 1)
 
+            # Under the null the numerator is evaluated at x, not at y (see __init__).
+            Z_at_X, Z_at_E = ((X_t.repeat(m, 1, 1), E_t.repeat(m, 1, 1, 1))
+                              if self.null_adjoint else (X_Y, E_Y))
             if self.candidate_mode == "simulate":
-                Z_X, Z_E = self._simulate_endpoints(X_Y, E_Y, nm_r, cond_r, t_int, 1)
+                Z_X, Z_E = self._simulate_endpoints(Z_at_X, Z_at_E, nm_r, cond_r, t_int, 1)
                 g_Z = self._terminal_loss(Z_X, Z_E, nm_r, cond_r)
                 lr_Z = torch.zeros_like(g_Z)
             else:
-                pY, pYE, noisyY, extraY = _base_uncond_softmax(base, X_Y, E_Y, t_r, nm_r)
+                pY, pYE, noisyY, extraY = _base_uncond_softmax(base, Z_at_X, Z_at_E, t_r, nm_r)
                 polYX, polYE = self._composed(self.adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
                 refYX, refYE = self._composed(self.ref_adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
                 Z_X, Z_E = self._draw_clean(polYX, polYE, nm_r)
@@ -708,6 +725,29 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                     return float("nan")
                 return float((per[mask].detach().sum() / noop[mask].sum().clamp_min(1e-12)).clamp(0, 1e6))
             resid = float((per.sum() / noop.sum().clamp_min(1e-12)).clamp(0, 1e6))
+
+            # --- what `resid` is actually made of ---------------------------------
+            # `target` is `u_base * a_hat` with a_hat redrawn every iteration, so
+            # `noop` measures only how far the adjoint ASKS the rate to move, and
+            # `resid` = per/noop is a ratio in which u_base cancels. If a_hat carries
+            # no state-dependent signal, u_theta = u_base is optimal and resid = 1.000
+            # is the CEILING, not the neutral point. These five numbers separate the
+            # two readings; without them resid alone cannot be interpreted.
+            ld = (u_theta_Y.detach().clamp_min(1e-12).log()
+                  - u_base_Y.clamp_min(1e-12).log())
+            drift = float(ld.std())                       # how far the policy moved
+            drift_nodes = float(ld[is_node].std()) if int(is_node.sum()) > 1 else float("nan")
+            a_mean = float(log_a.exp().mean())            # E[a_hat]; Alg. 1 pins it at 1
+            a_sd = float(log_a.std())
+            # Best achievable by a policy that knows only the GLOBAL mean adjoint...
+            orc_flat = float((gkl(u_base_Y * log_a.exp().mean(), target).sum()
+                              / noop.sum().clamp_min(1e-12)).clamp(0, 1e6))
+            # ...and by one that knows each STATE's mean adjoint exactly. The gap
+            # between them is the only part of the adjoint a policy could ever learn.
+            la2 = log_a.detach().reshape(m, -1)
+            a_state = la2.exp().mean(0, keepdim=True).expand_as(la2).reshape(-1)
+            orc_state = float((gkl(u_base_Y * a_state, target).sum()
+                               / noop.sum().clamp_min(1e-12)).clamp(0, 1e6))
         # Split by coordinate type: calibration on the real base shows the node and
         # edge channels move in OPPOSITE directions with t -- the node gap sits at
         # ~0.66-0.71 everywhere while the edge gap falls to 0.09 by t=0.99 -- so a
@@ -717,4 +757,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                       "g_spread": g_spread,
                       "resid_ratio": resid,
                       "resid_nodes": _ratio(is_node),
-                      "resid_edges": _ratio(~is_node)}
+                      "resid_edges": _ratio(~is_node),
+                      "drift": drift, "drift_nodes": drift_nodes,
+                      "a_mean": a_mean, "a_sd": a_sd,
+                      "orc_flat": orc_flat, "orc_state": orc_state}
