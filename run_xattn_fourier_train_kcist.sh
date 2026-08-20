@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=12:00:00
+#SBATCH --time=16:00:00
 #SBATCH --job-name=xafo_train
 #SBATCH --output=xafo_train_%j.out
 
@@ -31,9 +31,18 @@
 #
 # MATCHED TO THE SHIPPED RECIPE so the comparison against molsmith/clogp@1.2.0 means
 # something: same base, property, vocabulary, label convention, width, LR, epochs.
+#   * EPOCHS. 20 is the matched control; this job trains 40 and checkpoints every 10, so
+#     ep20 is the like-for-like comparison and ep30/ep40 say whether it was still improving.
 #   * BASE. ckpts/zinc_kek_base is what molsmith/zinc-kek serves -- token
 #     -94.15126384728774, matching the shipped adapter. ckpts/zinc_e1_seed42_kek is a
 #     DIFFERENT base (-94.09057337861941).
+#   * LR=4e-4, NOT the module default 2e-4. docs/zinc_kek_shipping.md has TWO
+#     "(shipped)" markers and they disagree: line 66 marks lr2h256 for the v1.0
+#     aromatic-label grid, line 124 marks lr4h256 for the v1.1 DECODED-label grid, and
+#     line 174 pins it at 4e-4. clogp@1.2.0 is the v1.1 lineage (same weights_hash as
+#     1.1.0, plus a head), so 4e-4 is the matching arm. Taking the first marker is the
+#     trap: a +2.05M-parameter adapter at HALF the shipped LR for the same number of
+#     epochs is the least favourable setting in which to show a mechanism works.
 #   * PROPERTY_FROM=decoded is NOT the module default ("source"). The shipped adapter
 #     used decoded (run_zinc_clogp_adapter_v11_jupiter.sh:54); source gives cond_mean/std
 #     2.458506/1.431754 instead of 2.825129/1.158113, so the adapter would read every
@@ -54,9 +63,16 @@ BASE="ckpts/zinc_kek_base"
 PROPERTY="clogp"
 PROPERTY_FROM="decoded"
 VOCAB="e1_kekulized"
-EPOCHS=20
+# 20 epochs is the MATCHED control (the shipped recipe); 40 with a checkpoint every 10
+# gives that comparison AND the convergence answer in one job. Measured on a near-identical
+# arm on this cluster (adapter_improvements/capacity_results/train_A_base.log): ~10 min per
+# epoch, so 40 epochs is ~7 h of a 16 h wall. Without this, a null result at +75%
+# parameters has two explanations and no way to separate them.
+EPOCHS=40
+CKPT_EVERY_K=10
+EVAL_ETA=25          # module default is 5.0; the shipped run used 25
 HIDDEN=256
-LR=2e-4
+LR=4e-4
 COND_FOURIER=3
 XATTN_TOKENS=8
 XATTN_DIM=128
@@ -75,9 +91,12 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 if [ ! -f "${BASE}.ckpt" ]; then echo "ERROR: ${BASE}.ckpt missing"; exit 1; fi
 
 # ---- preflight: right base, and the new code is actually present here --------
-# "Verify remote, not local": this script may be running against a checkout that
-# predates the feature, in which case the flags below are silently ignored by pycomex
-# and the run trains a PLAIN adapter that would then be reported as xattn+fourier.
+# "Verify remote, not local": this script may be running against a checkout that predates
+# the feature. pycomex registers one argparse argument per module global and hard-exits
+# with status 2 on an unknown --FLAG, so an old checkout CRASHES rather than quietly
+# training a plain adapter -- the preflight is not what stands between us and a
+# mislabelled run. It earns its place for the other checks: base identity, and that the
+# two mechanisms are exact no-ops at init on THIS base.
 $PY - <<PY || { echo "ERROR: preflight failed -- refusing to train"; exit 1; }
 import inspect, sys
 sys.path.insert(0, ".")
@@ -113,7 +132,10 @@ a = AdaLNAdapter.for_base(b, cond_dim=1, hidden=${HIDDEN}, cond_fourier=${COND_F
                           xattn_tokens=${XATTN_TOKENS}, xattn_dim=${XATTN_DIM},
                           xattn_heads=${XATTN_HEADS})
 gate_l1 = sum(float(p.detach().abs().sum()) for lay in a.gate for k in lay for p in lay[k].parameters())
-out_l1 = sum(float(m.out.weight.detach().abs().sum() + m.out.bias.detach().abs().sum()) for m in a.xattn)
+# `a.xattn` exists only when xattn_tokens is truthy, so an ablation arm with
+# XATTN_TOKENS=0 would die here instead of training.
+out_l1 = (sum(float(m.out.weight.detach().abs().sum() + m.out.bias.detach().abs().sum())
+              for m in a.xattn) if ${XATTN_TOKENS} else 0.0)
 print(f"adapter: {sum(p.numel() for p in a.parameters()):,} params "
       f"(gate L1 {gate_l1:.1e}, xattn out L1 {out_l1:.1e} -- both must be 0 at init)")
 if gate_l1 != 0.0 or out_l1 != 0.0:
@@ -135,8 +157,9 @@ $PY -u experiments/adapter_training__zinc.py \
     --XATTN_TOKENS ${XATTN_TOKENS} \
     --XATTN_DIM ${XATTN_DIM} \
     --XATTN_HEADS ${XATTN_HEADS} \
-    --CKPT_EVERY_K 5 \
-    --MAX_TIME_HOURS 8.0 \
+    --ETA ${EVAL_ETA} \
+    --CKPT_EVERY_K ${CKPT_EVERY_K} \
+    --MAX_TIME_HOURS 10.0 \
     --PROBE_EVERY_K 10 \
     --GUIDANCE_WEIGHTS "[2.0]" \
     --N_PER_TARGET 32 \
@@ -151,10 +174,13 @@ echo "training exited ${rc} at $(date)"
 RESULT_DIR=$(ls -td experiments/results/adapter_training__zinc/*/ 2>/dev/null | head -1)
 echo "result dir: ${RESULT_DIR:-<none>}"
 
-$PY - "$RESULT_DIR" "${WANT_MEAN}" "${WANT_STD}" <<'PY'
+$PY - "$RESULT_DIR" "${WANT_MEAN}" "${WANT_STD}" "${COND_FOURIER}" "${XATTN_TOKENS}" <<'PY'
 import glob, os, sys, torch
 sys.path.insert(0, ".")
 d, want_mean, want_std = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+# Read from the launcher instead of hardcoded, so the attribution ablation this
+# experiment's own analysis prescribes (each mechanism alone) can be run with this script.
+want_fourier, want_xattn = int(sys.argv[4]), int(sys.argv[5])
 final = os.path.join(d, "clogp_adapter.ckpt")
 if not os.path.exists(final):
     print(f"FAIL: {final} missing"); sys.exit(1)
@@ -164,13 +190,14 @@ for f in [final] + sorted(glob.glob(os.path.join(d, "clogp_adapter_ep*.ckpt"))):
     cfg, sd = ck["config"], ck["state_dict"]
     m, s = float(sd["cond_mean"][0]), float(sd["cond_std"][0])
     scale_ok = abs(m - want_mean) < 1e-4 and abs(s - want_std) < 1e-4
-    arch_ok = cfg.get("cond_fourier") == 3 and cfg.get("xattn_tokens") == 8
+    arch_ok = (cfg.get("cond_fourier") == want_fourier
+               and cfg.get("xattn_tokens") == want_xattn)
     # A trained adapter whose xattn output projections are still exactly zero learned
     # nothing through that path -- the mechanism would be inert and the run would be
     # reporting a FiLM adapter under a cross-attention label.
     xa = sum(float(v.abs().sum()) for k, v in sd.items()
              if k.startswith("xattn.") and ".out." in k)
-    live = xa > 0.0
+    live = (xa > 0.0) if want_xattn else True
     bad += not (scale_ok and arch_ok and live)
     print(f"{os.path.basename(f):30s} fourier={cfg.get('cond_fourier')} "
           f"xattn={cfg.get('xattn_tokens')} cond=({m:.6f},{s:.6f}) xattn_out_L1={xa:.3e} "
