@@ -24,11 +24,16 @@ marked as inadmissible-as-published.
 
 ## The one-paragraph version
 
+**First, the target moved.** Our own conditional model is at ~0.30, so the 0.52-vs-0.16 gap is really
+two gaps: **0.22 that the adapter design costs us**, and 0.14 of base capacity and training scale
+that no adapter-side change can touch (Part 0). Everything below aims at the 0.22.
+
 Six leads survive the constraints, and the highest-value one is **not architectural**: we own a
-conditional model that beats the adapter, and we are not using it as a teacher. Distilling it into
-the adapter attacks the gap directly, and because the residual distillation error *is* the adapter
-family's own expressiveness floor, it answers PLAN.md's Wave-4b capacity-vs-control question as a
-by-product — the separate "cheating model" oracle does not need to be built. Two cheap architectural
+conditional model that beats the adapter, it is on the right vocabulary, and we are not using it as a
+teacher. Distilling it into the adapter attacks the 0.22 directly — a student's ceiling is its
+teacher, so the lever is exactly the size of the gap — and because the residual distillation error
+*is* the adapter family's own expressiveness floor, it answers PLAN.md's Wave-4b capacity-vs-control
+question as a by-product; the separate "cheating model" oracle does not need to be built. Two cheap architectural
 fixes should ride along regardless, because both are near-free and both are things we would be
 embarrassed to have left undone: the property enters the trunk as **one raw scalar** while flow-time
 gets a 64-dimensional sinusoidal embedding, which is precisely the spectral-bias setup Fourier
@@ -39,19 +44,47 @@ are post-freeze: node-resolved decoupled cross-attention, and the Wave-5 closed 
 
 ---
 
-## Part 0 — Two things I need before this is actionable
+## Part 0 — The gap is two gaps, and only one of them is ours to fix
 
-1. **The in-house conditional number.** Which property, which split, how many targets, and the
-   validity alongside it. Everything below is ranked against "0.52 adapter vs 0.16 FreeGress";
-   if our own conditional model sits at, say, 0.30, the gap being explained is half as large and
-   L4's ceiling moves with it.
-2. **Whether the teacher shares the base's representation.** `experiments/conditional_training__zinc.py`
-   matches the base architecture (`N_LAYERS=9`, `HIDDEN_DIM=256`, `COND_DROP_PROB=0.1`) but shows no
-   `KEKULIZE` / `VOCABULARY` binding, which suggests it predates the kekulized lineage. Distillation
-   requires the teacher and `zinc_kek_base` to agree on atom/bond class **order**, not just on
-   chemistry — the same trap `adapter_training__zinc.py:120-126` already guards against. If the
-   teacher is aromatic-representation, it must be retrained on the kekulized vocabulary first, which
-   moves L4 from ~1 week to ~2 and probably out of the pre-freeze window.
+Both preconditions are **answered** (2026-08-20, from the user):
+
+1. **The in-house conditional model sits at ~0.30 logP MAE** — better than the adapter's 0.52, short
+   of FreeGress's 0.16. *(Approximate, user-reported; exact number, property split and validity to be
+   filled in from the run record before this is quoted anywhere.)*
+2. **The teacher is on the kekulized vocabulary.** It therefore shares `zinc_kek_base`'s atom/bond
+   class order, and distillation is well-posed with no teacher retraining. L4 stays at ~1 week and is
+   **pre-freeze viable**.
+
+The first answer is the more important one, because it splits a number we have been treating as one
+gap into two with completely different causes:
+
+```
+adapter            0.52
+                         ]  0.22   <- what the ADAPTER DESIGN costs.  Ours to fix.
+our conditional    0.30
+                         ]  0.14   <- base capacity / training scale / preprocessing.
+FreeGress          0.16              NOT an adapter problem.
+```
+
+The lower gap is same-data, same-architecture (`N_LAYERS=9`, `HIDDEN_DIM=256`), same vocabulary,
+same harness — the *only* difference is frozen-base-plus-adapter versus trained-conditional. That is
+a clean attribution, and it is the first time we have one.
+
+The upper gap is a different animal: FreeGress trains 16M parameters for 1000 epochs on a
+228k-molecule ZINC with stereochemistry stripped, and operates at ~86% validity where we hold ~99%.
+RESEARCH.md §1 already argued preprocessing cannot explain 0.16 vs 0.52 — but it can plausibly
+explain a good part of 0.16 vs 0.30, and nothing on this document's list attacks it.
+
+**Consequences for everything below.**
+
+- **The realistic target for adapter-side work is 0.30, not 0.16.** The success bar (0.42) is
+  therefore "close half of the adapter-attributable gap", which is a reasonable ask rather than a
+  long shot.
+- **L4's ceiling is exactly the adapter-attributable gap**, because a distilled student's ceiling is
+  its teacher. The lever and the gap are the same size, which is the strongest argument for running
+  it first.
+- Any lead that would need to beat 0.30 is arguing about base capacity, and is out of scope under
+  this note's constraint envelope.
 
 Measured facts this note relies on, read out of `ckpts/logp_adapter_preRL_dBe2.ckpt`:
 `cond_dim=1, n_layers=9, dims={dx:256, de:64, dy:64}, hidden=256, time_emb_dim=64`, **2,747,778
@@ -297,9 +330,9 @@ adapter stays from its teacher on held-out targets — **is** the expressiveness
 diagonal FiLM over this base, measured directly. That is Wave 4b's question, answered without building
 Wave 4b's separate over-capacity oracle.
 
-**Effort** ~1 week if the teacher's vocabulary matches, ~2 if it must be retrained (see Part 0).
-**Odds** 60%. **If it helps** potentially large — this is the only lead whose ceiling is set by the
-teacher rather than by our own architecture.
+**Effort** ~1 week — the teacher is kekulized, so no retraining is needed (Part 0). **Odds** 60%.
+**If it helps** up to 0.52 → 0.30, the whole adapter-attributable gap. This is the only lead whose
+ceiling is set by a model we have already trained rather than by an architectural guess.
 
 ### L5 — Train on the states the adapter actually visits
 
@@ -337,7 +370,7 @@ validity headroom that lets a larger `w` pay off, which compounds with everythin
 
 | # | Lead | Effort | Retrain adapter? | Odds | Ceiling | Pre-freeze? |
 |---|---|---|---|---|---|---|
-| **L4** | **Distil the in-house conditional teacher** | 1–2 wk | yes | **60%** | **large** | yes, if the vocabulary matches |
+| **L4** | **Distil the in-house conditional teacher** | ~1 wk | yes | **60%** | **0.52 → 0.30** | yes |
 | L1 | Fourier-feature the condition | 1 d | yes (cheap) | 40% | small–moderate | yes |
 | L6 | Autoguidance negative branch | hours | **no** | 30% | small | yes |
 | L5 | On-policy states (needs L4) | +3 d | yes | 45% | small–moderate | yes, if L4 lands |
@@ -350,10 +383,11 @@ L5 only if L4 lands. L2 only if the schedule holds after that. L3 and Wave 5 are
 
 **Decision rule on L4 — this is the one that changes the story.**
 
-- **Distilled adapter lands close to the teacher.** The adapter family was never the binding
-  constraint; the *training signal* was. Ship it, and Wave 5 becomes unnecessary rather than merely
-  risky. PLAN.md's strategic note ("we probably cannot beat 0.16 and the paper does not need to")
-  gets weaker in a good way.
+- **Distilled adapter lands close to the teacher (~0.30).** The adapter *family* was never the
+  binding constraint; the *training signal* was. Ship it, and Wave 5 becomes unnecessary rather than
+  merely risky. Note what this would and would not overturn: PLAN.md's "we probably cannot beat 0.16"
+  stands — 0.16 is on the far side of the base-capacity gap — but "frozen-base adapter conditioning
+  plateaus" would be shown to be a statement about how we trained it, not about the design.
 - **Distilled adapter plateaus well short of the teacher.** That residual is the measured
   expressiveness floor of open-loop diagonal FiLM over a frozen base. The honest paper contribution
   is then the characterisation, exactly as PLAN.md argues — but now with a *number* attached instead
