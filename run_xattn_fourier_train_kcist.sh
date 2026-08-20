@@ -132,7 +132,11 @@ a = AdaLNAdapter.for_base(b, cond_dim=1, hidden=${HIDDEN}, cond_fourier=${COND_F
                           xattn_tokens=${XATTN_TOKENS}, xattn_dim=${XATTN_DIM},
                           xattn_heads=${XATTN_HEADS})
 gate_l1 = sum(float(p.detach().abs().sum()) for lay in a.gate for k in lay for p in lay[k].parameters())
-# `a.xattn` exists only when xattn_tokens is truthy, so an ablation arm with
+# NOTE: this heredoc is UNQUOTED, so the shell expands its contents. Keep it free of
+# backticks and of dollar signs other than the intended parameter substitutions -- a
+# backtick in a COMMENT is still command substitution, which is how this file briefly
+# ended up running the string a.xattn as a command.
+# The xattn attribute exists only when xattn_tokens is truthy, so an ablation arm with
 # XATTN_TOKENS=0 would die here instead of training.
 out_l1 = (sum(float(m.out.weight.detach().abs().sum() + m.out.bias.detach().abs().sum())
               for m in a.xattn) if ${XATTN_TOKENS} else 0.0)
