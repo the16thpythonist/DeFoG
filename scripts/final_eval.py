@@ -69,6 +69,12 @@ def main() -> int:
                          "for anything that feeds a SELECTION decision -- picking a "
                          "model by its test numbers is tuning on test, however "
                          "defensible each individual pass looks.")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Torch sampling seed. Protocol section 5 step 4 requires the "
+                         "seed to be reported alongside steps/eta/omega/n, and an "
+                         "unseeded one-shot evaluation cannot be reproduced -- which "
+                         "for a pass that is meant to happen exactly once is the whole "
+                         "ballgame. Recorded in the output record.")
     ap.add_argument("--sweep-dir", default=None,
                     help="Where the frozen config was chosen; recorded for provenance")
     ap.add_argument("--out-dir", required=True)
@@ -96,6 +102,12 @@ def main() -> int:
                 fh.write("\n".join(split.test_scaffolds_smiles) + "\n")
             print(f"wrote test_scaffolds reference "
                   f"({len(split.test_scaffolds_smiles)}) -> {sf_path}", flush=True)
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        print(f"sampling seed {args.seed}", flush=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = DeFoGModel.load(args.ckpt).to(device).eval()
@@ -138,6 +150,7 @@ def main() -> int:
         "frozen_config": {
             "sample_steps": args.sample_steps, "eta": args.eta,
             "omega": args.omega, "time_distortion": args.time_distortion,
+            "seed": args.seed, "num_samples": args.num_samples,
         },
         "chosen_on": "validation",
         "sweep_dir": args.sweep_dir,

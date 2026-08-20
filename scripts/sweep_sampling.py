@@ -81,6 +81,13 @@ def main() -> int:
     ap.add_argument("--eta", default=None)
     ap.add_argument("--omega", default=None)
     ap.add_argument("--time-distortion", default="polydec")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Torch seed for sampling. Two runs of ONE config at "
+                         "different seeds measure the noise floor directly -- their "
+                         "spread is the smallest difference between grid points that "
+                         "can mean anything. Without that, a sweep's winner is "
+                         "whichever point happened to draw well, and there is no way "
+                         "to tell. Recorded in the per-point JSON.")
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
 
@@ -107,6 +114,12 @@ def main() -> int:
         with open(val_path, "w") as fh:
             fh.write("\n".join(val_smiles) + "\n")
         print(f"wrote validation reference ({len(val_smiles)}) -> {val_path}", flush=True)
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        print(f"sampling seed {args.seed}", flush=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = DeFoGModel.load(args.ckpt).to(device).eval()
@@ -145,6 +158,7 @@ def main() -> int:
             "dataset": args.dataset, "ckpt": args.ckpt,
             "sample_steps": n_steps, "eta": eta, "omega": omega,
             "time_distortion": args.time_distortion,
+            "seed": args.seed,
             "num_samples": args.num_samples,
             "sample_seconds": round(sample_s, 1),
             "smiles_file": os.path.basename(out_smi),

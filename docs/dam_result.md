@@ -98,20 +98,73 @@ Four-arm run on both bases (`scratchpad/power.py`, 8 iterations):
 can do -- is 0.94-1.04, i.e. as good as or better than every number in the withdrawn
 table. On the shipped base it is >= 1: even that buys nothing there.
 
+## Coupling and temperature: the hypothesis is falsified
+
+Alg. 1 line 7 was implemented (`_coupled_draws`); `E[a_hat]` on the real model moved
+from 1.042 to 0.989 at lambda=0.3 and holds at 0.976 / 0.967 for lambda = 1.0 / 3.0,
+where the uncoupled estimator diverges. Coupling is also cheaper -- K sub-rollouts
+against K + m, 83 -> 72 s/it. With the bias gone, `lambda` is free to carry
+temperature: `g_spread` scales 0.428 / 1.449 / 4.130 across lambda = 0.3 / 1.0 / 3.0.
+
+The hypothesis was that the bias and the resulting cold temperature were jointly
+suppressing the signal. They were not. Pre-RL base, coupled, simulate candidates,
+K=8, `n_jumps=4`, 12 iterations, median over the last 8, `resid(real) - resid(null)`:
+
+| lambda | lr | diff nodes | diff edges |
+|---|---|---|---|
+| 1.0 | 1e-4 | -0.000 | +0.015 |
+| 1.0 | 3e-4 | -0.010 | -0.010 |
+| 0.3 | 3e-4 | -0.039 | -0.005 |
+
+lambda=1.0 is the WEAKEST configuration measured, despite being the only one with an
+unbiased estimator. Restoring the temperature made the update worse, not better.
+
+## The channel split
+
+The strongest cell was replicated at three trainer seeds (`scripts/seedrep.py`,
+lambda=0.3, lr=3e-4, coupled):
+
+| seed | diff nodes | diff edges |
+|---|---|---|
+| 7 | +0.172 | -0.016 |
+| 43 | -0.013 | -0.026 |
+| 91 | -0.531 | -0.036 |
+| | mean -0.124, sd 0.364, t=-0.59 | **mean -0.026, sd 0.010, t=-4.50** |
+
+**Edges replicate; nodes are noise.** Across all nine paired cells measured -- two
+candidate modes, two temperatures, coupled and uncoupled, three seeds -- the edge
+difference is negative in 8 of 9 and the node difference in 6 of 9 with sign flips and
+36x the spread.
+
+That is a sharper statement than the withdrawn verdict and partly rehabilitates the
+intuition behind it: the x1-parameterisation does bind, but specifically **on the node
+channel**, while edges remain steerable. The original error was pooling the two on a
+contaminated support (see below) and concluding the whole rate family was the obstacle.
+
+### Absolute `resid` has run-to-run scatter of ~0.8
+
+Same nominal cell, trainer seed 42 -> 7: `resid_nodes` goes 1.031 -> 1.837. Every
+absolute figure in the withdrawn table -- 1.057, 1.099, 1.200, 2.113 -- sits inside
+that. The paired differences meanwhile stay within +-0.010 across seeds on edges. The
+null is what absorbs the shared variance; without it nothing at this scale is
+resolvable, which is why no configuration before it produced an interpretable number.
+
 ## Established / not established
 
-**Established.** `resid`'s ceiling is 1.0 and its pass mark was unreachable. Every
-historical cell is reproduced by drift against a near-signal-free target. Against a
-matched null, the adjoint carries directional signal, edge-dominated, with a monotone
-dose-response across three step sizes. `E[a_hat]` is 1.06-1.21 and never 1.
+**Established.** `resid`'s ceiling is 1.0 and its pass mark was unreachable; its
+absolute value has ~0.8 run-to-run scatter and is uninterpretable unpaired. Against a
+matched null the adjoint carries a small, reproducible directional signal **on edges**
+(-0.026 +- 0.010 over three seeds, negative in 8/9 cells) and **none on nodes** (sign
+flips, 36x the spread). Alg. 1's coupling fixes `E[a_hat]` at 1 as specified. Neither
+the coupling nor a restored temperature increases the signal.
 
-**Not established.** That DAM steers DeFoG. A 5% residual reduction is not a property
-shift; no molecules were generated and no logP was measured in any of this. The effect
-is absent on the shipped base (1.001/1.002 at production LR). The `grad x` ratio does
-not replicate across bases (pre-RL 1.3-2.0x, shipped 0.84x) and should not be read as a
-signal detector on its own.
+**Not established.** That DAM steers DeFoG. A 2.6% residual reduction on one channel is
+not a property shift; no molecules were generated and no logP was measured in any of
+this. The effect is absent on the shipped base (1.001/1.002 at production LR). The
+`grad x` ratio does not replicate across bases (pre-RL 1.3-2.0x, shipped 0.84x) and is
+not a signal detector on its own.
 
-## The suppressor worth removing first
+## The suppressor that was removed (and did not help)
 
 DAM Alg. 1 line 7 (PDF p.5): *"Set (Y, Z) as the first and last jumps of one of the
 trajectory X^(k)"* -- `Z` is a **member of the K-candidate denominator set**, which
@@ -138,10 +191,9 @@ it as the cause.
 
 ## Next
 
-1. Implement Alg. 1 line-7 coupling: draw `Y` and `Z` from one of the K trajectories.
-   Verify `E[a_hat] = 1.00` in the null arm before anything else.
-2. Raise `lambda` toward 1.0 once the bias is gone, and re-run the paired sweep.
-3. Only then measure something real -- generated logP against the conditioning target,
+1. ~~Implement Alg. 1 line-7 coupling~~ -- done, `E[a_hat]` = 0.97-1.01 at every lambda.
+2. ~~Raise `lambda` toward 1.0~~ -- done, and it made the update worse.
+3. Measure something real -- generated logP against the conditioning target,
    the way the GDPO and adapter arms are scored. `resid` is a debugging instrument, not
    an outcome, and should never again be the acceptance criterion.
 4. Fix `test_adjoint_is_one_at_y_equals_x` to use the `null_adjoint` path.
