@@ -440,7 +440,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                  candidate_mode: str = "head",
                  head_scale: float = 1.0, head_clamp: float = 3.0,
                  t_sampler: str = "match", debias: str = "snis",
-                 null_adjoint: bool = False,
+                 null_adjoint: bool = False, coupled: bool = False,
                  lr: float = 1e-5, weight_decay: float = 1e-5, ema_decay=0.999,
                  **gdpo_kw):
         super().__init__(base, adapter, cond_reward, ref_adapter=None, kl_coef=0.0,
@@ -472,6 +472,16 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         # the y = x control that `test_adjoint_is_one_at_y_equals_x` was meant to be and
         # is not: that test computes A - A and returns 0.0 for any reward or lambda.
         self.null_adjoint = bool(null_adjoint)
+        # Alg. 1 line 7. Only defined for trajectory candidates: "the first and last
+        # jumps of one of the trajectory" presupposes line 6's trajectories, and the
+        # one-shot head draws Z at y with no path connecting it to the denominator.
+        self.coupled = bool(coupled)
+        if self.coupled and candidate_mode != "simulate":
+            raise ValueError(
+                "coupled=True implements DAM Alg. 1 line 7, which takes (Y, Z) from "
+                "one of line 6's model trajectories; it is undefined for "
+                f"candidate_mode={candidate_mode!r}. Use candidate_mode='simulate'."
+            )
         self.n_jumps = int(n_jumps)
         # The adjoint's terminal loss. RDKit floors every undecodable graph at the
         # same value, and 84-98% of the head's one-shot draws are undecodable at the
@@ -525,6 +535,63 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                                time_distortion=self.time_distortion,
                                eta=self.eta, omega=0.0,
                                composition=self._composition(cr))
+
+    def _coupled_draws(self, uX, uE, X_t, E_t, nm, cond, t_int):
+        """DAM Alg. 1 lines 6-7: (Y, Z) are the first and last jumps of ONE trajectory.
+
+        Line 6 samples K model trajectories from ``X_t``; line 7 sets ``(Y, Z)`` as the
+        first and last jumps of one of them. ``Z`` is therefore a MEMBER of the
+        K-sample denominator set, and because the trajectory is chosen uniformly,
+        ``E[a_hat | trajectories] = 1`` EXACTLY -- the numerator is one term of the
+        mean that divides it.
+
+        That identity is the whole point. The uncoupled path drew ``Y`` from the rate
+        at ``X_t`` and then simulated a FRESH ``Z`` from ``X_Y``, making numerator and
+        denominator independent draws; measured on the real model that ran
+        ``E[a_hat]`` at 1.06-1.21, and ``dam_lambda`` was pinned at 0.3 to suppress it
+        (`dam_design.md:244`). Since lambda is the only knob that puts spread into
+        ``g``, every measurement before this was taken at a third of the intended
+        temperature to buy off a bias the paper removes for free.
+
+        ``null_adjoint`` picks Z's trajectory independently of Y's. BOTH arms then
+        satisfy ``E[a_hat] = 1``; they differ only in whether Z's path is the one that
+        passed through Y -- which is exactly the value-function difference
+        ``V(x) - V(y)`` the adjoint exists to estimate. That makes the null a clean
+        one-factor control rather than a differently-biased estimator.
+
+        Cost is K sub-rollouts, against the uncoupled path's K + m, so coupling is
+        cheaper as well as unbiased.
+        """
+        K, bs = self.dam_k, X_t.shape[0]
+        m = min(self.n_jumps, K)
+        dev = X_t.device
+        nmk, ck = nm.repeat(K, 1), cond.repeat(K, 1)
+
+        # One CTMC jump per trajectory, from the policy rate -- Alg. 1's p^ubar.
+        lp_a, pk_a, XY_a, EY_a = sample_jump(
+            uX.detach().repeat(K, 1, 1), uE.detach().repeat(K, 1, 1, 1),
+            X_t.repeat(K, 1, 1), E_t.repeat(K, 1, 1, 1), nmk)
+        # ...then each trajectory runs to t=1. Its endpoint serves as a denominator
+        # sample for every state, and as the numerator's Z for the chosen one.
+        s1X, s1E = self._simulate_endpoints(XY_a, EY_a, nmk, ck, t_int, 1)
+        g_a = self._terminal_loss(s1X, s1E, nmk, ck)
+        g_X1 = g_a.view(K, bs).t().contiguous()
+        lr_X1 = torch.zeros_like(g_X1)          # ratios are 1: Prop 2.3 / Eq. (12)
+
+        # Both index draws happen unconditionally so the RNG stream is bit-identical
+        # between the real and null arms; only which one Z reads differs.
+        w = torch.ones(bs, K)
+        sel_y = torch.multinomial(w, m, replacement=m > K)
+        sel_z_free = torch.multinomial(w, m, replacement=m > K)
+        sel_z = sel_z_free if self.null_adjoint else sel_y
+        ar = torch.arange(bs, device=dev)
+        iy = (sel_y.t().to(dev) * bs + ar[None, :]).reshape(-1)
+        iz = (sel_z.t().to(dev) * bs + ar[None, :]).reshape(-1)
+
+        g_Z = g_a[iz]
+        return (lp_a[iy], pk_a[iy], XY_a[iy], EY_a[iy], g_Z,
+                torch.zeros_like(g_Z), g_X1, lr_X1,
+                float(g_X1.std(dim=-1).mean()), m)
 
     # ------------------------------------------------------------- helpers
     def _composed(self, adapter, noisy, extra, nm, cond, puX, puE):
@@ -644,60 +711,69 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
             bX, bE = marginal_rate(refX.exp(), refE.exp(), BX, BE)
 
         with torch.no_grad():
-            # --- K clean draws at x: the self-normalised second factor -------------
-            if self.candidate_mode == "simulate":
-                # DAM Alg. 1 line 6: K model TRAJECTORIES from X_t. The importance
-                # ratio is left at 1 -- that is Prop 2.3 / Eq. (12), the "original AM
-                # recipe" the paper names as the alternative to Eq. (13), and it needs
-                # no path likelihoods. Bias reduces over training.
-                K = self.dam_k
-                sX, sE = self._simulate_endpoints(X_t, E_t, nm, cond, t_int, K)
-                gk = self._terminal_loss(sX, sE, nm.repeat(K, 1), cond.repeat(K, 1))
-                g_X1 = gk.view(K, -1).t().contiguous()
-                lr_X1 = torch.zeros_like(g_X1)
+            if self.coupled:
+                # DAM Alg. 1 lines 6-7 with (Y, Z) drawn from ONE trajectory; see
+                # _coupled_draws. The `else` below is the uncoupled path, which
+                # draws Y and Z independently and so carries an E[a_hat] bias.
+                (logp_y, pick, X_Y, E_Y, g_Z, lr_Z, g_X1, lr_X1,
+                 g_spread, m) = self._coupled_draws(uX, uE, X_t, E_t, nm,
+                                                    cond, t_int)
+                nm_r, cond_r = nm.repeat(m, 1), cond.repeat(m, 1)
             else:
-                lrs, gs = [], []
-                for _ in range(self.dam_k):
-                    X1, E1 = self._draw_clean(polX, polE, nm)
-                    lrs.append(self._log_ratio(refX, refE, polX, polE, X1, E1, nm))
-                    gs.append(self._terminal_loss(X1, E1, nm, cond))
-                lr_X1 = torch.stack(lrs, -1)
-                g_X1 = torch.stack(gs, -1)
-            g_spread = float(g_X1.std(dim=-1).mean())   # 0 => the adjoint is blind
+                # --- K clean draws at x: the self-normalised second factor -------------
+                if self.candidate_mode == "simulate":
+                    # DAM Alg. 1 line 6: K model TRAJECTORIES from X_t. The importance
+                    # ratio is left at 1 -- that is Prop 2.3 / Eq. (12), the "original AM
+                    # recipe" the paper names as the alternative to Eq. (13), and it needs
+                    # no path likelihoods. Bias reduces over training.
+                    K = self.dam_k
+                    sX, sE = self._simulate_endpoints(X_t, E_t, nm, cond, t_int, K)
+                    gk = self._terminal_loss(sX, sE, nm.repeat(K, 1), cond.repeat(K, 1))
+                    g_X1 = gk.view(K, -1).t().contiguous()
+                    lr_X1 = torch.zeros_like(g_X1)
+                else:
+                    lrs, gs = [], []
+                    for _ in range(self.dam_k):
+                        X1, E1 = self._draw_clean(polX, polE, nm)
+                        lrs.append(self._log_ratio(refX, refE, polX, polE, X1, E1, nm))
+                        gs.append(self._terminal_loss(X1, E1, nm, cond))
+                    lr_X1 = torch.stack(lrs, -1)
+                    g_X1 = torch.stack(gs, -1)
+                g_spread = float(g_X1.std(dim=-1).mean())   # 0 => the adjoint is blind
 
-            # --- m jump targets, evaluated in ONE batched forward -----------------
-            # Eq. (11) is a single-sample estimate of Eq. (14)'s sum over ~n*dx +
-            # n^2/2*de reachable y -- about 3.2k at n=38. One draw per state makes
-            # each gradient step fit a different randomly chosen coordinate, and the
-            # residual diagnostic read at that same single y is equally noisy
-            # (measured bouncing over 0.8-12.8 across iterations). Averaging m draws
-            # is the same estimator with m samples instead of 1; the extra cost is
-            # one forward on an m-times-larger batch, not m forwards.
-            jumps = [sample_jump(uX.detach(), uE.detach(), X_t, E_t, nm)
-                     for _ in range(self.n_jumps)]
-            logp_y = torch.cat([j[0] for j in jumps])
-            pick = torch.cat([j[1] for j in jumps])
-            X_Y = torch.cat([j[2] for j in jumps])
-            E_Y = torch.cat([j[3] for j in jumps])
-            m = self.n_jumps
-            t_r = t.repeat(m, 1)
-            nm_r = nm.repeat(m, 1)
-            cond_r = cond.repeat(m, 1)
+                # --- m jump targets, evaluated in ONE batched forward -----------------
+                # Eq. (11) is a single-sample estimate of Eq. (14)'s sum over ~n*dx +
+                # n^2/2*de reachable y -- about 3.2k at n=38. One draw per state makes
+                # each gradient step fit a different randomly chosen coordinate, and the
+                # residual diagnostic read at that same single y is equally noisy
+                # (measured bouncing over 0.8-12.8 across iterations). Averaging m draws
+                # is the same estimator with m samples instead of 1; the extra cost is
+                # one forward on an m-times-larger batch, not m forwards.
+                jumps = [sample_jump(uX.detach(), uE.detach(), X_t, E_t, nm)
+                         for _ in range(self.n_jumps)]
+                logp_y = torch.cat([j[0] for j in jumps])
+                pick = torch.cat([j[1] for j in jumps])
+                X_Y = torch.cat([j[2] for j in jumps])
+                E_Y = torch.cat([j[3] for j in jumps])
+                m = self.n_jumps
+                t_r = t.repeat(m, 1)
+                nm_r = nm.repeat(m, 1)
+                cond_r = cond.repeat(m, 1)
 
-            # Under the null the numerator is evaluated at x, not at y (see __init__).
-            Z_at_X, Z_at_E = ((X_t.repeat(m, 1, 1), E_t.repeat(m, 1, 1, 1))
-                              if self.null_adjoint else (X_Y, E_Y))
-            if self.candidate_mode == "simulate":
-                Z_X, Z_E = self._simulate_endpoints(Z_at_X, Z_at_E, nm_r, cond_r, t_int, 1)
-                g_Z = self._terminal_loss(Z_X, Z_E, nm_r, cond_r)
-                lr_Z = torch.zeros_like(g_Z)
-            else:
-                pY, pYE, noisyY, extraY = _base_uncond_softmax(base, Z_at_X, Z_at_E, t_r, nm_r)
-                polYX, polYE = self._composed(self.adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
-                refYX, refYE = self._composed(self.ref_adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
-                Z_X, Z_E = self._draw_clean(polYX, polYE, nm_r)
-                lr_Z = self._log_ratio(refYX, refYE, polYX, polYE, Z_X, Z_E, nm_r)
-                g_Z = self._terminal_loss(Z_X, Z_E, nm_r, cond_r)
+                # Under the null the numerator is evaluated at x, not at y (see __init__).
+                Z_at_X, Z_at_E = ((X_t.repeat(m, 1, 1), E_t.repeat(m, 1, 1, 1))
+                                  if self.null_adjoint else (X_Y, E_Y))
+                if self.candidate_mode == "simulate":
+                    Z_X, Z_E = self._simulate_endpoints(Z_at_X, Z_at_E, nm_r, cond_r, t_int, 1)
+                    g_Z = self._terminal_loss(Z_X, Z_E, nm_r, cond_r)
+                    lr_Z = torch.zeros_like(g_Z)
+                else:
+                    pY, pYE, noisyY, extraY = _base_uncond_softmax(base, Z_at_X, Z_at_E, t_r, nm_r)
+                    polYX, polYE = self._composed(self.adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
+                    refYX, refYE = self._composed(self.ref_adapter, noisyY, extraY, nm_r, cond_r, pY, pYE)
+                    Z_X, Z_E = self._draw_clean(polYX, polYE, nm_r)
+                    lr_Z = self._log_ratio(refYX, refYE, polYX, polYE, Z_X, Z_E, nm_r)
+                    g_Z = self._terminal_loss(Z_X, Z_E, nm_r, cond_r)
 
             log_a, clamp_frac = discrete_adjoint(lr_Z, g_Z, lr_X1.repeat(m, 1),
                                                  g_X1.repeat(m, 1),

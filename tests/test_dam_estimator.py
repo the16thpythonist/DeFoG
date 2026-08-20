@@ -212,24 +212,77 @@ def test_gate_rejects_mistranscribed_adjoints(bug):
 
 
 # ================================================================ the y = x control
-def test_adjoint_is_one_at_y_equals_x():
-    """The health metric section 8.5 calls for: when y = x the true adjoint is exactly
-    1, so log a_hat must sit at 0 up to estimator noise. This is what separates
-    'lambda is too hot' from 'the reward is doing work', and unlike the clamp fraction
-    it is not zero by construction."""
-    p_base, gvec = _problem(lam=0.3)
+def test_uncoupled_adjoint_is_biased_high():
+    """The UNCOUPLED estimator does not satisfy E[a_hat] = 1, and the bias grows with
+    lambda. This is the defect Alg. 1 line 7 removes.
+
+    This test replaces an earlier "y = x control" that computed `A - A` and returned
+    0.0 for any reward, any lambda and any model -- inert, and the reason a run at 1/3
+    the intended temperature went unnoticed. Its docstring claimed it was "not zero by
+    construction"; it was.
+    """
     torch.manual_seed(SEED)
-    idx = torch.multinomial(p_base, 100_000, replacement=True)
-    ratio = torch.zeros_like(gvec[idx])                      # p_theta = p_base
-    # y = x: the first factor is the same expectation as the second
-    log_a, frac = discrete_adjoint(
-        estimate_neg_value(ratio, gvec[idx]).reshape(1),
-        torch.zeros(1),
-        ratio.unsqueeze(0),
-        gvec[idx].unsqueeze(0),
+    # At PRODUCTION K. The bias is a Jensen gap between E[num]/E[den] and
+    # E[num]*E[1/den], so it is O(1/K) and vanishes for a large denominator set --
+    # measuring it at K=512 would show nothing. K=12 is what the runs used.
+    Kp, N = 12, 20_000
+    prev = 0.0
+    for lam, floor in ((0.3, 1.01), (1.0, 1.05), (3.0, 1.3)):
+        p_base, gvec = _problem(lam=lam)
+        idx = torch.multinomial(p_base, N * Kp, replacement=True).view(N, Kp)
+        g_den = gvec[idx]                                    # (N, K) denominator set
+        # Numerator drawn INDEPENDENTLY of the K denominator samples.
+        g_num = gvec[torch.multinomial(p_base, N, replacement=True)]
+        z = torch.zeros_like(g_den)
+        log_a, _ = discrete_adjoint(torch.zeros_like(g_num), g_num, z, g_den,
+                                    clamp=50.0)
+        got = float(log_a.exp().mean())
+        assert got > floor, f"lambda={lam}: expected E[a_hat] > {floor}, got {got:.4f}"
+        assert got > prev, "the bias must grow with lambda -- that is why lambda was pinned"
+        prev = got
+
+
+def test_coupled_adjoint_is_exactly_one():
+    """DAM Alg. 1 line 7: (Y, Z) are the first and last jumps of ONE of the K
+    trajectories, so Z is a MEMBER of the denominator set. With the trajectory chosen
+    uniformly the numerator is one term of the mean that divides it, and
+    E[a_hat | trajectories] = 1 identically -- for ANY reward and ANY lambda.
+
+    Checked at lambda = 1.0 and 3.0, where the uncoupled estimator above is badly
+    biased. This is what frees lambda to carry temperature.
+    """
+    torch.manual_seed(SEED)
+    for lam in (0.3, 1.0, 3.0):
+        p_base, gvec = _problem(lam=lam)
+        Kp, N = 12, 20_000                               # production K, where the
+        idx = torch.multinomial(p_base, N * Kp,              # uncoupled bias is worst
+                                replacement=True).view(N, Kp)
+        g_den = gvec[idx]                                    # (N, K)
+        pick = torch.randint(0, Kp, (g_den.shape[0],))       # uniform trajectory
+        g_num = g_den.gather(1, pick[:, None]).squeeze(1)    # Z IS a member
+        z = torch.zeros_like(g_den)
+        log_a, _ = discrete_adjoint(torch.zeros_like(g_num), g_num, z, g_den,
+                                    clamp=50.0)
+        # Exact in expectation; the residual is Monte-Carlo over `pick` only.
+        got = float(log_a.exp().mean())
+        assert abs(got - 1.0) < 0.05, f"lambda={lam}: E[a_hat]={got:.4f}, want 1.00"
+        # ...and exactly 1 when the selection is averaged rather than sampled.
+        per = (-g_den).exp()
+        assert torch.allclose((per / per.mean(1, keepdim=True)).mean(1),
+                              torch.ones(g_den.shape[0]), atol=1e-4)
+
+
+def test_coupled_requires_trajectory_candidates():
+    """Line 7 presupposes line 6's trajectories; it is undefined for the one-shot
+    head, whose Z at y has no path connecting it to the denominator set at x."""
+    import inspect
+
+    from defog.core.dam import AdapterDAMTrainer
+
+    src = inspect.getsource(AdapterDAMTrainer.__init__)
+    assert 'coupled and candidate_mode != "simulate"' in src, (
+        "the guard refusing coupled=True with head candidates has gone missing"
     )
-    assert abs(float(log_a)) < 0.05, f"y=x control gave log E[a_hat] = {float(log_a):+.4f}"
-    assert frac == 0.0
 
 
 def test_clamp_fraction_is_zero_when_lambda_times_span_fits():
