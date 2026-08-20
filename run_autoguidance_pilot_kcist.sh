@@ -190,13 +190,14 @@ echo "finished at $(date)"
 
 echo
 echo "=== autoguidance pilot: validity headroom as w rises ==="
-$PY - "$OUT" <<'PY'
+$PY - "$OUT" "${NAMES[@]}" <<'PY'
 import json, os, sys
 import numpy as np
 
-OUT = sys.argv[1]
-EXPECT = ["cfg_w2", "cfg_w3", "cfg_w4", "ag_w2", "ag_w3", "ag_w4",
-          "cfg_w3_s43", "ag_w3_s43"]
+# EXPECT comes from the NAMES array itself rather than a second hardcoded list: an arm
+# added to NAMES but forgotten here would be silently omitted from the table, which is
+# the exact failure the MISSING ARMS banner exists to prevent.
+OUT, EXPECT = sys.argv[1], sys.argv[2:]
 rows, missing = {}, []
 for n in EXPECT:
     f = os.path.join(OUT, n + ".json")
@@ -238,12 +239,24 @@ def paired(a, b):
         return None                      # not the same targets: pairing is invalid
     dm = np.array([y["mae"] - x["mae"] for x, y in zip(ra, rb)], dtype=float)
     dv = np.array([y["validity"] - x["validity"] for x, y in zip(ra, rb)], dtype=float)
+    # DO NOT mask dv by dm's finiteness. e2_targeting.py writes mae=NaN for a target
+    # where an arm produced ZERO valid molecules -- and those are exactly the targets
+    # this experiment is about. Measured on the real w-sweep: 0 such targets at w=1/2/3,
+    # 7 of 100 at w=4, 78 of 100 at w=6. If autoguidance rescues a target where CFG
+    # collapsed to 0/10, that target carries the LARGEST positive dv in the sample; the
+    # old `dv[np.isfinite(dm)]` deleted precisely those, turning a clean win into a
+    # clean null with a zero standard error. Validity is always finite -- 0/10 is 0.0,
+    # not NaN -- so dv needs no mask at all.
     ok = np.isfinite(dm)
-    return dm[ok], dv[ok]
+    return dm[ok], dv, int(ok.sum())
+
+def _se(x):
+    return x.std(ddof=1) / np.sqrt(len(x)) if len(x) > 1 else float("nan")
 
 print()
-print("PAIRED per-target difference (autoguidance - CFG), same 30 targets:")
-print(f"{'w':>5s}{'dMAE':>10s}{'se':>8s}{'ag<cfg':>9s}{'dvalid':>10s}{'se':>8s}{'n':>5s}")
+print("PAIRED per-target difference (autoguidance - CFG), same targets:")
+print(f"{'w':>5s}{'dMAE':>10s}{'se':>8s}{'ag<cfg':>11s}{'n_mae':>7s}"
+      f"{'dvalid':>10s}{'se':>8s}{'n_val':>7s}{'dead':>6s}")
 for w in ("2", "3", "4"):
     c, a = rows.get(f"cfg_w{w}"), rows.get(f"ag_w{w}")
     if not (c and a):
@@ -252,10 +265,16 @@ for w in ("2", "3", "4"):
     if pr is None:
         print(f"{w:>5s}  targets differ between arms -- cannot pair (check seed/--n-targets)")
         continue
-    dm, dv = pr
-    print(f"{w:>5s}{dm.mean():>+10.4f}{dm.std(ddof=1)/np.sqrt(len(dm)):>8.4f}"
-          f"{int((dm < 0).sum()):>6d}/{len(dm):<3d}"
-          f"{dv.mean():>+10.4f}{dv.std(ddof=1)/np.sqrt(len(dv)):>8.4f}{len(dm):>5d}")
+    dm, dv, n_mae = pr
+    dead = len(dv) - n_mae            # targets where SOME arm produced nothing at all
+    print(f"{w:>5s}{dm.mean():>+10.4f}{_se(dm):>8.4f}"
+          f"{str(int((dm < 0).sum())) + '/' + str(len(dm)):>11s}{n_mae:>7d}"
+          f"{dv.mean():>+10.4f}{_se(dv):>8.4f}{len(dv):>7d}{dead:>6d}")
+    if dead:
+        print(f"       ^ {dead} target(s) had an arm produce 0 valid molecules. dMAE is "
+              f"computed on the OTHER {n_mae} -- a strictly easier subset -- while "
+              f"dvalidity covers all {len(dv)}. The two columns describe different "
+              f"targets at this w; read dvalidity as the honest one.")
 
 # Kept, but labelled as what it is: an UNPAIRED spread over a different target draw.
 print()
@@ -266,6 +285,10 @@ for arm in ("cfg", "ag"):
               f"on noise): dMAE {abs(a['mae_pooled']-b['mae_pooled']):.4f}  "
               f"dvalidity {abs(a['validity']-b['validity']):.4f}")
 
+print()
+print("NOTE: the table's MAE is molecule-weighted (pooled over all generated molecules)")
+print("while the paired dMAE is target-weighted. Where per-target valid counts vary a")
+print("lot -- which is the whole point at high w -- the two can disagree in sign.")
 print()
 print("READING THIS. Judge the cfg-vs-ag contrast against the PAIRED standard errors")
 print("above, not against the seed-42-vs-43 spread -- that spread is inflated by the")

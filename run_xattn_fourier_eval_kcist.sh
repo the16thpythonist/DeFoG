@@ -145,14 +145,24 @@ if missing:
 if not rows:
     print("no result files at all"); sys.exit(1)
 
+# "dead" = targets where the arm produced ZERO valid molecules. Those rows carry
+# mae=NaN, so they are silently absent from every MAE number in this table while still
+# counting in validity. On the shipped adapter's own w-sweep that count is 0 at w=1/2/3
+# and 7 of 100 at w=4 -- so a high-w arm can post a respectable MAE precisely because
+# its hardest targets contributed nothing to it. Printed, not left to be discovered.
+import math
 print(f"{'arm':9s}{'w':>5s}{'seed':>6s}{'MAE':>9s}{'low':>8s}{'mid':>8s}{'high':>8s}"
-      f"{'valid':>8s}{'uniq':>8s}")
+      f"{'valid':>8s}{'uniq':>8s}{'dead':>6s}")
 for n in EXPECT:
     if n not in rows: continue
     d = rows[n]
+    dead = sum(1 for r in d["per_target"] if not math.isfinite(r["mae"]))
     print(f"{n:9s}{d['sampling']['weight']:>5.1f}{d['seed']:>6d}{d['mae_pooled']:>9.4f}"
           f"{d['mae_low_third']:>8.4f}{d['mae_mid_third']:>8.4f}{d['mae_high_third']:>8.4f}"
-          f"{d['validity']:>8.3f}{d['uniqueness']:>8.3f}")
+          f"{d['validity']:>8.3f}{d['uniqueness']:>8.3f}{dead:>6d}")
+    if dead:
+        print(f"{'':9s}^ {dead}/{len(d['per_target'])} targets produced 0 valid molecules; "
+              f"this arm's MAE describes only the other {len(d['per_target'])-dead}.")
 
 a, b = rows.get("w2"), rows.get("w2_s43")
 spread = abs(a["mae_pooled"] - b["mae_pooled"]) if (a and b) else None
