@@ -28,19 +28,23 @@ marked as inadmissible-as-published.
 two gaps: **0.22 that the adapter design costs us**, and 0.14 of base capacity and training scale
 that no adapter-side change can touch (Part 0). Everything below aims at the 0.22.
 
-Six leads survive the constraints, and the highest-value one is **not architectural**: we own a
-conditional model that beats the adapter, it is on the right vocabulary, and we are not using it as a
-teacher. Distilling it into the adapter attacks the 0.22 directly — a student's ceiling is its
-teacher, so the lever is exactly the size of the gap — and because the residual distillation error
-*is* the adapter family's own expressiveness floor, it answers PLAN.md's Wave-4b capacity-vs-control
-question as a by-product; the separate "cheating model" oracle does not need to be built. Two cheap architectural
-fixes should ride along regardless, because both are near-free and both are things we would be
-embarrassed to have left undone: the property enters the trunk as **one raw scalar** while flow-time
-gets a 64-dimensional sinusoidal embedding, which is precisely the spectral-bias setup Fourier
-features exist to fix; and our modulation is **diagonal**, which a per-sample low-rank term
-generalises for ~+8% adapter parameters with the zero-init exact-no-op preserved. Two further leads
-are post-freeze: node-resolved decoupled cross-attention, and the Wave-5 closed loop — for which the
-2026 discrete-diffusion literature **contradicts one item our current spec marks "non-negotiable."**
+**Two leads were rejected on review and one is free.** Distillation from our own conditional model
+(L4) had the best MAE ceiling on paper and is **out**: it needs a full conditional model trained per
+property, which inverts the cost argument the adapter design exists to make. L5 depended on it and
+goes with it. What is left is cheaper and better-targeted anyway.
+
+**Three things to run before the freeze.** The property enters the trunk as **one raw scalar** while
+flow-time gets a 64-dimensional sinusoidal embedding — precisely the spectral-bias setup Fourier
+features exist to fix, and one day of work (L1). Our modulation is **diagonal**, and a per-sample
+low-rank term generalises it for ~+8% adapter parameters with the zero-init exact-no-op preserved
+(L2). And the guidance negative branch can be a *weak adapter* instead of the unconditional base,
+which costs hours because the checkpoints already exist (L6). L1 and L2 double as the capacity probe
+that L4's diagnostic would have provided: if adding condition bandwidth and modulation rank move the
+number, the family had headroom; if neither does, the open-loop diagnosis is what is left standing.
+
+**Two are post-freeze:** node-resolved decoupled cross-attention (L3) — the only option that attacks
+the open-loop diagnosis head-on — and the Wave-5 closed loop, for which the 2026 discrete-diffusion
+literature **contradicts one item our current spec marks "non-negotiable."**
 
 ---
 
@@ -51,9 +55,10 @@ Both preconditions are **answered** (2026-08-20, from the user):
 1. **The in-house conditional model sits at ~0.30 logP MAE** — better than the adapter's 0.52, short
    of FreeGress's 0.16. *(Approximate, user-reported; exact number, property split and validity to be
    filled in from the run record before this is quoted anywhere.)*
-2. **The teacher is on the kekulized vocabulary.** It therefore shares `zinc_kek_base`'s atom/bond
-   class order, and distillation is well-posed with no teacher retraining. L4 stays at ~1 week and is
-   **pre-freeze viable**.
+2. **The teacher is on the kekulized vocabulary.** It shares `zinc_kek_base`'s atom/bond class order,
+   so distillation would have been well-posed with no teacher retraining. It is rejected on other
+   grounds (see L4) — but this means the *diagnostic* form of it remains available at ~1 week if we
+   ever want it.
 
 The first answer is the more important one, because it splits a number we have been treating as one
 gap into two with completely different causes:
@@ -80,9 +85,8 @@ explain a good part of 0.16 vs 0.30, and nothing on this document's list attacks
 - **The realistic target for adapter-side work is 0.30, not 0.16.** The success bar (0.42) is
   therefore "close half of the adapter-attributable gap", which is a reasonable ask rather than a
   long shot.
-- **L4's ceiling is exactly the adapter-attributable gap**, because a distilled student's ceiling is
-  its teacher. The lever and the gap are the same size, which is the strongest argument for running
-  it first.
+- **0.30 is the number to quote as the adapter's target**, not 0.16, in the paper as well as in
+  planning. It is the fairer comparison and we are the ones who can make it.
 - Any lead that would need to beat 0.30 is arguing about base capacity, and is out of scope under
   this note's constraint envelope.
 
@@ -296,7 +300,25 @@ needs its own test.
 **Effort** ~2 weeks. **Odds** 45% — the highest of the architectural options, and the only one that
 addresses the diagnosis head-on. **Post-freeze.**
 
-### L4 — Distil our own conditional model into the adapter ★
+### L4 — Distil our own conditional model into the adapter — **REJECTED as a shipping path**
+
+> **Rejected 2026-08-20, and correctly.** Distillation requires a trained full conditional model
+> *per property*, then an adapter on top. That is strictly more expensive than just training the
+> conditional model, and the entire reason the adapter design exists is that adding a property must
+> be cheap and must not require touching or retraining a full model. I ranked this lead #1 on the
+> strength of its MAE ceiling and failed to check it against the product constraint the project is
+> built around. Composability and hot-swapping would survive; the cost argument — the main one —
+> would not.
+>
+> **What survives is the diagnostic, and only if it is judged worth a week.** The teacher already
+> exists and is on the right vocabulary, so running the distillation *once*, on logP, costs no new
+> conditional training. Its residual measures the expressiveness floor of open-loop diagonal FiLM
+> over this base. That is Wave 4b's question. If that answer is not worth a week, drop this section
+> entirely and get the same signal more cheaply from L1 and L2: if adding condition bandwidth and
+> modulation rank move the number, the family had headroom; if neither does, the open-loop diagnosis
+> is what is left standing.
+>
+> The mechanism is retained below **only** as the spec for that one diagnostic run.
 
 **Change.** Replace (or mix into) `AdapterModule`'s CE-against-one-hot with a KL against the
 **teacher's predicted clean-graph marginals** at the same `(G_t, t, c)`:
@@ -308,7 +330,7 @@ L = KL( p_teacher(·|G_t,c) ‖ p_adapter(·|G_t,c) )      on X and on E, masked
 The teacher is frozen and runs no-grad, so the step cost is one extra forward — the same overhead
 `GroundedAdapterModule` already pays.
 
-**Why this is the headline lead.** Every other item on this list tries to make the adapter *discover*
+**Why it would have worked, for the record.** Every other item on this list tries to make the adapter *discover*
 the conditional structure from a cross-entropy signal against a single sampled molecule. We already
 have a model that has discovered it. CE-against-one-hot is a high-variance, low-information target;
 the teacher's full conditional distribution is dense supervision at every node and edge, and it
@@ -334,21 +356,25 @@ Wave 4b's separate over-capacity oracle.
 **If it helps** up to 0.52 → 0.30, the whole adapter-attributable gap. This is the only lead whose
 ceiling is set by a model we have already trained rather than by an architectural guess.
 
-### L5 — Train on the states the adapter actually visits
+### L5 — Train on the states the adapter actually visits — **DEAD, it depended on L4**
 
-**Change.** Fine-tune the adapter on `(G_t, t, c)` drawn from its **own** guided rollouts instead of
-from `base._apply_noise` on real data. Requires a target that is defined at arbitrary states — which
-is exactly what L4's teacher provides, so **L5 only makes sense stacked on L4**. With a CE-against-data
-target it is not even well-posed: at a self-generated state there is no true clean graph to score
-against.
+Fine-tuning on `(G_t, t, c)` drawn from the adapter's own guided rollouts needs a target defined at
+*arbitrary* states. Training against the data, which is the standard and correct flow-matching
+protocol, gives a target only at forward-noised states: at a self-generated state there is no true
+clean graph to score against. A teacher supplies one; nothing else here does. **L4 is out, so L5 is
+out.**
 
-**We already own the machinery.** `defog/core/renoise.py` draws states at chosen noise levels, `rl.py`
-has the rollout loop, and RAM was built precisely to score at re-noised rather than trajectory states.
-The cheapest form is a second phase: train with L4 on forward-noised states, then fine-tune on cached
-rollout states with the same loss.
+**Why the underlying observation was not arbitrary, though it changes nothing now.** The forward-noised
+training distribution is the right one *for the model being trained* — if the model is exact, the states
+it visits at sampling time are distributed exactly as the forward kernel says. That correspondence is
+what justifies the protocol. **Guidance breaks it.** At w=2 we do not sample from the learned marginal;
+we sample from a tilted version of it, and the guided sampler visits states the training distribution
+under-weights. AGD's contribution is noticing that gap and closing it. We cannot close it without a
+target at those states, so we live with it — but it is a known cost of guidance, not a flaw in the
+protocol.
 
-**Effort** ~3 days on top of L4. **Odds** 45% conditional on L4 being built. **If it helps** small
-to moderate; AGD frames this as the difference between their method working and prior work not.
+The teacher-free version of "train on your own samples with a signal that is not the data" is a reward,
+not a target — which is `defog/core/rl.py`, already built and already shipped.
 
 ### L6 — Autoguidance negative branch *(one eval run, no training)*
 
@@ -370,30 +396,35 @@ validity headroom that lets a larger `w` pay off, which compounds with everythin
 
 | # | Lead | Effort | Retrain adapter? | Odds | Ceiling | Pre-freeze? |
 |---|---|---|---|---|---|---|
-| **L4** | **Distil the in-house conditional teacher** | ~1 wk | yes | **60%** | **0.52 → 0.30** | yes |
+| L6 | Autoguidance negative branch | hours | **no** | 30% | small | yes — run first |
 | L1 | Fourier-feature the condition | 1 d | yes (cheap) | 40% | small–moderate | yes |
-| L6 | Autoguidance negative branch | hours | **no** | 30% | small | yes |
-| L5 | On-policy states (needs L4) | +3 d | yes | 45% | small–moderate | yes, if L4 lands |
-| L2 | Conditional low-rank modulation | 4–5 d | yes | 35% | moderate | borderline |
+| L2 | Conditional low-rank modulation | 4–5 d | yes | 35% | moderate | yes |
 | L3 | Decoupled cross-attention | ~2 wk | yes | 45% | moderate–large | **no** |
+| ~~L4~~ | ~~Distil the conditional teacher~~ | — | — | — | — | **rejected** — inverts the cost argument |
+| ~~L5~~ | ~~On-policy states~~ | — | — | — | — | **dead** — depended on L4 |
 
-**Run order.** L6 today (it is an eval, not a build). L1 and L4 in parallel — they touch different
-files and their effects are independent, so a 2×2 is affordable and tells us whether they compose.
-L5 only if L4 lands. L2 only if the schedule holds after that. L3 and Wave 5 are post-freeze.
+**Run order.** L6 today — it is an eval, not a build. L1 next (one day). L2 after, if the schedule
+holds. L3 and Wave 5 are post-freeze.
 
-**Decision rule on L4 — this is the one that changes the story.**
+**Decision rule, now that L4 is out.** L1 and L2 both add expressiveness without changing what the
+adapter is allowed to see. Read them together:
 
-- **Distilled adapter lands close to the teacher (~0.30).** The adapter *family* was never the
-  binding constraint; the *training signal* was. Ship it, and Wave 5 becomes unnecessary rather than
-  merely risky. Note what this would and would not overturn: PLAN.md's "we probably cannot beat 0.16"
-  stands — 0.16 is on the far side of the base-capacity gap — but "frozen-base adapter conditioning
-  plateaus" would be shown to be a statement about how we trained it, not about the design.
-- **Distilled adapter plateaus well short of the teacher.** That residual is the measured
-  expressiveness floor of open-loop diagonal FiLM over a frozen base. The honest paper contribution
-  is then the characterisation, exactly as PLAN.md argues — but now with a *number* attached instead
-  of an argument, and L2 → L3 become the indicated post-freeze fixes in that order.
-- **Either way**, Wave 4b's over-capacity oracle does not need to be built, which frees the three days
-  PLAN.md budgeted for it.
+- **Either moves the number materially.** The open-loop family had headroom we were not using, and
+  the plateau was partly a bandwidth/capacity problem inside the adapter rather than a structural
+  one. L3 becomes the natural post-freeze continuation, since it adds bandwidth of a different kind.
+- **Neither moves the number.** That is the strongest evidence yet for the open-loop diagnosis: more
+  expressiveness in a graph-blind controller buys nothing, so the missing ingredient is
+  state-dependence, not capacity. L3 and Wave 5 become the only things worth building, and the
+  characterisation contribution PLAN.md describes is what the paper reports.
+
+This is a weaker instrument than L4's residual would have been — it reads the answer off two
+improvements rather than measuring the floor directly — but it costs six days instead of a week and
+produces shippable artifacts either way, which L4's diagnostic would not have.
+
+**Wave 4b is still unbuilt.** With distillation out, nothing on this list measures the adapter
+family's ceiling directly. If that number is wanted for the paper, PLAN.md's original three-day
+over-capacity oracle is back on the table — or the L4 diagnostic run, which costs a week and answers
+it more sharply.
 
 ---
 
