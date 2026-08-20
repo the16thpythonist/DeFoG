@@ -176,9 +176,14 @@ class Modulation:
                 off = g * bs
                 for L in range(n_layers):
                     for sl, fn in m.xattn[L]:
-                        assert sl == slice(None), (
-                            "stack_groups expects each source modulation to carry "
-                            "whole-batch cross-attention entries; got a pre-sliced one")
+                        if sl != slice(None):
+                            # An already-stacked Modulation being re-stacked: the offsets
+                            # would compose wrongly and silently. `raise`, not `assert` --
+                            # python -O strips asserts and this must survive it.
+                            raise ValueError(
+                                "stack_groups expects each source modulation to carry "
+                                f"whole-batch cross-attention entries; got {sl}. This "
+                                "Modulation has already been stacked.")
                         xa[L].append((slice(off, off + bs), fn))
         return Modulation(combined, xattn=xa)
 
@@ -257,6 +262,15 @@ class NodeConditionCrossAttention(nn.Module):
     def forward(self, X: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
         """``X`` (B,n,dx), ``tokens`` (B,m,d_tok) -> delta (B,n,dx)."""
         B, n, _ = X.shape
+        if tokens.dim() != 3 or tokens.size(0) != B:
+            # `.view(B, -1, h, dh)` would SUCCEED on a mismatched batch by silently
+            # reinterpreting one graph's tokens as several graphs' -- no error, a wrong
+            # delta. The FiLM path broadcasts a 1-row condition correctly, so the two
+            # paths would disagree and only one of them would say so.
+            raise ValueError(
+                f"tokens must be (B, m, d_tok) with B={B} matching the queries; got "
+                f"{tuple(tokens.shape)}. Expand the condition to the full batch first "
+                f"(AdapterComposition._broadcast_condition does this).")
         h, dh = self.n_heads, self.dx // self.n_heads
         q = self.q(self.norm(X)).view(B, n, h, dh).transpose(1, 2)          # B,h,n,dh
         k = self.k(tokens).view(B, -1, h, dh).transpose(1, 2)               # B,h,m,dh
@@ -451,6 +465,8 @@ class AdaLNAdapter(nn.Module):
         # LOW-DIMENSIONAL ONLY, which is the regime the result is about. A fingerprint
         # or spectrum condition goes through its own encoder instead; expanding 512 hash
         # bits into bands would be both meaningless and enormous.
+        if self.cond_fourier < 0:
+            raise ValueError(f"cond_fourier must be >= 0, got {self.cond_fourier}")
         if self.cond_fourier:
             if cond_encoder is not None:
                 raise ValueError("cond_fourier is for a raw low-dimensional condition; "
@@ -467,11 +483,11 @@ class AdaLNAdapter(nn.Module):
             # (cond_std 1.158, targets spanning ~9.3 units, i.e. ~8 z):
             #
             #     n   f_max   cycles/range   cos(0.1 logP)   cos(2.5 logP)
-            #     2     1.0        8            0.910            0.722     under-resolved
-            #     3     2.0       16            0.763            0.358     <- default
-            #     4     4.0       32            0.432            0.087
-            #     6    16.0      128            0.105           -0.099     aliased
-            #     8    64.0      512           -0.039            0.162     noise
+            #     2     1.0        8            0.910            0.710     under-resolved
+            #     3     2.0       16            0.762            0.335     <- default
+            #     4     4.0       32            0.431            0.087
+            #     6    16.0      128            0.104           -0.125     aliased
+            #     8    64.0      512           -0.035            0.075     noise
             #
             # n=3 keeps neighbours correlated while separating the ends; by n=6 a
             # 0.1-logP step has already decorrelated the features and the mapping is
@@ -525,6 +541,16 @@ class AdaLNAdapter(nn.Module):
                 self.attn.append(a_l)
 
         # --- node -> condition cross-attention (one module per layer) -----------
+        if self.xattn_tokens == 1:
+            # softmax over ONE key is identically 1.0, so every node receives the same
+            # value vector and q.weight never gets gradient -- the mechanism degenerates
+            # into exactly the per-graph broadcast it exists to avoid, silently.
+            raise ValueError(
+                "xattn_tokens=1 degenerates: softmax over a single token is constant, so "
+                "the delta is identical for every node and the query path receives no "
+                "gradient. Use >= 2 tokens, or 0 to disable cross-attention.")
+        if self.xattn_tokens < 0:
+            raise ValueError(f"xattn_tokens must be >= 0, got {self.xattn_tokens}")
         if self.xattn_tokens:
             self.tok = nn.Linear(hidden, self.xattn_tokens * self.xattn_dim)
             self.xattn = nn.ModuleList([
@@ -664,7 +690,14 @@ class AdaLNAdapter(nn.Module):
             path = path + ".ckpt"
         ck = torch.load(path, map_location=device, weights_only=False)
         cfg = dict(ck["config"]); cfg["streams"] = tuple(cfg["streams"])
-        a = cls(**cfg)
+        # Filter through _CONFIG_KEYS exactly as from_config does. The .ckpt path is the
+        # one the run scripts use, and it was the stricter of the two: a checkpoint
+        # written by a newer version raised TypeError here while from_config accepted it.
+        dropped = sorted(set(cfg) - _CONFIG_KEYS)
+        if dropped:
+            warnings.warn(f"ignoring unknown config keys in {path}: {dropped}",
+                          RuntimeWarning)
+        a = cls(**{k: v for k, v in cfg.items() if k in _CONFIG_KEYS})
         a.load_state_dict(ck["state_dict"])   # includes cond_mean/cond_std buffers
         return a.to(device)
 

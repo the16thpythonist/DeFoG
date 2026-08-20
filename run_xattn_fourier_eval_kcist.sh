@@ -92,6 +92,45 @@ print(f"  xattn output-projection L1 = {xa:.4e}")
 if xa == 0.0:
     print("FAIL: cross-attention output projections are still exactly zero -- the "
           "mechanism is inert."); sys.exit(1)
+
+# A NON-ZERO OUTPUT PROJECTION IS NOT EVIDENCE OF ROUTING. At init the keys are
+# unnormalised and the token producer's output is small, so the attention is almost
+# uniform and every atom reads the same token average -- cross-attention starts life as
+# a per-graph broadcast and only becomes content-addressed if training moves q/k. A
+# checkpoint whose attention is still uniform IS a FiLM adapter with extra parameters,
+# and the L1 check above would call it healthy. Entropy against ln(m) is what tells them
+# apart. Reported, not enforced: a partially-sharpened router is still a real result, and
+# the number belongs beside the MAE when it is interpreted.
+import math, torch
+m_tok = a.xattn_tokens
+c = torch.tensor([[a.cond_mean.reshape(-1)[0].item()]])
+cn = a.normalize(c)
+parts = [cn] + ([a._fourier(cn)] if a.cond_fourier else [])
+if a.time_conditioned:
+    from defog.core.layers import timestep_embedding
+    parts.append(timestep_embedding(torch.full((1, 1), 0.5), a.time_emb_dim))
+h = a.trunk(torch.cat(parts, dim=-1))
+tokens = a.tok(h).view(1, m_tok, a.xattn_dim)
+torch.manual_seed(0)
+X = torch.randn(1, 24, a.dims["dx"])
+ents = []
+for mod in a.xattn:
+    nh, dh = mod.n_heads, mod.dx // mod.n_heads
+    q = mod.q(mod.norm(X)).view(1, -1, nh, dh).transpose(1, 2)
+    k = mod.k(tokens).view(1, -1, nh, dh).transpose(1, 2)
+    att = torch.softmax(q @ k.transpose(-1, -2) / math.sqrt(dh), dim=-1)
+    ents.append(float(-(att * att.clamp_min(1e-12).log()).sum(-1).mean()))
+uni = math.log(m_tok)
+mean_ent, min_ent = sum(ents) / len(ents), min(ents)
+print(f"  attention entropy: mean {mean_ent:.4f}, min {min_ent:.4f} "
+      f"(uniform max {uni:.4f} = a pure broadcast)")
+if mean_ent > 0.995 * uni:
+    print(f"  WARNING: attention is still ~uniform ({mean_ent/uni:.4f} of max). The "
+          f"cross-attention path is behaving as a per-graph BROADCAST, so any result "
+          f"below is closer to 'FiLM with more parameters' than to node-resolved "
+          f"conditioning. Read the MAE with that in mind.")
+else:
+    print(f"  routing learned: {(1 - mean_ent/uni)*100:.2f}% below uniform entropy")
 print("adapter preflight OK")
 PY
 

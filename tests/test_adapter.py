@@ -22,7 +22,10 @@ from defog.core.layers import timestep_embedding
 
 def build_tiny_model():
     atom_enc, atom_dec, bond_enc, bond_dec = build_encoders(["C", "N", "O"], ["SINGLE", "DOUBLE"])
-    smis = ["CCO", "CCN", "CCC", "CNO", "OCC", "NCC"]
+    # DELIBERATELY VARIABLE SIZES (2-5 heavy atoms). With uniform sizes `node_mask` is
+    # all-True, and every masking invariant in this file passes vacuously -- deleting
+    # x_mask from Modulation.apply entirely would still go green.
+    smis = ["CCO", "CCNC", "CC", "CNOCC", "OCC", "NCCO"]
     graphs = [smiles_to_pyg_data(s, atom_enc, bond_enc) for s in smis]
     graphs = [g for g in graphs if g is not None]
     loader = DataLoader(graphs, batch_size=3, shuffle=False)
@@ -556,13 +559,23 @@ def test_guided_sampler_runs():
 # ===========================================================================
 # Fourier condition features + node->condition cross-attention
 # ===========================================================================
-def _wake_xattn(adapter, seed, scale=0.3):
-    """Zero-init output projections make cross-attention an exact no-op. Wake them."""
+def _wake_xattn(adapter, seed, scale=0.3, sharpen=0.0):
+    """Zero-init output projections make cross-attention an exact no-op. Wake them.
+
+    ``sharpen`` additionally scales up the query/key projections. It exists because at
+    INIT the attention is near-uniform -- keys are unnormalised and the token producer's
+    output is small, so every node reads almost the same token average and the mechanism
+    is effectively a broadcast until training moves q/k. Any test about content-addressed
+    ROUTING has to exercise a trained-like state, not the initial one, or it is asserting
+    something that only becomes true later."""
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for m in adapter.xattn:
             m.out.weight.normal_(0.0, scale, generator=g)
             m.out.bias.normal_(0.0, scale, generator=g)
+            if sharpen:
+                m.q.weight.mul_(sharpen)
+                m.k.weight.mul_(sharpen)
     return adapter
 
 
@@ -598,7 +611,14 @@ def test_fourier_widens_the_condition_path_and_keeps_the_raw_scalar():
     feats = ff._fourier(ff.normalize(c))
     assert feats.shape == (1, 12), f"fourier feature shape {tuple(feats.shape)}"
     assert torch.isfinite(feats).all()
-    return f"cond_in {w0} -> {w1} (+{w1-w0}), raw scalar retained alongside 6 bands"
+    # The name claims the raw scalar is RETAINED -- check it reaches the trunk, by
+    # capturing the trunk's actual input rather than trusting the concatenation order.
+    seen = {}
+    ff.trunk.register_forward_pre_hook(lambda m, inp: seen.setdefault("x", inp[0]))
+    ff(c, t=torch.zeros(1, 1))
+    assert torch.allclose(seen["x"][:, :1], ff.normalize(c), atol=1e-6), \
+        "raw normalised scalar is not slot 0 of the trunk input"
+    return f"cond_in {w0} -> {w1} (+{w1-w0}), raw scalar verified at trunk slot 0"
 
 
 def test_fourier_resolves_nearby_targets_better_than_a_raw_scalar():
@@ -665,28 +685,86 @@ def test_fourier_refuses_encoder_and_high_dimensional_conditions():
     return "cond_fourier refuses a cond_encoder and cond_dim > 8"
 
 
-def test_xattn_is_content_addressed_not_a_broadcast():
-    """The claim the mechanism rests on. FiLM applies ONE diagonal affine map to every
-    atom; cross-attention lets each atom SELECT what it reads. So the per-node attention
-    distributions must not all be identical -- if they were, this would be an expensive
-    way to reproduce a broadcast."""
+def test_xattn_matches_reference_attention():
+    """`NodeConditionCrossAttention.forward` must BE attention. Checked against
+    torch's own scaled_dot_product_attention on identical weights, because a wrong
+    softmax axis, a dropped transpose or a missing 1/sqrt(d) would otherwise be
+    invisible -- the mechanism would still produce plausible deltas and train."""
+    import torch.nn.functional as F
     torch.manual_seed(3)
-    xa = NodeConditionCrossAttention(dx=32, d_tok=16, n_heads=4)
-    X = torch.randn(2, 7, 32) * 2.0                 # genuinely different node states
-    tokens = torch.randn(2, 8, 16)
+    xa = NodeConditionCrossAttention(dx=32, d_tok=16, n_heads=4).eval()
+    with torch.no_grad():                      # out is zero-init; wake it to compare
+        xa.out.weight.normal_(0.0, 0.3)
+        xa.out.bias.normal_(0.0, 0.3)
+    X, tokens = torch.randn(2, 7, 32), torch.randn(2, 8, 16)
+    got = xa(X, tokens)
+    B, n, h, dh = 2, 7, xa.n_heads, xa.dx // xa.n_heads
+    q = xa.q(xa.norm(X)).view(B, n, h, dh).transpose(1, 2)
+    k = xa.k(tokens).view(B, -1, h, dh).transpose(1, 2)
+    v = xa.v(tokens).view(B, -1, h, dh).transpose(1, 2)
+    ref = xa.out(F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, n, xa.dx))
+    d = (got - ref).abs().max().item()
+    assert d < 1e-5, f"forward disagrees with reference attention (max diff {d:.2e})"
+    return f"forward == scaled_dot_product_attention reference (max diff {d:.2e})"
+
+
+def test_xattn_is_nonlinear_in_node_content_unlike_film():
+    """The claim the mechanism rests on, tested THROUGH the real closure rather than a
+    copy of its arithmetic. FiLM's delta is an AFFINE map of the node state, identical
+    for every atom: f(x1) + f(x2) - f(0) == f(x1 + x2) holds exactly. Cross-attention
+    routes through a softmax over the node's own query, so that identity must FAIL --
+    that failure is precisely what 'content-addressed rather than broadcast' means."""
+    model, loader = build_tiny_model()
+    noisy, extra, mask, bs = a_noisy(model, loader)
+    a = _wake_xattn(AdaLNAdapter.for_base(model, cond_dim=1, hidden=32, xattn_tokens=8,
+                                          xattn_dim=32, xattn_heads=4).eval(),
+                    seed=21, sharpen=6.0)
+    mod = a(torch.full((bs, 1), 0.7), t=noisy["t"])
+    _, fn = mod.xattn[0][0]                      # the real bound closure
+    n, dx = mask.size(1), a.dims["dx"]
+    xm = torch.ones(bs, n, 1)
+    torch.manual_seed(5)
+    X1, X2 = torch.randn(bs, n, dx), torch.randn(bs, n, dx)
+    d0, d1, d2 = fn(torch.zeros(bs, n, dx), xm), fn(X1, xm), fn(X2, xm)
+    d12 = fn(X1 + X2, xm)
+    resid = (d1 + d2 - d0 - d12).abs().max().item()
+    scale = d12.abs().max().item()
+    assert scale > 0, "closure produced an all-zero delta; the wake-up failed"
+    assert resid > 0.05 * scale, (
+        f"delta is affine in node content (residual {resid:.2e} vs scale {scale:.2e}) "
+        f"-- this is a broadcast, not content-addressed routing")
+    # and the FiLM path, on the same model, MUST satisfy the identity it is being
+    # contrasted with, or the contrast means nothing
+    m0 = mod.layers[0]
+    film = lambda X: m0["gateX"][:, None] * (m0["scaleX"][:, None] * X + m0["shiftX"][:, None])
+    f_resid = (film(X1) + film(X2) - film(torch.zeros_like(X1)) - film(X1 + X2)).abs().max().item()
+    assert f_resid < 1e-5, f"FiLM is not affine ({f_resid:.2e}); the contrast is invalid"
+    return (f"xattn breaks affinity (residual {resid/scale:.1%} of scale) while FiLM "
+            f"satisfies it ({f_resid:.1e})")
+
+
+def test_xattn_starts_as_a_near_broadcast_at_init():
+    """Recorded because it changes how a trained adapter must be checked. At init the
+    keys are unnormalised and the token producer's output is small, so the attention is
+    almost uniform and cross-attention behaves as a per-graph broadcast -- content
+    addressing is something training has to BUY. Consequence: 'the output projection is
+    non-zero' does not establish that the mechanism is doing anything; attention entropy
+    against ln(n_tokens) is the diagnostic that does."""
+    model, loader = build_tiny_model()
+    noisy, extra, mask, bs = a_noisy(model, loader)
+    a = _wake_xattn(AdaLNAdapter.for_base(model, cond_dim=1, hidden=32, xattn_tokens=8,
+                                          xattn_dim=32, xattn_heads=4).eval(), seed=22)
+    xa, tokens = a.xattn[0], a.tok(torch.randn(bs, a.hidden)).view(bs, 8, a.xattn_dim)
+    X = torch.randn(bs, mask.size(1), a.dims["dx"])
     h, dh = xa.n_heads, xa.dx // xa.n_heads
-    q = xa.q(xa.norm(X)).view(2, 7, h, dh).transpose(1, 2)
-    k = xa.k(tokens).view(2, -1, h, dh).transpose(1, 2)
-    att = torch.softmax(q @ k.transpose(-1, -2) / (dh ** 0.5), dim=-1)   # (2,h,7,m)
-    spread = (att - att.mean(dim=2, keepdim=True)).abs().max().item()
-    assert spread > 1e-3, f"attention identical across nodes (spread {spread:.2e})"
-    # ...and identical node states must attend identically, or it is not a function of content
-    Xsame = X.clone(); Xsame[:, 1] = Xsame[:, 0]
-    q2 = xa.q(xa.norm(Xsame)).view(2, 7, h, dh).transpose(1, 2)
-    att2 = torch.softmax(q2 @ k.transpose(-1, -2) / (dh ** 0.5), dim=-1)
-    assert torch.allclose(att2[:, :, 0], att2[:, :, 1], atol=1e-6), \
-        "identical node states attended differently"
-    return f"attention is content-addressed (per-node spread {spread:.3f}, ties respected)"
+    q = xa.q(xa.norm(X)).view(bs, -1, h, dh).transpose(1, 2)
+    k = xa.k(tokens).view(bs, -1, h, dh).transpose(1, 2)
+    att = torch.softmax(q @ k.transpose(-1, -2) / (dh ** 0.5), dim=-1)
+    ent = -(att * att.clamp_min(1e-12).log()).sum(-1).mean().item()
+    import math
+    assert ent > 0.97 * math.log(8), f"entropy {ent:.4f} unexpectedly far below uniform"
+    return (f"attention entropy at init {ent:.4f} vs uniform max {math.log(8):.4f} "
+            f"-- near-broadcast until trained")
 
 
 def test_xattn_masks_padded_nodes():
@@ -846,7 +924,9 @@ if __name__ == "__main__":
         test_fourier_resolves_nearby_targets_better_than_a_raw_scalar,
         test_fourier_bandwidth_keeps_neighbours_correlated,
         test_fourier_refuses_encoder_and_high_dimensional_conditions,
-        test_xattn_is_content_addressed_not_a_broadcast,
+        test_xattn_matches_reference_attention,
+        test_xattn_is_nonlinear_in_node_content_unlike_film,
+        test_xattn_starts_as_a_near_broadcast_at_init,
         test_xattn_masks_padded_nodes,
         test_xattn_only_touches_its_own_group_in_a_stacked_forward,
         test_xattn_bypass_rows_silences_it,
