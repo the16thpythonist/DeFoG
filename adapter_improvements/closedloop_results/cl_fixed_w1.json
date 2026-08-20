@@ -1,0 +1,82 @@
+{
+  "adapter": "molsmith/qed@3.1.0",
+  "w0": 1.0,
+  "gain": 0.0,
+  "w_max": 3.0,
+  "warmup_frac": 0.5,
+  "sigma": 0.1327676922082901,
+  "seed": 42,
+  "steps": 500,
+  "targets": {
+    "p05": 0.46657728435671814,
+    "p25": 0.6475456511489155,
+    "p50": 0.7625973648897089,
+    "p75": 0.8405614659583267,
+    "p95": 0.9082259760223633
+  },
+  "per_level": {
+    "p05": {
+      "target": 0.46657728435671814,
+      "n_valid": 125,
+      "validity": 0.9765625,
+      "achieved_mean": 0.6121688614403932,
+      "achieved_sd": 0.17656624366171492,
+      "mae": 0.18929440787410717,
+      "w_mean": 1.0,
+      "w_final": 1.0,
+      "w_saturated_frac": 0.0,
+      "w_spread": 0.0
+    },
+    "p25": {
+      "target": 0.6475456511489155,
+      "n_valid": 126,
+      "validity": 0.984375,
+      "achieved_mean": 0.7344184898403455,
+      "achieved_sd": 0.14186559997995993,
+      "mae": 0.14532736024925277,
+      "w_mean": 1.0,
+      "w_final": 1.0,
+      "w_saturated_frac": 0.0,
+      "w_spread": 0.0
+    },
+    "p50": {
+      "target": 0.7625973648897089,
+      "n_valid": 126,
+      "validity": 0.984375,
+      "achieved_mean": 0.7448399107835691,
+      "achieved_sd": 0.12609885864762355,
+      "mae": 0.09316092403700339,
+      "w_mean": 1.0,
+      "w_final": 1.0,
+      "w_saturated_frac": 0.0,
+      "w_spread": 0.0
+    },
+    "p75": {
+      "target": 0.8405614659583267,
+      "n_valid": 127,
+      "validity": 0.9921875,
+      "achieved_mean": 0.7904484211854766,
+      "achieved_sd": 0.10546646625342412,
+      "mae": 0.08115695639583895,
+      "w_mean": 1.0,
+      "w_final": 1.0,
+      "w_saturated_frac": 0.0,
+      "w_spread": 0.0
+    },
+    "p95": {
+      "target": 0.9082259760223633,
+      "n_valid": 128,
+      "validity": 1.0,
+      "achieved_mean": 0.8280878446443547,
+      "achieved_sd": 0.0999257308708466,
+      "mae": 0.0860858686282699,
+      "w_mean": 1.0,
+      "w_final": 1.0,
+      "w_saturated_frac": 0.0,
+      "w_spread": 0.0
+    }
+  },
+  "slope": 0.459189757556387,
+  "mean_mae": 0.11900510343689445,
+  "mean_validity": 0.9875
+}

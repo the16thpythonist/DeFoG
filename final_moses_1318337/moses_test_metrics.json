@@ -1,0 +1,25 @@
+{
+  "reference_file": "final_moses_1318337/_test_reference.smi",
+  "generated_file": "final_moses_1318337/seed42.smi",
+  "dataset": "moses",
+  "n_generated": 29954,
+  "n_reference": 176074,
+  "metrics_requested": [
+    "moses"
+  ],
+  "moses_validity": 1.0,
+  "moses_unique": 0.999399078587167,
+  "moses_filters": 0.9806703612205382,
+  "moses_snn_test": 0.5507743404926346,
+  "moses_frag_test": 0.9987622317875734,
+  "moses_scaf_test": 0.9095294855477463,
+  "moses_fcd_test": 0.2668097561953857,
+  "moses_fcd_direction": "lower_is_better",
+  "moses_implementation": "molsets 0.3.1 (official)",
+  "moses_n_reference": 176074,
+  "moses_snn_test_scaffolds": 0.5248320127599881,
+  "moses_frag_test_scaffolds": 0.9966824033186797,
+  "moses_scaf_test_scaffolds": 0.1402371775742386,
+  "moses_fcd_test_scaffolds": 0.8157584996707641,
+  "moses_n_reference_scaffolds": 176225
+}

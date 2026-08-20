@@ -1,0 +1,40 @@
+host=euler  job=3731  started=2026-07-28T15:20:12+02:00
+name, memory.used [MiB], memory.total [MiB]
+NVIDIA GeForce RTX 2060, 1214 MiB, 6144 MiB
+/media/ssd2/Programming/DeFoG/.venv/lib/python3.10/site-packages/pycomex/config.py:100: UserWarning: Failed to load plugin from module "/media/ssd2/Programming/DeFoG/.venv/lib/python3.10/site-packages/pycomex/plugins/plot_track/main.py" due to No module named 'moviepy.editor'
+  warnings.warn(f'Failed to load plugin from module "{module_path}" due to {exc}')
+================================================================================
+EXPERIMENT STARTED
+    namespace:          results/adapter_compose_2d__zinc
+    start time:         Tuesday, July 28, 2026 at 03:20 PM
+    archive path:       /media/ssd2/Programming/DeFoG/experiments/results/adapter_compose_2d__zinc/28_07_2026__15_20__b3SO
+    debug mode?         False
+================================================================================
+no wandb project defined. skipping...
+ZINC adapter STACKING: compose logP + TPSA adapters, 2D high/low validation
+[rank: 0] Seed set to 43
+loaded logp adapter from /media/ssd2/Programming/DeFoG/ckpts/logp_adapter_preRL_dBe2.ckpt
+loaded tpsa adapter from /media/ssd2/Programming/DeFoG/ckpts/tpsa_adapter_preRL_jFD3.ckpt
+targets: {'logp': {'low': 0.7964549999999999, 'high': 4.610735000000004}, 'tpsa': {'low': 26.3, 'high': 103.33999999999999}}  |  size-fit mols: 20000
+conditional size distribution fitted (method=kernel)
+[logp-low tpsa-low] target=(0.8,26.3) n=193 mean=(2.1,50.5)
+[logp-low tpsa-high] target=(0.8,103.3) n=179 mean=(1.1,123.6)
+[logp-high tpsa-low] target=(4.6,26.3) n=182 mean=(4.3,47.3)
+[logp-high tpsa-high] target=(4.6,103.3) n=162 mean=(3.4,111.7)
+background: KDE contour on 8000 molecules, 160^2 grid
+============================================================
+logp-low_tpsa-low: target=(0.8,26.3) mean=(2.050215181347151,50.50668393782384) n=193
+logp-low_tpsa-high: target=(0.8,103.3) mean=(1.0822139106145254,123.55100558659217) n=179
+logp-high_tpsa-low: target=(4.6,26.3) mean=(4.3273123626373655,47.26686813186813) n=182
+logp-high_tpsa-high: target=(4.6,103.3) mean=(3.3840676543209893,111.66462962962962) n=162
+Done.
+================================================================================
+EXPERIMENT ENDED
+    duration:           0.377 hrs
+    start time:         Tuesday, July 28, 2026 at 03:20 PM
+    end time:           Tuesday, July 28, 2026 at 03:42 PM
+    error?              None
+    n/o parameters:     30
+    data size:          0.000 MB
+================================================================================
+finished=2026-07-28T15:43:00+02:00

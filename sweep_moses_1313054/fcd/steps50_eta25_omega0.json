@@ -1,0 +1,14 @@
+{
+  "reference_file": "sweep_moses_1313054/_validation_reference.smi",
+  "generated_file": "sweep_moses_1313054/steps50_eta25_omega0.smi",
+  "dataset": "moses",
+  "n_generated": 1985,
+  "n_reference": 5000,
+  "metrics_requested": [
+    "fcd"
+  ],
+  "fcd_raw": 1.8455041028416446,
+  "fcd_raw_direction": "lower_is_better",
+  "fcd_guacamol": 0.6913557040614478,
+  "fcd_guacamol_direction": "higher_is_better"
+}

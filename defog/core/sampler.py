@@ -410,6 +410,12 @@ class AdaptedSampler(Sampler):
         super().__init__(model, **kwargs)
         for br in composition.branches:
             br.adapter.check_compatible(model)   # fail fast on dim/n_layers/base mismatch
+        guide = getattr(composition, "guide", None)
+        if guide is not None:
+            # The autoguidance negative branch is loaded outside the package store, so it
+            # has not been through molsmith's compatibility gate. This is the only check
+            # it gets.
+            guide.adapter.check_compatible(model)
         self.composition = composition
 
     def _desc(self) -> str:

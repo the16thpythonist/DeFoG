@@ -1,0 +1,85 @@
+{
+  "adapter": "molsmith/qed@3.1.0",
+  "controller": "p",
+  "lam": 1.0,
+  "w_post": null,
+  "w0": 1.75,
+  "gain": 0.0,
+  "w_max": 3.0,
+  "warmup_frac": 0.5,
+  "sigma": 0.1327676922082901,
+  "seed": 42,
+  "steps": 500,
+  "targets": {
+    "p05": 0.46657728435671814,
+    "p25": 0.6475456511489155,
+    "p50": 0.7625973648897089,
+    "p75": 0.8405614659583267,
+    "p95": 0.9082259760223633
+  },
+  "per_level": {
+    "p05": {
+      "target": 0.46657728435671814,
+      "n_valid": 122,
+      "validity": 0.953125,
+      "achieved_mean": 0.4689991697588654,
+      "achieved_sd": 0.19520920227589764,
+      "mae": 0.16309295793093853,
+      "w_mean": 1.75,
+      "w_final": 1.75,
+      "w_saturated_frac": 0.0,
+      "w_spread": 0.0
+    },
+    "p25": {
+      "target": 0.6475456511489155,
+      "n_valid": 127,
+      "validity": 0.9921875,
+      "achieved_mean": 0.699085638348971,
+      "achieved_sd": 0.14623226917516968,
+      "mae": 0.13050239131804792,
+      "w_mean": 1.75,
+      "w_final": 1.75,
+      "w_saturated_frac": 0.0,
+      "w_spread": 0.0
+    },
+    "p50": {
+      "target": 0.7625973648897089,
+      "n_valid": 128,
+      "validity": 1.0,
+      "achieved_mean": 0.7809335978405836,
+      "achieved_sd": 0.09385494081958669,
+      "mae": 0.07729353177838694,
+      "w_mean": 1.75,
+      "w_final": 1.75,
+      "w_saturated_frac": 0.0,
+      "w_spread": 0.0
+    },
+    "p75": {
+      "target": 0.8405614659583267,
+      "n_valid": 128,
+      "validity": 1.0,
+      "achieved_mean": 0.8202377773819485,
+      "achieved_sd": 0.08874823279476529,
+      "mae": 0.060277815353373274,
+      "w_mean": 1.75,
+      "w_final": 1.75,
+      "w_saturated_frac": 0.0,
+      "w_spread": 0.0
+    },
+    "p95": {
+      "target": 0.9082259760223633,
+      "n_valid": 127,
+      "validity": 0.9921875,
+      "achieved_mean": 0.8427265011544838,
+      "achieved_sd": 0.0792766095978739,
+      "mae": 0.07387949499789055,
+      "w_mean": 1.75,
+      "w_final": 1.75,
+      "w_saturated_frac": 0.0,
+      "w_spread": 0.0
+    }
+  },
+  "slope": 0.8491020584766302,
+  "mean_mae": 0.10100923827572746,
+  "mean_validity": 0.9875
+}

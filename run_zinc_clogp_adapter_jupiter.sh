@@ -85,19 +85,38 @@ PY
 
 # Fail before the fit loop if the base and the vocabulary disagree, rather than
 # after four arms have each burned an hour.
-python - "$BASE" "$VOCAB" <<'PY' || { echo "ERROR: vocabulary/base mismatch"; exit 1; }
-import sys
-from defog.core import DeFoGModel
-from defog.data import vocabulary
-import importlib.util
-spec = importlib.util.spec_from_file_location("at", "experiments/adapter_training__zinc.py")
-m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-atoms, bonds, kek, src = m._vocabulary(sys.argv[2])
-base = DeFoGModel.load(sys.argv[1], device="cpu")
-print(vocabulary.check_model(base, atoms, bonds, what=sys.argv[1]))
+#
+# The module MUST be registered in sys.modules before exec_module: pycomex's
+# @Experiment decorator runs at import and calls inspect.get_annotations on the
+# module it looks up by name, which returns None for an unregistered module and
+# raises a TypeError that has nothing to do with vocabularies. Job 1238075 died
+# exactly this way and reported it as a mismatch.
+python - "$BASE" "$VOCAB" <<'PY'
+import sys, importlib.util
+try:
+    from defog.core import DeFoGModel
+    from defog.data import vocabulary
+    spec = importlib.util.spec_from_file_location("at", "experiments/adapter_training__zinc.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["at"] = m              # <- pycomex needs this
+    spec.loader.exec_module(m)
+    atoms, bonds, kek, src = m._vocabulary(sys.argv[2])
+    base = DeFoGModel.load(sys.argv[1], device="cpu")
+except Exception as exc:
+    print(f"PREFLIGHT CRASHED ({type(exc).__name__}: {exc}) -- this is a bug in the "
+          f"check itself, not evidence about the base.")
+    raise SystemExit(2)
+try:
+    print(vocabulary.check_model(base, atoms, bonds, what=sys.argv[1]))
+except vocabulary.VocabularyMismatch as exc:
+    print(f"REAL MISMATCH: {exc}")
+    raise SystemExit(1)
 print("atoms:", atoms)
 print("bonds:", bonds, "kekulize=", kek, "source=", src)
 PY
+rc=$?
+if [ $rc -eq 1 ]; then echo "ERROR: base and vocabulary disagree -- refusing to train"; exit 1; fi
+if [ $rc -ne 0 ]; then echo "ERROR: preflight could not run (exit $rc)"; exit 1; fi
 
 for i in 0 1 2 3; do
     CUDA_VISIBLE_DEVICES=$i python -u experiments/adapter_training__zinc.py \

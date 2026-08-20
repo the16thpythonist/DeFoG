@@ -116,7 +116,16 @@ class _TargetedSize:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="molsmith/zinc-kek")
-    ap.add_argument("--adapter", required=True, help="store ref, e.g. molsmith/clogp@1.2.0")
+    ap.add_argument("--adapter", default=None, help="store ref, e.g. molsmith/clogp@1.2.0")
+    # A RAW .ckpt, for an adapter that is not a shippable package yet -- a new
+    # architecture under test. Same precedent molsmith documents for `size_dist` and
+    # `guide`: an experiment's own model has nothing to publish, so the caller supplies
+    # the module and molsmith keys it by whatever string the caller uses. The cost is
+    # that it skips the store's compatibility gate, so the base check below is the only
+    # one it gets -- and it is made strict, not a warning.
+    ap.add_argument("--adapter-ckpt", default=None,
+                    help="Path to an AdaLNAdapter .ckpt to steer with, instead of a "
+                         "packaged --adapter. For architectures not yet packaged.")
     ap.add_argument("--property", required=True, choices=sorted(PROP_FNS))
     ap.add_argument("--split", required=True, choices=("validation", "test"),
                     help="validation for anything that informs a choice; test once, frozen")
@@ -160,13 +169,72 @@ def main() -> int:
                          "learned: P(n|target) from --size-model.")
     ap.add_argument("--size-model", default=None,
                     help="Path to a LearnedSizeDistribution ckpt (--size-mode learned)")
+    # AUTOGUIDANCE. Replaces the blend's negative branch (normally the frozen
+    # unconditional base) with a DELIBERATELY WORSE conditional model, so guidance pushes
+    # away from a weak version of the same thing rather than away from no conditioning at
+    # all. Karras et al.; MolGuidance reports it improving structural validity where CFG
+    # costs it, which is the reason to try it here -- CFG's validity collapses as w rises
+    # (0.982 / 0.898 / 0.466 at w = 2 / 3 / 4), and the question is whether autoguidance
+    # buys headroom to push w further.
+    #
+    # A RAW .ckpt path, not a store reference: a deliberately undertrained guide is not a
+    # shippable artefact and has no package. The cost is that it skips molsmith's
+    # compatibility gate, so this script checks the base token itself, strictly, below.
+    ap.add_argument("--guide", default=None,
+                    help="Path to an AdaLNAdapter .ckpt to use as the autoguidance "
+                         "negative branch, in place of the unconditional base.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if bool(args.adapter) == bool(args.adapter_ckpt):
+        sys.exit("give exactly one of --adapter (a store ref) or --adapter-ckpt (a raw .ckpt)")
+    if args.adapter_ckpt and args.method == "fk":
+        sys.exit("REFUSING: --adapter-ckpt with --method fk. FK needs the property head "
+                 "the package bundles; a raw checkpoint has none, and FK would silently "
+                 "reduce to plain adapter sampling.")
     if args.size_mode == "learned" and not args.size_model:
         sys.exit("--size-mode learned needs --size-model PATH")
+    if args.guide and args.method == "fk":
+        sys.exit("REFUSING: --guide with --method fk. FeynmanKacSampler assigns the "
+                 "composition without calling check_compatible on anything "
+                 "(defog/core/feynman_kac.py), so a guide would reach the sampler with no "
+                 "structural validation at all. The adapter path validates it; use "
+                 "--method adapter, or add the check to FeynmanKacSampler first.")
+    if args.guide and args.blend_space != "prob":
+        sys.exit(f"--guide requires --blend-space prob, got {args.blend_space!r}. In rate "
+                 f"space the forbidden-transition guard would be derived from the guide "
+                 f"instead of the base, and w>1 is broken there anyway -- which makes the "
+                 f"w sweep this flag exists for impossible.")
 
     from molsmith import sample as ms
+
+    # Loaded before any config is built so every config -- including the probe -- is
+    # identical to the ones that sample. `adapter_key` is what molsmith uses as the key
+    # into Loaded.adapters; for a packaged adapter it is the store ref, for a raw
+    # checkpoint it is a path-derived string that resolve_package must never see.
+    adapter_module = None
+    adapter_key = args.adapter
+    if args.adapter_ckpt:
+        from defog.core import AdaLNAdapter
+        adapter_module = AdaLNAdapter.load(args.adapter_ckpt, device="cpu")
+        adapter_key = f"ckpt:{Path(args.adapter_ckpt).resolve()}"
+        cfg_dump = adapter_module._config()
+        print(f"adapter (raw ckpt): {args.adapter_ckpt}\n"
+              f"  params={sum(p.numel() for p in adapter_module.parameters()):,} "
+              f"hidden={cfg_dump['hidden']} n_layers={cfg_dump['n_layers']} "
+              f"cond_fourier={cfg_dump.get('cond_fourier')} "
+              f"xattn_tokens={cfg_dump.get('xattn_tokens')} "
+              f"interior_ff={cfg_dump.get('interior_ff')} "
+              f"interior_attn={cfg_dump.get('interior_attn')}\n"
+              f"  cond_mean={adapter_module.cond_mean.tolist()} "
+              f"cond_std={adapter_module.cond_std.tolist()}")
+        # _fill_from_packages short-circuits only when property is set AND scale != 1.0.
+        # If it does not short-circuit it calls resolve_package on `adapter_key`, which
+        # is not a package, and the run dies mid-loop rather than here.
+        if float(adapter_module.cond_std.reshape(-1)[0]) == 1.0:
+            sys.exit("REFUSING: this adapter's cond_std is exactly 1.0, which collides "
+                     "with molsmith's 'unfilled' sentinel for AdapterTarget.scale, so "
+                     "molsmith would try to resolve the raw checkpoint as a package.")
 
     prop_fn = PROP_FNS[args.property]
     targets = draw_targets(args.split, args.n_targets, args.seed, prop_fn)
@@ -202,14 +270,43 @@ def main() -> int:
             f"mislabelled. Update molsmith before re-running."
         )
 
+    # Same failure mode as the two guards above: a molsmith without the field would run
+    # plain CFG while this script's JSON recorded a guide.
+    if args.guide and "guide" not in ms.SamplingConfig.__dataclass_fields__:
+        sys.exit(
+            "REFUSING: this molsmith build has no SamplingConfig.guide field, so --guide "
+            "would be silently ignored -- the run would be plain CFG and the output would "
+            "be labelled autoguidance. Update molsmith before re-running."
+        )
+
+    # Loaded BEFORE the first config is built so that every config, including probe_cfg,
+    # carries it. Loading it later would leave the probe on a different code path from the
+    # runs, which is how the FK scale=1.0 bug survived a passing probe.
+    guide_module = None
+    if args.guide:
+        from defog.core import AdaLNAdapter
+        guide_module = AdaLNAdapter.load(args.guide, device="cpu")
+        print(f"guide: {args.guide}  name={guide_module.name!r} "
+              f"cond_type={guide_module.cond_type!r} "
+              f"params={sum(p.numel() for p in guide_module.parameters()):,}")
+
+    # Pre-filled for a raw checkpoint so _fill_from_packages never reaches the store.
+    raw_target_kw = {}
+    if adapter_module is not None:
+        raw_target_kw = dict(property=args.property,
+                             scale=float(adapter_module.cond_std.reshape(-1)[0]),
+                             mean=float(adapter_module.cond_mean.reshape(-1)[0]))
+
     def cfg_for(target: float, seed: int):
         c = ms.SamplingConfig(
             base=args.base, n=args.per_target, seed=seed, steps=args.steps,
             eta=args.eta, omega=args.omega, time_distortion=args.time_distortion,
-            adapters=[ms.AdapterTarget(package=args.adapter, target=target,
-                                       weight=args.weight)],
+            adapters=[ms.AdapterTarget(package=adapter_key, target=target,
+                                       weight=args.weight, **raw_target_kw)],
             blend_space=args.blend_space,
             method="fk" if args.method == "fk" else "none")
+        if guide_module is not None:
+            c.guide = guide_module
         if size_model is not None:
             # A ready-made SizeDistribution, bypassing size_mode. The condition rides in
             # the branch here rather than through SamplingConfig, because the target is
@@ -223,11 +320,80 @@ def main() -> int:
         return c
 
     probe_cfg = cfg_for(float(tvals[0]), args.seed)
-    loaded = ms.load(probe_cfg)                     # fills probe_cfg.adapters[*] in place
+    if adapter_module is None:
+        loaded = ms.load(probe_cfg)                 # fills probe_cfg.adapters[*] in place
+    else:
+        # ms.load resolves every adapter ref against the store, so the raw checkpoint is
+        # withheld for that call and injected afterwards, keyed exactly as the configs
+        # name it. sample() only does `loaded.adapters.get(spec.package)`, which molsmith
+        # documents as a supported entry point for a caller holding pre-loaded modules.
+        held, probe_cfg.adapters = probe_cfg.adapters, []
+        loaded = ms.load(probe_cfg)
+        probe_cfg.adapters = held
+        base_dev = next(loaded.base.parameters()).device
+        adapter_module.to(base_dev).eval()
+        adapter_module.check_compatible(loaded.base)     # dims / n_layers, raises
+        from defog.core.adapter import _base_token as _bt
+        tok = _bt(loaded.base)
+        if adapter_module.base_token is None or \
+                abs(tok - adapter_module.base_token) > 1e-3 * (1 + abs(adapter_module.base_token)):
+            sys.exit(f"REFUSING: {args.adapter_ckpt} was trained on a different base "
+                     f"(token {adapter_module.base_token} != {tok} for {args.base}). "
+                     f"A raw checkpoint skips the store's compatibility gate, so this is "
+                     f"the only thing standing between a mismatch and a plausible-looking "
+                     f"number.")
+        loaded.adapters[adapter_key] = adapter_module
+        loaded.heads[adapter_key] = None
+        loaded.size_models[adapter_key] = None
+        print(f"adapter base check: OK (token {tok:.8g}); injected as {adapter_key!r}")
+
+    if guide_module is not None:
+        # The guide did not go through the store's compatibility gate, and
+        # AdaLNAdapter.check_compatible only WARNS on a base-token mismatch. A warning is
+        # not enough here: a guide trained on a different base does not share this base's
+        # flaws, so the blend would not be autoguidance at all -- it would be pushing away
+        # from an unrelated model, and the run would still produce plausible molecules and
+        # a plausible number. Hard-fail instead.
+        from defog.core.adapter import _base_token
+        base_dev = next(loaded.base.parameters()).device
+        guide_module.to(base_dev)
+        guide_module.check_compatible(loaded.base)   # dims / n_layers, raises on mismatch
+        tok = _base_token(loaded.base)
+        if guide_module.base_token is None:
+            sys.exit(f"REFUSING: guide {args.guide} carries no base_token, so there is no "
+                     f"way to tell whether it was trained on {args.base}. Retrain it with a "
+                     f"current AdaLNAdapter.for_base, which records one.")
+        if abs(tok - guide_module.base_token) > 1e-3 * (1 + abs(guide_module.base_token)):
+            sys.exit(f"REFUSING: guide {args.guide} was trained on a DIFFERENT base "
+                     f"(token {guide_module.base_token:.8g} != {tok:.8g} for {args.base}). "
+                     f"Autoguidance requires the guide to share the model's flaws; a guide "
+                     f"over another base does not, and the result would be uninterpretable.")
+
+        # The guide must also read the target on the SAME SCALE as the adapter it negates.
+        # AdaLNAdapter normalises internally with its own cond_mean/cond_std buffers, so a
+        # guide fitted on a different normalisation is conditioned on a different VALUE
+        # while every log line still says the same target. Nothing downstream would notice.
+        import torch as _torch
+        main_adapter = loaded.adapters.get(adapter_key)
+        if main_adapter is None:
+            sys.exit(f"REFUSING: adapter {adapter_key} did not load, so the guide's "
+                     f"conditioning scale cannot be checked against it.")
+        for field in ("cond_mean", "cond_std"):
+            g_v = getattr(guide_module, field).detach().cpu()
+            m_v = getattr(main_adapter, field).detach().cpu()
+            if g_v.shape != m_v.shape or not _torch.allclose(g_v, m_v, atol=1e-4):
+                sys.exit(
+                    f"REFUSING: guide {field} {g_v.tolist()} != adapter {field} "
+                    f"{m_v.tolist()}. The two would normalise the same target to different "
+                    f"values, so the guide would not be a degraded version of THIS adapter "
+                    f"at THIS target. Retrain the guide on the same property and data.")
+        print(f"guide base check: OK (token {tok:.8g}); "
+              f"cond_mean/std match adapter ({main_adapter.cond_mean.item():.6f} / "
+              f"{main_adapter.cond_std.item():.6f})")
     if args.method == "fk":
-        h = loaded.heads.get(args.adapter)
+        h = loaded.heads.get(adapter_key)
         if h is None:
-            sys.exit(f"REFUSING: --method fk but {args.adapter} bundles no property head. "
+            sys.exit(f"REFUSING: --method fk but {adapter_key} bundles no property head. "
                      f"LearnedPropertyEnergy needs one; without it FK has nothing to score "
                      f"and would silently reduce to plain adapter sampling.")
         # The scale is the property's own std, and the energy is divided by its square, so
@@ -241,16 +407,47 @@ def main() -> int:
             sys.exit("REFUSING: adapter spec has scale=1.0, so the FK energy would be in raw "
                      "property units and beta would not be comparable across properties. "
                      "Expected _fill_from_packages to set it from the package prop_std.")
-        print(f"FK energy: head from {args.adapter}  "
+        print(f"FK energy: head from {adapter_key}  "
               f"beta={args.fk_beta} (dimensionless; scale={scale:.4f}, "
               f"= raw-units beta {args.fk_beta / (scale * scale):.4g})  "
               f"warmup={args.fk_warmup} ess={args.fk_ess} "
               f"rejuvenate={args.fk_rejuvenate}")
 
+    # The field-presence guard above is the weaker half of the FK guard's lesson: a
+    # molsmith whose SamplingConfig HAS `guide` but whose sample() predates the wiring
+    # would pass it, run plain CFG, and write "guide": "<path>". Nothing else in either
+    # repo covers that hop -- molsmith has no test for the guide path, and every DeFoG
+    # test builds AdapterComposition directly. So watch the constructor itself.
+    # molsmith imports AdapterComposition INSIDE sample(), so patching the attribute here
+    # is picked up on the next call.
+    _probe = None
+    if guide_module is not None:
+        import defog.core as _dc
+        _probe = {"real": _dc.AdapterComposition, "built": False, "guided": False}
+
+        def _probe_ctor(*a, **kw):
+            _probe["built"] = True
+            _probe["guided"] = kw.get("guide") is not None
+            return _probe["real"](*a, **kw)
+
+        _dc.AdapterComposition = _probe_ctor
+
     rows, all_err, t0 = [], [], time.time()
     for k, (smi, tgt) in enumerate(targets):
         cfg = cfg_for(tgt, args.seed + k)          # a different draw per target
         res = ms.sample(cfg, loaded)
+        if k == 0 and _probe is not None:
+            import defog.core as _dc
+            _dc.AdapterComposition = _probe["real"]          # restore before anything else
+            if not _probe["built"]:
+                sys.exit("REFUSING: no AdapterComposition was constructed during sampling, "
+                         "so the run was not adapter-guided at all. Check --adapter.")
+            if not _probe["guided"]:
+                sys.exit("REFUSING: molsmith's sample() built the composition WITHOUT the "
+                         "guide -- this run is plain CFG and would have been recorded as "
+                         "autoguidance. The installed molsmith has the SamplingConfig.guide "
+                         "field but does not pass it through. Update molsmith.")
+            print("guide wiring check: AdapterComposition received the guide", flush=True)
         if k == 0 and args.method == "fk" and float(cfg.adapters[0].scale) == 1.0:
             # The per-target configs are built fresh, so the one that just sampled is the
             # only thing that proves the energy was normalised. Checking probe_cfg alone
@@ -299,12 +496,16 @@ def main() -> int:
     by_third = [float(np.nanmean([rows[i]["mae"] for i in part])) for part in thirds]
 
     summary = {
-        "adapter": args.adapter, "base": args.base, "property": args.property,
+        "adapter": args.adapter or adapter_key, "adapter_ckpt": args.adapter_ckpt,
+        "adapter_config": (adapter_module._config() if adapter_module is not None else None),
+        "base": args.base, "property": args.property,
         "split": args.split, "method": args.method, "seed": args.seed,
         "n_targets": len(rows), "per_target": args.per_target,
         "sampling": {"weight": args.weight, "steps": args.steps, "eta": args.eta,
                      "omega": args.omega, "time_distortion": args.time_distortion,
                      "blend_space": args.blend_space},
+        # None means the negative branch was the frozen unconditional base (plain CFG).
+        "guide": args.guide,
         # Recorded so a pair of runs can be read as an ablation without anyone having to
         # remember which was which.
         "size": {"mode": args.size_mode, "model": args.size_model,
@@ -325,7 +526,8 @@ def main() -> int:
 
     print()
     print(f"=== E2 {args.property} / {args.method} / {args.split} / "
-          f"size={args.size_mode} ===")
+          f"size={args.size_mode} / "
+          f"{'autoguidance' if args.guide else 'CFG'} w={args.weight} ===")
     print(f"  MAE (pooled over {len(all_err)} molecules) {summary['mae_pooled']:.4f}")
     print(f"  MAE by target third   low {by_third[0]:.4f}  mid {by_third[1]:.4f}  "
           f"high {by_third[2]:.4f}")

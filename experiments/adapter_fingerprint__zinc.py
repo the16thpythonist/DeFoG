@@ -115,7 +115,20 @@ FP_RADIUS: int = 2      # discriminative fingerprint + a cleaner Tanimoto signal
 FP_COUNTS: bool = False
 
 # --- Adapter architecture ---
+# :param H_HIDDEN: Width of the shared trunk that feeds EVERY FiLM head. Without a
+#     cond_encoder this is also the narrowest point in the whole conditioning path:
+#     the trunk's first layer is Linear(FP_BITS + time_emb, H_HIDDEN), so widening
+#     FP_BITS alone does not widen the path. 512 and 1024 bits were both squeezed to
+#     256 here, which is the likeliest reason that doubling the fingerprint bought
+#     only +0.015 Tanimoto lift.
 H_HIDDEN: int = 256
+# :param COND_ENCODER: Optional module between the normalized condition and the
+#     trunk. None keeps the historical behaviour (condition goes straight in).
+#     A dict is a spec resolved through AdaLNAdapter's registry, e.g.
+#         {"kind": "mlp", "out_dim": 512, "hidden": 1024, "n_blocks": 2}
+#     `in_dim` is filled in from FP_BITS automatically -- passing it here would let
+#     it silently disagree with the fingerprint width.
+COND_ENCODER: dict = None
 TIME_CONDITIONED: bool = True
 STREAMS: list = ["X", "E", "y"]
 INTERIOR_FF: bool = False        # L4: pre-FFN adaLN-Zero FiLM on X,E
@@ -136,6 +149,20 @@ ETA: float = 5.0
 OMEGA: float = 0.0
 TIME_DISTORTION: str = "polydec"
 N_TARGETS: int = 6
+# :param N_TARGETS_EXTRA: Additional held-out targets drawn AFTER the first
+#     N_TARGETS, from the remaining pool. Kept as a separate draw on purpose: the
+#     original six have now driven selection across four runs and are no longer a
+#     clean generalization estimate, but re-drawing them would break comparability
+#     with every number already measured. This way the run reports both -- the old
+#     six for continuity, the fresh set for an honest estimate.
+N_TARGETS_EXTRA: int = 10
+# :param N_TARGETS_TRAIN: Targets drawn from the TRAINING pool. The regime
+#     diagnostic: if lift on molecules the adapter trained on is no better than on
+#     held-out ones, the adapter is not failing to generalize -- it is failing to
+#     fit at all, and capacity (wider trunk, encoder, more bits) cannot be the
+#     binding constraint. A large train-vs-holdout gap means the opposite, and more
+#     capacity would make it worse.
+N_TARGETS_TRAIN: int = 6
 N_PER_TARGET: int = 64
 N_BASELINE: int = 256
 EVAL_CHUNK: int = 32
@@ -205,18 +232,31 @@ def tanimoto_to_target(fp_mat, target):
 
 
 def decode_and_fp(samples, atom_decoder, bond_decoder, radius, n_bits):
-    mols, smis = [], []
+    """(mols, smiles, binary fingerprints, disconnected fraction).
+
+    "Valid" here means "decodes to a parseable SMILES", which a multi-fragment
+    result satisfies while being useless as a molecule. That distinction was
+    invisible in this experiment for a long time and it hid a real effect: the
+    frozen base emits fragments ~1.6% of the time unconditionally, and fingerprint
+    conditioning pushes that to ~15%. Both report validity ~0.98.
+
+    Disconnected molecules stay in the scored pool so the lifts remain comparable
+    with everything already measured; the fraction is reported alongside so the
+    validity column can no longer flatter an adapter that is quietly fragmenting.
+    """
+    mols, smis, n_disc = [], [], 0
     for s in samples:
         mol = pyg_data_to_mol(s, atom_decoder, bond_decoder)
         smi = mol_to_smiles(mol) if mol is not None else None
         if smi is not None and Chem.MolFromSmiles(smi) is not None:
             mols.append(mol)
             smis.append(smi)
+            n_disc += "." in smi
     # BINARY: this feeds the Tanimoto metric, which stays binary whatever the
     # conditioning encoding is, so numbers remain comparable across generations.
     fp = np.stack([mol_morgan_binary(m, radius, n_bits) for m in mols]) if mols else \
         np.zeros((0, n_bits), dtype=np.float32)
-    return mols, smis, fp
+    return mols, smis, fp, (n_disc / len(mols) if mols else float("nan"))
 
 
 def guided_sample(base, adapter, target_fp, weight, n, steps, eta, omega, td, chunk, device):
@@ -266,7 +306,7 @@ class FPAdapterProbe(pl.Callback):
         for tcond, tmetric in self.targets:
             samples = guided_sample(pl_module.base, pl_module.adapter, tcond, self.weight, self.n,
                                     self.steps, self.eta, self.omega, self.td, self.chunk, device)
-            _, _, gfp = decode_and_fp(samples, self.ad, self.bd, self.radius, self.n_bits)
+            _, _, gfp, _ = decode_and_fp(samples, self.ad, self.bd, self.radius, self.n_bits)
             sims = tanimoto_to_target(gfp, tmetric)
             per.append(float(sims.mean()) if sims.size else float("nan"))
         guided = float(np.nanmean(per)) if per else float("nan")
@@ -308,10 +348,14 @@ def experiment(e: Experiment) -> None:
     e.log(f"source molecules: {len(smiles_iter)}")
 
     # ONE full-size array only. At 1024 bits over 224k molecules a float32 array
-    # is ~0.9 GB, so keeping both conventions and both encodings would be several
-    # gigabytes for no benefit: the evaluation needs only six target molecules,
-    # whose fingerprints are recomputed on demand. The decoded SMILES are kept
-    # (cheap, strings) so those targets can be built in either convention later.
+    # is ~0.9 GB and 2048 bits is ~1.8 GB, so keeping both conventions and both
+    # encodings would be many gigabytes for no benefit: the evaluation needs only
+    # a couple of dozen target molecules, whose fingerprints are recomputed on
+    # demand. The decoded SMILES are kept (cheap, strings) so those targets can be
+    # built in either convention later.
+    # Peak is ~2x the final array, briefly: np.stack allocates the result while
+    # fp_list is still alive. ~3.6 GB at 2048 bits, which the node absorbs, but it
+    # is the reason `del fp_list` follows immediately.
     CEIL_SAMPLE = 5000          # the ceiling is a mean; 5k pins it to ~0.003
     graphs, smiles_kept, dec_smiles, fp_list = [], [], [], []
     ceil_num = []
@@ -377,14 +421,32 @@ def experiment(e: Experiment) -> None:
     from defog.data import vocabulary as _vocab
     e.log(_vocab.check_model(base, atom_types, bond_types,
                              what=f"base {e.BASE_CKPT}"))
+    # in_dim is derived from FP_BITS, never taken from the spec: a hand-written
+    # in_dim that disagreed with the fingerprint width would raise at the first
+    # forward, but only after the run had already loaded the dataset and the base.
+    enc_spec = None
+    if e.COND_ENCODER:
+        enc_spec = dict(e.COND_ENCODER)
+        enc_spec.setdefault("kind", "mlp")
+        enc_spec["in_dim"] = e.FP_BITS
     adapter = AdaLNAdapter.for_base(
         base, cond_dim=e.FP_BITS, hidden=e.H_HIDDEN, time_conditioned=e.TIME_CONDITIONED,
         streams=tuple(e.STREAMS), cond_mean=cond_mean, cond_std=cond_std,
         interior_ff=e.INTERIOR_FF, interior_attn=e.INTERIOR_ATTN,
+        cond_encoder=enc_spec,
         name="fp_adapter", cond_type=f"morgan{e.FP_BITS}")
     e["adapter/num_params"] = sum(p.numel() for p in adapter.parameters())
+    e["adapter/cond_encoder"] = enc_spec
+    e["adapter/hidden"] = e.H_HIDDEN
+    # The narrowest point in the conditioning path -- the thing this run is varying.
+    bottleneck = e.H_HIDDEN if enc_spec is None else min(e.H_HIDDEN, enc_spec.get("out_dim", 512))
+    e["adapter/bottleneck"] = bottleneck
     e.log(f"adapter: {e['adapter/num_params']:,} params (interior_ff={e.INTERIOR_FF} interior_attn={e.INTERIOR_ATTN}; "
           f"base {sum(p.numel() for p in base.parameters()):,} frozen)")
+    e.log(f"conditioning path: {e.FP_BITS} bits -> "
+          + (f"encoder[{enc_spec['kind']} h={enc_spec.get('hidden')} x{enc_spec.get('n_blocks')}]"
+             f" -> {enc_spec.get('out_dim')} -> " if enc_spec else "")
+          + f"trunk({e.H_HIDDEN}) -> FiLM heads   [narrowest = {bottleneck}]")
     module = AdapterModule(base, adapter, cond_attr="cond", cond_drop_prob=e.COND_DROP_PROB,
                            lr=e.LEARNING_RATE, l10_lr_scale=e.L10_LR_SCALE)
 
@@ -400,7 +462,7 @@ def experiment(e: Experiment) -> None:
         cur = min(e.EVAL_CHUNK, rem)
         pb += pbs.sample(cur, device=device, show_progress=False)
         rem -= cur
-    _, _, pb_fp = decode_and_fp(pb, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS)
+    _, _, pb_fp, _ = decode_and_fp(pb, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS)
     probe_baseline = [float(tanimoto_to_target(pb_fp, t).mean()) if pb_fp.shape[0] else float("nan")
                       for t in probe_metric]
     e.log(f"probe baseline <T>: {[round(x, 3) for x in probe_baseline]}")
@@ -426,7 +488,22 @@ def experiment(e: Experiment) -> None:
     e.log("=" * 60)
     base = base.to(device).eval()
     adapter = adapter.to(device).eval()
+    # This first draw is deliberately the ORIGINAL call -- same population, same k,
+    # same RNG state -- so it reproduces the exact six targets earlier runs were
+    # scored on and the new numbers stay comparable to them. Everything else is
+    # drawn afterwards, from what is left, so it cannot perturb that draw.
     tgt_idx = random.sample(holdout_idx, min(e.N_TARGETS, len(holdout_idx)))
+    tgt_split = ["holdout_orig"] * len(tgt_idx)
+    _rest = [i for i in holdout_idx if i not in set(tgt_idx)]
+    _extra = random.sample(_rest, min(e.N_TARGETS_EXTRA, len(_rest)))
+    tgt_idx += _extra
+    tgt_split += ["holdout_fresh"] * len(_extra)
+    _tr = random.sample(train_idx, min(e.N_TARGETS_TRAIN, len(train_idx)))
+    tgt_idx += _tr
+    tgt_split += ["train"] * len(_tr)
+    e.log(f"targets: {tgt_split.count('holdout_orig')} original held-out (comparability) "
+          f"+ {tgt_split.count('holdout_fresh')} fresh held-out (honest estimate) "
+          f"+ {tgt_split.count('train')} training (regime diagnostic)")
     # Condition on the TRAINING convention (that is what the adapter speaks),
     # then score the same generated molecules against BOTH conventions. One
     # sampling run, two measurements: the gap between them is exactly the
@@ -449,39 +526,50 @@ def experiment(e: Experiment) -> None:
         cur = min(e.EVAL_CHUNK, rem)
         bsamp += base_sampler.sample(cur, device=device, show_progress=False)
         rem -= cur
-    _, _, base_fp = decode_and_fp(bsamp, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS)
-    e.log(f"baseline valid: {base_fp.shape[0]}/{e.N_BASELINE}")
+    _, _, base_fp, base_disc = decode_and_fp(bsamp, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS)
+    e.log(f"baseline valid: {base_fp.shape[0]}/{e.N_BASELINE}  disconnected {base_disc:.3f}"
+          f"  <- the frozen base's own fragment rate; steering is measured against it")
+    e["fp/baseline_disconnected"] = base_disc
 
     methods = ["baseline"] + [f"w={w}" for w in e.GUIDANCE_WEIGHTS]
     CONVS = ("decoded", "source")
+    SPLITS = ("holdout_orig", "holdout_fresh", "train")
     agg = {c: {m: [] for m in methods} for c in CONVS}
+    # Same numbers, sliced by split. Pooling them would let the training targets
+    # inflate the held-out figure, which is the one that means anything.
+    agg_split = {s: {c: {m: [] for m in methods} for c in CONVS} for s in SPLITS}
     per_target = []
     for ti, (traw, tmol) in enumerate(zip(tgt_raw, tgt_mols)):
+        split = tgt_split[ti]
         rec = {"index": int(tgt_idx[ti]), "smiles": smiles_kept[tgt_idx[ti]],
+               "split": split, "n_heavy": tmol.GetNumHeavyAtoms(),
                "baseline_mean_tanimoto": {}, "per_w": {}}
         for c in CONVS:
             bs = tanimoto_to_target(base_fp, tgt_by_conv[c][ti])
             agg[c]["baseline"].extend(bs.tolist())
+            agg_split[split][c]["baseline"].extend(bs.tolist())
             rec["baseline_mean_tanimoto"][c] = float(bs.mean()) if bs.size else None
         best_grid = None
         for w in e.GUIDANCE_WEIGHTS:
             samples = guided_sample(base, adapter, traw, w, e.N_PER_TARGET, e.EVAL_STEPS,
                                     e.ETA, e.OMEGA, e.TIME_DISTORTION, e.EVAL_CHUNK, device)
-            mols, smis, gfp = decode_and_fp(samples, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS)
+            mols, smis, gfp, gdisc = decode_and_fp(samples, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS)
             entry = {"n_valid": len(mols), "n_unique": len(set(smis)),
-                     "validity": len(mols) / len(samples) if samples else 0.0}
+                     "validity": len(mols) / len(samples) if samples else 0.0,
+                     "disconnected": gdisc}
             sims = None
             for c in CONVS:
                 s = tanimoto_to_target(gfp, tgt_by_conv[c][ti])
                 agg[c][f"w={w}"].extend(s.tolist())
+                agg_split[split][c][f"w={w}"].extend(s.tolist())
                 entry[f"mean_tanimoto_{c}"] = float(s.mean()) if s.size else None
                 entry[f"max_tanimoto_{c}"] = float(s.max()) if s.size else None
                 if c == "decoded":
                     sims = s
             rec["per_w"][str(w)] = entry
-            e.log(f"  [t{ti}] w={w}: valid={len(mols)}/{len(samples)} uniq={len(set(smis))} "
+            e.log(f"  [t{ti} {split}] w={w}: valid={len(mols)}/{len(samples)} uniq={len(set(smis))} "
                   f"<T>decoded={entry['mean_tanimoto_decoded']} "
-                  f"<T>source={entry['mean_tanimoto_source']}")
+                  f"<T>source={entry['mean_tanimoto_source']} disc={gdisc:.3f}")
             if abs(w - e.GRID_SCALE) < 1e-9 and mols:
                 order = np.argsort(-sims)[:e.GRID_N]
                 best_grid = ([tmol] + [mols[j] for j in order], ["TARGET"] + [f"T={sims[j]:.2f}" for j in order])
@@ -507,6 +595,51 @@ def experiment(e: Experiment) -> None:
             e.log(f"{c:12s}{m:12s}{mean:>9.4f}{mean - base_mean:>+9.4f}")
     e.log(f"ceiling when scoring against SOURCE targets: {ceil:.4f} "
           f"(a perfect reproduction of the target GRAPH cannot beat this)")
+
+    # --- by split: the regime diagnostic -------------------------------------
+    # `train` here means the adapter SAW these molecules during training. If its
+    # lift on them is no higher than on held-out targets, the limit is not
+    # generalization and no amount of extra conditioning capacity will move it.
+    summary["by_split"] = {}
+    e.log("-" * 60)
+    e.log(f"{'split':16s}{'n':>4s}  {'method':10s}{'<T>dec':>9s}{'lift':>9s}{'validity':>10s}")
+    for s in SPLITS:
+        rows = [r for r in per_target if r["split"] == s]
+        if not rows:
+            continue
+        bl = agg_split[s]["decoded"]["baseline"]
+        base_mean = float(np.mean(bl)) if bl else float("nan")
+        summary["by_split"][s] = {"n_targets": len(rows), "aggregate": {}}
+        for m in methods:
+            vals = agg_split[s]["decoded"][m]
+            mean = float(np.mean(vals)) if vals else float("nan")
+            val = float("nan")
+            if m != "baseline":
+                w = m.split("=", 1)[1]
+                vv = [r["per_w"][w]["validity"] for r in rows if w in r["per_w"]]
+                val = float(np.mean(vv)) if vv else float("nan")
+            summary["by_split"][s]["aggregate"][m] = {
+                "mean_tanimoto": mean, "lift_over_baseline": mean - base_mean,
+                "validity": val}
+            e.log(f"{s:16s}{len(rows):>4d}  {m:10s}{mean:>9.4f}{mean - base_mean:>+9.4f}{val:>10.4f}")
+    ho = summary["by_split"].get("holdout_fresh", {}).get("aggregate", {})
+    tr = summary["by_split"].get("train", {}).get("aggregate", {})
+    top = f"w={e.GUIDANCE_WEIGHTS[-1]}"
+    if top in ho and top in tr:
+        gap = tr[top]["lift_over_baseline"] - ho[top]["lift_over_baseline"]
+        # A nan gap means a split produced no valid molecules at all. Reading a
+        # verdict off that would state a conclusion drawn from missing data -- the
+        # exact failure this diagnostic exists to avoid -- so say so instead.
+        if not np.isfinite(gap):
+            e.log(f"train-minus-heldout lift gap at {top}: UNDEFINED "
+                  f"(a split produced no valid molecules; no conclusion available)")
+        else:
+            e["fp/train_holdout_gap"] = gap
+            e.log(f"train-minus-heldout lift gap at {top}: {gap:+.4f}  "
+                  + ("-> memorization-limited: extra capacity would widen this, not help"
+                     if gap > 0.05 else
+                     "-> NOT generalization-limited: the adapter fits its own training "
+                     "targets no better, so capacity is not the binding constraint"))
     e.commit_json("adapter_fingerprint_metrics.json", summary)
 
     # Both conventions side by side, with the source-target ceiling drawn in --
@@ -561,6 +694,8 @@ def testing(e: Experiment):
     e.PROBE_N_TARGETS = 2
     e.N_HOLDOUT = 40
     e.N_TARGETS = 2
+    e.N_TARGETS_EXTRA = 1
+    e.N_TARGETS_TRAIN = 1
     e.N_PER_TARGET = 8
     e.N_BASELINE = 8
     e.EVAL_CHUNK = 8

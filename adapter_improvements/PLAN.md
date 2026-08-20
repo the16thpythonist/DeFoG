@@ -208,7 +208,69 @@ this, the null-calibration story is wrong and we learn something either way.
 
 ---
 
-## Wave 4 — one week to decide: control or capacity?
+## Wave 4b — DONE (2026-08-15). The adapter is NOT the bottleneck.
+
+Capacity ladder on QED, KCIST job 43124, four arms on four GPUs. Metric is the SLOPE of
+achieved-vs-requested QED (1.0 perfect, 0 ignores the target), not MAE — a QED adapter
+emitting the dataset mean already scores MAE ~0.15. Evaluated at w=1.0, where rate- and
+prob-space blending are provably identical for a single adapter, so these numbers are
+comparable with everything measured before the blend fix.
+
+**Final eval** (128 molecules, 500 steps), targets at the 5/25/50/75/95th percentiles
+(span 0.432):
+
+| arm | params | slope | span | mean MAE | uncond |
+|---|---|---|---|---|---|
+| A_base h256 20ep | 4.97M | **0.369** | 0.154 | 0.1252 | 0.748 |
+| B_wide h1024 20ep | 20.6M | **0.323** | 0.154 | 0.1284 | 0.720 |
+
+| hypothesis | verdict | evidence |
+|---|---|---|
+| trunk too small | **no** | 4x width, identical 0.154 span; slope 0.369 -> 0.323 (final evals) |
+| undertrained | **NOT RESOLVED** | 10 probes, trend +0.0043/epoch, **p=0.118** — underpowered |
+| modulation too shallow | **no** | matched-epoch arm spread 0.051 < probe noise 0.063 |
+
+**Correction.** This table first read "undertrained: no — flat". That was wrong, and the
+way it was wrong is worth keeping: the analysis script judged the trend against a hard
+threshold (`m > 0.002`) with no error bar, so when a tenth probe arrived at epoch 49 the
+verdict flipped from FLAT to RISING on one observation. Tested properly, C_long's trend is
++0.00425/epoch with se 0.00242, **p=0.118**, R2=0.28, and drops to +0.00164 (p=0.51) if the
+last point is removed. That is not evidence of flatness — it is too little power to tell.
+The point estimate, if real, would be worth +0.19 slope over 45 epochs, which is large.
+D_attn over the same range gives +0.00127, p=0.367.
+
+So: **width and depth are ruled out on their own evidence; training length is still open**,
+and it is open specifically on the arm that got killed.
+
+Going from 4.97M to 27.7M trainable parameters — from half the frozen base's size to
+nearly 3x it — and from 20 to 44 epochs moves QED range recovery not at all. It sits at
+~36% of the requested range throughout. **This is the measurement the capacity argument
+was missing, and it says the adapter is not the constraint.**
+
+### What this result cannot support
+
+`C_long` and `D_attn` were killed by the SLURM wall mid-training with **no final eval and
+no saved adapter**, so their conclusions rest on probe data (31 molecules, 100 steps).
+The calibration check earned its place: on the two arms with both, the probe-vs-final
+offsets go in OPPOSITE directions (A_base +0.112, B_wide −0.131), a 0.24 disagreement on
+a quantity of ~0.35. So a single probe cannot stand in for a final eval, and no point
+estimate is reported for C/D — only the 9-point trend, which averages the noise down.
+
+The depth verdict is "null below noise", not "interior attention cannot help". Single
+seed throughout.
+
+**Cause of the loss, for next time:** `MAX_TIME_HOURS=9.5` against a 12h SLURM wall left
+no margin, Lightning's cap did not fire, and the adapter is only saved after training
+completes. Set the training cap well under the wall (7h against 12h) AND checkpoint
+periodically, so a kill costs the tail rather than everything.
+
+### Consequence
+
+Wave 4a (the adaptive-`w` probe) is now the only untested control lever, and **Step 2 —
+the unfrozen "cheating model" oracle — is the clear next move**: it measures what the
+frozen-base design actually costs, which is the number the paper is missing.
+
+## Wave 4 (original text) — one week to decide: control or capacity?
 
 Two experiments, run together. They answer the question the rest of the plan hinges on, and
 neither produces a shippable artifact — which is exactly why they are easy to skip and

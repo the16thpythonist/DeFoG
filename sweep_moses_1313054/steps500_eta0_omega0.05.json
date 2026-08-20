@@ -1,0 +1,29 @@
+{
+  "dataset": "moses",
+  "ckpt": "ckpts/moses_kekrl_b0s43/best_model",
+  "sample_steps": 500,
+  "eta": 0.0,
+  "omega": 0.05,
+  "time_distortion": "polydec",
+  "num_samples": 2000,
+  "sample_seconds": 171.2,
+  "smiles_file": "steps500_eta0_omega0.05.smi",
+  "scored_against": "validation",
+  "metrics": {
+    "num_samples": 2000,
+    "num_valid": 1992,
+    "num_unique": 1992,
+    "validity_relaxed_largest_frag": 0.996,
+    "validity_strict_largest_frag": 0.9955,
+    "validity_whole_molecule": 0.996,
+    "connected": 0.9959839357429718,
+    "disconnected": 0.004016064257028112,
+    "uniqueness": 1.0,
+    "v": 0.996,
+    "v_u": 0.996,
+    "validity_convention": "relaxed_largest_frag",
+    "num_novel": 1902,
+    "novelty": 0.9548192771084337,
+    "v_u_n": 0.951
+  }
+}

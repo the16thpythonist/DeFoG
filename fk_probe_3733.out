@@ -1,0 +1,9 @@
+/media/ssd2/Programming/DeFoG/.venv/lib/python3.10/site-packages/pycomex/config.py:100: UserWarning: Failed to load plugin from module "/media/ssd2/Programming/DeFoG/.venv/lib/python3.10/site-packages/pycomex/plugins/plot_track/main.py" due to No module named 'moviepy.editor'
+  warnings.warn(f'Failed to load plugin from module "{module_path}" due to {exc}')
+device=cuda  total=5.78 GiB
+K= 16  OK    peak=0.51 GiB
+K= 24  OK    peak=0.71 GiB
+K= 32  OK    peak=0.92 GiB
+K= 48  OK    peak=1.33 GiB
+K= 64  OK    peak=1.74 GiB
+probe done

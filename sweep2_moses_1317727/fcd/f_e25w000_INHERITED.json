@@ -1,0 +1,14 @@
+{
+  "reference_file": "/media/ssd2/Programming/DeFoG/sweep2_moses_1317727/a_e25w005/_validation_reference.smi",
+  "generated_file": "/media/ssd2/Programming/DeFoG/sweep2_moses_1317727/f_e25w000_INHERITED/steps500_eta25_omega0.smi",
+  "dataset": "moses",
+  "n_generated": 9982,
+  "n_reference": 5000,
+  "metrics_requested": [
+    "fcd"
+  ],
+  "fcd_raw": 0.5746356125655723,
+  "fcd_raw_direction": "lower_is_better",
+  "fcd_guacamol": 0.8914311067984315,
+  "fcd_guacamol_direction": "higher_is_better"
+}

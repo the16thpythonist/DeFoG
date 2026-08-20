@@ -959,8 +959,9 @@ class DeFoGModel(pl.LightningModule):
     def _denoise_step_composed(self, t, s, X_t, E_t, y_t, node_mask, composition,
                                posterior_transform=None):
         """One CTMC denoise step under an N-branch adapter composition (product-of-
-        experts). Runs a SINGLE batched (N+1)*bs forward (group 0 = frozen-base
-        unconditional bypass; groups 1..N = each adapter's modulation), blends the
+        experts). Runs a SINGLE batched (N+1)*bs forward (group 0 = the negative
+        branch -- the frozen-base unconditional bypass, or, under autoguidance, a
+        degraded conditional; groups 1..N = each adapter's modulation), blends the
         per-branch rate matrices geometrically in log space, and at the terminal
         step decodes the blended clean-graph marginals. eta/omega are assumed
         already set on the rate-matrix designer by the caller."""
@@ -1067,7 +1068,10 @@ class DeFoGModel(pl.LightningModule):
     @staticmethod
     def _blend_logp(p, w, mode):
         """Same PoE blend on clean-graph softmax marginals -> unnormalized log q
-        (argmax is normalization-invariant). p: (N+1, ...), group 0 = uncond.
+        (argmax is normalization-invariant). p: (N+1, ...), group 0 = the NEGATIVE
+        branch: the unconditional base normally, a degraded conditional under
+        autoguidance. The arithmetic is identical either way -- only what fills
+        group 0 changes -- which is why autoguidance needed no change here.
 
         ``w`` is either ``(N,)`` -- one weight per branch, shared by the batch -- or
         ``(N, bs)``, one weight per branch PER MOLECULE. The second form exists for

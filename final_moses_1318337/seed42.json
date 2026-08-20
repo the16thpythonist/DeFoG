@@ -1,0 +1,39 @@
+{
+  "dataset": "moses",
+  "tag": "seed42",
+  "ckpt": "ckpts/moses_kekrl_b0s43/best_model",
+  "split": "test",
+  "sampling_config_frozen": true,
+  "frozen_config": {
+    "sample_steps": 500,
+    "eta": 25.0,
+    "omega": 0.0,
+    "time_distortion": "polydec",
+    "seed": 42,
+    "num_samples": 30000
+  },
+  "chosen_on": "validation",
+  "sweep_dir": "sweep2_moses_1317727",
+  "num_samples": 30000,
+  "sample_seconds": 2554.9,
+  "n_reference": 176074,
+  "smiles_file": "seed42.smi",
+  "novelty_reference": "train",
+  "metrics": {
+    "num_samples": 30000,
+    "num_valid": 29954,
+    "num_unique": 29936,
+    "validity_relaxed_largest_frag": 0.9984666666666666,
+    "validity_strict_largest_frag": 0.9980333333333333,
+    "validity_whole_molecule": 0.9984666666666666,
+    "connected": 0.9960940108165854,
+    "disconnected": 0.003905989183414569,
+    "uniqueness": 0.999399078587167,
+    "v": 0.9984666666666666,
+    "v_u": 0.9978666666666667,
+    "validity_convention": "relaxed_largest_frag",
+    "num_novel": 28303,
+    "novelty": 0.945450293960449,
+    "v_u_n": 0.9434333333333333
+  }
+}

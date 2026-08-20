@@ -26,7 +26,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 from rdkit import Chem, RDLogger
-from rdkit.Chem import Crippen, Descriptors
+from rdkit.Chem import Crippen, Descriptors, QED
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 
@@ -41,7 +41,14 @@ _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PROP_FNS = {"logp": lambda m: float(Crippen.MolLogP(m)),
             "clogp": lambda m: float(Crippen.MolLogP(m)),   # alias; same Crippen estimate
-            "tpsa": lambda m: float(Descriptors.TPSA(m))}
+            "tpsa": lambda m: float(Descriptors.TPSA(m)),
+            # QED is bounded in [0, 1] and its mass sits mid-range, unlike logp and
+            # tpsa which are unbounded and roughly symmetric. That matters twice: the
+            # conditioning normaliser sees a much narrower spread, and a low MAE can be
+            # earned by regressing to the middle. Judge it across the range, not on the
+            # mean. For scale, FreeGress reports an UNCONDITIONAL MAE of 0.15 on this
+            # property and its own best at 0.04 -- the useful band is narrow.
+            "qed": lambda m: float(QED.qed(m))}
 
 
 def _vocabulary(name: str):
@@ -120,7 +127,7 @@ SMILES_COLUMN: str = "smiles"
 
 BASE_CKPT: str = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
 
-PROPERTY: str = "logp"          # logp | clogp | tpsa
+PROPERTY: str = "logp"          # logp | clogp | tpsa | qed
 
 # --- Adapter architecture ---
 H_HIDDEN: int = 256
@@ -129,6 +136,19 @@ STREAMS: list = ["X", "E", "y"]
 INTERIOR_FF: bool = False        # L4: pre-FFN adaLN-Zero FiLM on X,E
 INTERIOR_ATTN: bool = False      # L10: condition e_mul (edge->attention logits)
 L10_LR_SCALE: float = 0.3        # smaller LR on the L10 heads (validity guard)
+
+# --- Condition path: Fourier bands on the target (0 = off, the historical default) ---
+# Without this the trunk sees the property as ONE raw float while the flow-time gets a
+# 64-dim sinusoidal embedding. See AdaLNAdapter for the measured bandwidth table; 3 is
+# the ceiling that keeps neighbouring targets correlated enough to interpolate between.
+COND_FOURIER: int = 0
+
+# --- Node -> condition cross-attention (0 tokens = off, the historical default) ---
+# Each atom queries the condition instead of every atom receiving the same broadcast
+# FiLM correction. Nodes only: edges and the global vector keep the FiLM path.
+XATTN_TOKENS: int = 0
+XATTN_DIM: int = 128
+XATTN_HEADS: int = 8
 
 # --- Training ---
 EPOCHS: int = 20
@@ -144,13 +164,16 @@ OMEGA: float = 0.0
 TIME_DISTORTION: str = "polydec"
 TARGET_PERCENTILES: list = [5, 95]
 LEVEL_NAMES: list = ["low", "high"]
-# Steering weights must stay <= 1. The composition blends rate matrices as
-# log R_uncond + sum_i w_i (log R_cond_i - log R_uncond); with w > 1 the
-# unconditional coefficient 1 - sum(w_i) goes NEGATIVE, so the blend
-# extrapolates past the conditional instead of interpolating toward it, and
-# _stabilize's >1e5 clamp then silently drops rates. Empirically w=2 does not
-# work -- it degrades rather than steers harder.
-GUIDANCE_WEIGHTS: list = [0.25, 0.5, 1.0]
+# CORRECTED 2026-08-17. This list used to stop at 1.0, justified by "with w > 1 the
+# unconditional coefficient goes negative, the blend extrapolates past the conditional,
+# and _stabilize's clamp silently drops rates -- empirically w=2 degrades rather than
+# steers harder." Every word of that is true OF RATE-SPACE BLENDING, which was the only
+# blend space at the time. It is not a property of the task: the composition now blends
+# clean-graph marginals by default (AdapterComposition.blend_space="prob"), where w=2 is
+# the measured OPTIMUM -- logP MAE 0.6410 at w=1 vs 0.5420 at w=2, and the degradation
+# only resumes past w~2.5. The grid therefore has to straddle 2.0 or it cannot find the
+# operating point the adapter actually ships at.
+GUIDANCE_WEIGHTS: list = [1.0, 1.5, 2.0, 2.5, 3.0]
 N_PER_TARGET: int = 128
 N_BASELINE: int = 256
 EVAL_CHUNK: int = 32
@@ -160,7 +183,19 @@ COMPOSE_MODE: str = "product"    # single branch: product == mean
 PROBE_EVERY_K: int = 5
 PROBE_N: int = 32
 PROBE_STEPS: int = 100
-PROBE_WEIGHT: float = 1.0
+# Probe at the weight the adapter actually SHIPS at. It was 1.0 because rate-space
+# blending made anything above that unusable; probing at 1.0 while shipping at 2.0 is
+# how the capacity ladder ended up comparing an adapter at w=1 against a jointly
+# trained model at w=2 and reading the difference as a capacity gap.
+PROBE_WEIGHT: float = 2.0
+
+# --- periodic checkpointing ---
+# 0 disables. WHY THIS EXISTS: the C_long / D_attn arms of the capacity ladder were
+# killed by the SLURM wall after ~50 epochs and the adapter is only written after
+# `trainer.fit` returns, so both arms were lost entirely -- no final eval, no weights,
+# and the one hypothesis they were testing ("more epochs") stayed open. With this set,
+# a kill costs the tail since the last multiple of K rather than everything.
+CKPT_EVERY_K: int = 0
 
 SEED: int = 42
 __DEBUG__: bool = False
@@ -190,6 +225,39 @@ def props_of(samples, atom_decoder, bond_decoder, prop_fn):
             except Exception:
                 pass
     return np.asarray(vals, dtype=float)
+
+
+class AdapterEpochCheckpoint(pl.Callback):
+    """Write the adapter to ``{property}_adapter_ep{N}`` every K epochs.
+
+    Two jobs, and the second is the one that matters. It makes a wall-clock kill cost
+    only the tail -- but it also turns "does training longer help?" into a question that
+    can be answered by EVALUATION rather than by a trend line through mid-training
+    probes. That distinction is load-bearing: on the two capacity-ladder arms that had
+    both, the probe-vs-final-eval offsets went in OPPOSITE directions (+0.112 and
+    -0.131, on a quantity of ~0.35), so a probe cannot stand in for a real eval and a
+    trend fitted through probes cannot be believed. Saved checkpoints can be evaluated
+    properly after the fact, at whatever weight and sample count the protocol demands.
+    """
+
+    def __init__(self, e, adapter, every_k: int, prop: str):
+        super().__init__()
+        self.e, self.adapter, self.every_k, self.prop = e, adapter, int(every_k), prop
+        self.saved = []
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if not self.every_k:
+            return
+        ep = int(trainer.current_epoch) + 1          # 1-based: "after N epochs of training"
+        if ep % self.every_k:
+            return
+        try:
+            path = self.adapter.save(os.path.join(self.e.path, f"{self.prop}_adapter_ep{ep}"))
+            self.saved.append({"epoch": ep, "path": path})
+            self.e["checkpoints"] = self.saved
+            self.e.log(f"[epoch {ep}] checkpoint -> {path}")
+        except Exception as ex:                       # never let a save kill the run
+            self.e.log(f"[epoch {ep}] CHECKPOINT FAILED (non-fatal): {ex}")
 
 
 class AdapterPropProbe(pl.Callback):
@@ -327,10 +395,20 @@ def experiment(e: Experiment) -> None:
         base, cond_dim=1, hidden=e.H_HIDDEN, time_conditioned=e.TIME_CONDITIONED,
         streams=tuple(e.STREAMS), cond_mean=[cond_mean], cond_std=[cond_std],
         interior_ff=e.INTERIOR_FF, interior_attn=e.INTERIOR_ATTN,
+        cond_fourier=e.COND_FOURIER, xattn_tokens=e.XATTN_TOKENS,
+        xattn_dim=e.XATTN_DIM, xattn_heads=e.XATTN_HEADS,
         name=f"{e.PROPERTY}_adapter", cond_type=e.PROPERTY)
     e["adapter/num_params"] = sum(p.numel() for p in adapter.parameters())
-    e.log(f"adapter: {e['adapter/num_params']:,} params (interior_ff={e.INTERIOR_FF} interior_attn={e.INTERIOR_ATTN}; "
+    e.log(f"adapter: {e['adapter/num_params']:,} params (interior_ff={e.INTERIOR_FF} interior_attn={e.INTERIOR_ATTN} "
+          f"cond_fourier={e.COND_FOURIER} xattn_tokens={e.XATTN_TOKENS}; "
           f"base {sum(p.numel() for p in base.parameters()):,} frozen)")
+    # Condition dropout with cross-attention needs Modulation.bypass_rows to silence the
+    # cross-attention delta as well as the FiLM gates. It does -- but say so out loud,
+    # because "unconditional branch is still conditioned" is invisible in the loss.
+    if e.XATTN_TOKENS and e.COND_DROP_PROB:
+        e.log(f"note: cond_drop_prob={e.COND_DROP_PROB} with cross-attention; "
+              f"bypass_rows scales the xattn delta to zero on dropped rows "
+              f"(tests/test_adapter.py::test_xattn_bypass_rows_silences_it)")
 
     module = AdapterModule(base, adapter, cond_attr="cond", cond_drop_prob=e.COND_DROP_PROB,
                            lr=e.LEARNING_RATE, l10_lr_scale=e.L10_LR_SCALE)
@@ -341,10 +419,14 @@ def experiment(e: Experiment) -> None:
     probe = AdapterPropProbe(e, base, adapter, atom_decoder, bond_decoder, prop_fn, targets,
                              e.PROBE_EVERY_K, e.PROBE_N, e.PROBE_STEPS, e.PROBE_WEIGHT, e.COMPOSE_MODE,
                              e.ETA, e.OMEGA, e.TIME_DISTORTION, e.EVAL_CHUNK)
+    callbacks = [probe]
+    if e.CKPT_EVERY_K:
+        callbacks.append(AdapterEpochCheckpoint(e, adapter, e.CKPT_EVERY_K, e.PROPERTY))
     trainer = pl.Trainer(max_epochs=e.EPOCHS, max_time={"hours": e.MAX_TIME_HOURS}, accelerator="auto",
                          devices=1, enable_progress_bar=True, enable_checkpointing=False, logger=False,
-                         gradient_clip_val=1.0, callbacks=[probe])
-    e.log(f"Training adapter: epochs<={e.EPOCHS} max_time={e.MAX_TIME_HOURS}h batch={e.BATCH_SIZE} LR={e.LEARNING_RATE}")
+                         gradient_clip_val=1.0, callbacks=callbacks)
+    e.log(f"Training adapter: epochs<={e.EPOCHS} max_time={e.MAX_TIME_HOURS}h batch={e.BATCH_SIZE} "
+          f"LR={e.LEARNING_RATE} ckpt_every={e.CKPT_EVERY_K or 'off'}")
     trainer.fit(module, train_dataloaders=train_loader)
 
     ckpt = adapter.save(os.path.join(e.path, f"{e.PROPERTY}_adapter"))
@@ -421,6 +503,7 @@ def testing(e: Experiment):
     e.EVAL_STEPS = 5
     e.PROBE_STEPS = 5
     e.PROBE_EVERY_K = 1
+    e.CKPT_EVERY_K = 1        # exercise the checkpoint path; it is the fix for a real loss
     e.PROBE_N = 6
     e.N_PER_TARGET = 8
     e.N_BASELINE = 8

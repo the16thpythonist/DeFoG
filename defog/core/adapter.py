@@ -27,6 +27,7 @@ Adapters are EXTERNAL objects (never attached to ``DeFoGModel``) so the base's
 ``save``/``load`` and every existing checkpoint are untouched.
 """
 
+import math
 import os
 import warnings
 from dataclasses import dataclass
@@ -48,6 +49,7 @@ _CONFIG_KEYS = frozenset({
     "cond_dim", "n_layers", "dims", "hidden", "time_conditioned", "streams",
     "time_emb_dim", "cond_mean", "cond_std", "name", "cond_type",
     "interior_ff", "interior_attn", "base_token", "cond_encoder",
+    "cond_fourier", "xattn_tokens", "xattn_dim", "xattn_heads",
 })
 
 
@@ -62,8 +64,18 @@ class Modulation:
     ``(B, channel)``. A zero ``gate`` makes that stream's delta exactly 0 (bypass).
     """
 
-    def __init__(self, layers: List[Dict[str, torch.Tensor]]):
+    def __init__(self, layers: List[Dict[str, torch.Tensor]], xattn=None):
         self.layers = layers
+        #: Optional per-layer node cross-attention, as a list (len == n_layers) of
+        #: ``[(row_slice, fn), ...]``. ``fn(X_slice, x_mask_slice) -> delta`` is a
+        #: closure over the adapter's own layer module and its condition tokens, which
+        #: is why this cannot be a plain tensor like the FiLM parameters: the module has
+        #: to run INSIDE the frozen base's stack, on that group's rows only.
+        #:
+        #: The (slice, fn) list-per-layer form is what "keeps the door open" for
+        #: N-branch stacking: a second branch is one more entry at a different offset.
+        #: It is refused today (untested, see AdapterComposition) rather than absent.
+        self.xattn = xattn
 
     def apply(self, i, X, E, y, x_mask, e_mask):
         """Apply layer ``i``'s modulation to the block outputs (gated residual).
@@ -76,6 +88,14 @@ class Modulation:
             E = E + e_mask * (m["gateE"][:, None, None] * (m["scaleE"][:, None, None] * E + m["shiftE"][:, None, None]))
         if "gatey" in m:
             y = y + m["gatey"] * (m["scaley"] * y + m["shifty"])
+        if self.xattn and self.xattn[i]:
+            # Built as a full-size delta and added, rather than assigned into X in
+            # place: X is needed for the backward pass, and an in-place write on it
+            # would either error or silently corrupt the gradient.
+            delta = torch.zeros_like(X)
+            for sl, fn in self.xattn[i]:
+                delta[sl] = fn(X[sl], x_mask[sl])
+            X = X + delta
         return X, E, y
 
     def bypass_rows(self, mask: torch.Tensor) -> "Modulation":
@@ -88,35 +108,164 @@ class Modulation:
                 if k.startswith("gate"):
                     d[k] = torch.where(mask[:, None], torch.zeros_like(d[k]), d[k])
             out.append(d)
-        return Modulation(out)
+        xa = None
+        if self.xattn:
+            # Zeroing the FiLM gates alone would NOT make a dropped row bypass to the
+            # base once cross-attention exists -- its delta does not pass through any
+            # gate. Scale it per row instead, or condition dropout silently trains a
+            # model whose "unconditional" branch is still conditioned.
+            keep = (~mask).to(torch.float32)
+            xa = [[(sl, _row_scaled(fn, keep[sl])) for sl, fn in entries]
+                  for entries in self.xattn]
+        return Modulation(out, xattn=xa)
 
     @staticmethod
-    def stack_groups(mods: Sequence["Modulation"], bs: int, device) -> "Modulation":
-        """Build a ``(N+1)·bs`` modulation: group 0 = uncond (all-zero => bypass),
+    def stack_groups(mods: Sequence["Modulation"], bs: int, device,
+                     guide: Optional["Modulation"] = None) -> "Modulation":
+        """Build a ``(N+1)·bs`` modulation: group 0 = the negative branch,
         groups 1..N = each adapter's modulation, concatenated along the batch dim.
 
         Robust to HETEROGENEOUS key sets across branches: an adapter that lacks an
         interior key (e.g. an output-only adapter composed with an interior-enabled
         one) is treated as gate=0 -> exact bypass at that site. Takes the UNION of
-        keys over all branches and zero-fills any key a branch does not define."""
-        n_layers = len(mods[0].layers)
+        keys over all branches and zero-fills any key a branch does not define.
+
+        ``guide`` is the AUTOGUIDANCE hook. Without it group 0 is all-zero, i.e. an
+        exact bypass to the frozen base -- the unconditional branch of ordinary CFG,
+        and the historical behaviour. With it, group 0 carries a DEGRADED CONDITIONAL's
+        modulation instead, so the blend pushes away from a weak version of the same
+        conditional model rather than away from the unconditional one (Karras et al.'s
+        autoguidance; MolGuidance reports it improving structural validity where CFG
+        costs it).
+
+        Note the invariant this preserves: a guide whose gates are all zero produces
+        exactly the zero row, so autoguidance with an *untrained* guide reduces to
+        standard CFG bit-for-bit. That is what ``test_guide_at_init_is_plain_cfg``
+        pins down, and it is why the zero-init gate convention had to be kept."""
+        all_mods = list(mods) if guide is None else [guide, *mods]
+        n_layers = len(all_mods[0].layers)
+        for m in all_mods:
+            assert len(m.layers) == n_layers, (
+                f"modulation layer-count mismatch: {len(m.layers)} != {n_layers}; "
+                f"a guide adapter must have the same n_layers as the branches")
         combined = []
         for L in range(n_layers):
             keys = set()
-            for m in mods:
+            for m in all_mods:
                 keys |= set(m.layers[L].keys())
             d = {}
             for k in sorted(keys):
-                ch = next(m.layers[L][k].shape[-1] for m in mods if k in m.layers[L])
-                zero = torch.zeros(bs, ch, device=device)
-                rows = [zero]                                    # group-0 uncond bypass
-                for m in mods:
-                    t = m.layers[L].get(k)
+                ch = next(m.layers[L][k].shape[-1] for m in all_mods if k in m.layers[L])
+                # group 0 first, then one row per branch. A missing key (or no guide at
+                # all) becomes zeros, which is an exact bypass at that site.
+                rows = []
+                for m in (guide, *mods):
+                    t = None if m is None else m.layers[L].get(k)
                     rows.append(t if t is not None else torch.zeros(bs, ch, device=device))
                 d[k] = torch.cat(rows, dim=0)
             combined.append(d)
-        return Modulation(combined)
 
+        # Cross-attention closures are re-homed from "all rows" onto this group's
+        # rows. Group g occupies [g*bs, (g+1)*bs); group 0 is the negative branch.
+        xa = None
+        if any(m.xattn for m in all_mods):
+            xa = [[] for _ in range(n_layers)]
+            for g, m in enumerate(all_mods if guide is not None else [None, *mods]):
+                if m is None or not m.xattn:
+                    continue
+                off = g * bs
+                for L in range(n_layers):
+                    for sl, fn in m.xattn[L]:
+                        assert sl == slice(None), (
+                            "stack_groups expects each source modulation to carry "
+                            "whole-batch cross-attention entries; got a pre-sliced one")
+                        xa[L].append((slice(off, off + bs), fn))
+        return Modulation(combined, xattn=xa)
+
+
+def _bind_xattn(module, tokens: torch.Tensor):
+    """Bind one layer's cross-attention module to this call's condition tokens.
+
+    The result is what ``Modulation`` carries: ``fn(X, x_mask) -> masked delta``. The
+    mask is applied to the DELTA, never to X, so a padded row is left exactly as the
+    frozen base left it -- the same contract the FiLM path uses."""
+    def fn(X, x_mask):
+        return x_mask * module(X, tokens)
+    return fn
+
+
+def _row_scaled(fn, keep: torch.Tensor):
+    """Wrap a cross-attention closure so its delta is scaled per row (0 = bypass)."""
+    def wrapped(X, x_mask):
+        return fn(X, x_mask) * keep.view(-1, *([1] * (X.dim() - 1)))
+    return wrapped
+
+
+class NodeConditionCrossAttention(nn.Module):
+    """One frozen-base layer's cross-attention from NODES to condition tokens.
+
+    Why this exists. The FiLM path computes every scale/shift/gate from ``c`` alone and
+    broadcasts the same numbers to every atom: ``RESEARCH.md`` §2.2 calls this an
+    open-loop controller and argues it is why property targeting plateaus -- logP is a
+    sum of per-atom environment contributions, so the right action at a given atom
+    depends on that atom, and a uniform push cannot express it.
+
+    Here each atom forms a QUERY from its own current representation and pulls a weighted
+    mixture of condition tokens.
+
+    BE PRECISE ABOUT WHAT THIS BUYS, because the obvious claim is wrong. "Two atoms get
+    different deltas" is ALREADY true of FiLM -- its delta at node i is
+    ``g(c) * (s(c) * X_i + b(c))``, which varies with X_i. Both mechanisms are node-local
+    functions of ``(X_i, c)``. The difference is the FORM of that function: FiLM applies
+    one DIAGONAL AFFINE map, identical for every atom, whereas cross-attention is a
+    content-addressed nonlinear lookup -- the atom's own representation selects which
+    condition tokens it reads, so different kinds of atom can receive qualitatively
+    different corrections rather than the same correction scaled per channel.
+
+    Because those representations come out of the frozen base's own message passing, by
+    the middle layers a query already reflects the atom's neighbourhood, not just its
+    element. It is still NOT the global running total that a closed-loop readout
+    (PLAN.md Wave 5) would provide: nothing here tells the adapter what the partial
+    molecule's logP currently is.
+
+    Structure follows IP-Adapter: a SEPARATE attention path added to the frozen block's
+    output, with a ZERO-INITIALISED output projection, so at init the delta is exactly
+    zero and the base is reproduced bit-for-bit. That is the same invariant the zero-init
+    FiLM gate provides, and the product-of-experts composition depends on it.
+
+    Applied at the layer OUTPUT (via :meth:`Modulation.apply`) rather than spliced inside
+    the block: the frozen base's own attention is untouched, so nothing about its
+    computation changes and the only new tensor is an additive residual.
+    """
+
+    def __init__(self, dx: int, d_tok: int, n_heads: int = 8):
+        super().__init__()
+        if dx % n_heads:
+            raise ValueError(f"dx={dx} not divisible by n_heads={n_heads}")
+        self.dx, self.d_tok, self.n_heads = int(dx), int(d_tok), int(n_heads)
+        # Pre-norm on the query side only. The frozen base's activation scale is not
+        # ours to assume, and an unnormalised query would make the attention logits
+        # depend on it; the keys/values come from our own tokens and are already tame.
+        self.norm = nn.LayerNorm(dx)
+        self.q = nn.Linear(dx, dx)
+        self.k = nn.Linear(d_tok, dx)
+        self.v = nn.Linear(d_tok, dx)
+        self.out = nn.Linear(dx, dx)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)          # zero-init => exact no-op at init
+
+    def forward(self, X: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """``X`` (B,n,dx), ``tokens`` (B,m,d_tok) -> delta (B,n,dx)."""
+        B, n, _ = X.shape
+        h, dh = self.n_heads, self.dx // self.n_heads
+        q = self.q(self.norm(X)).view(B, n, h, dh).transpose(1, 2)          # B,h,n,dh
+        k = self.k(tokens).view(B, -1, h, dh).transpose(1, 2)               # B,h,m,dh
+        v = self.v(tokens).view(B, -1, h, dh).transpose(1, 2)
+        att = torch.softmax(q @ k.transpose(-1, -2) / math.sqrt(dh), dim=-1)
+        o = (att @ v).transpose(1, 2).reshape(B, n, self.dx)
+        return self.out(o)
+        # NOTE: no mask over the KEYS -- condition tokens are always present. Padded
+        # QUERY rows are zeroed by the caller's x_mask, same as the FiLM delta.
 
 # ===========================================================================
 # AdaLNAdapter: c -> per-layer modulation
@@ -256,7 +405,9 @@ class AdaLNAdapter(nn.Module):
                  cond_mean=None, cond_std=None, name: str = "", cond_type: str = "",
                  interior_ff: bool = False, interior_attn: bool = False,
                  base_token: Optional[float] = None,
-                 cond_encoder: Optional[nn.Module] = None):
+                 cond_encoder: Optional[nn.Module] = None,
+                 cond_fourier: int = 0, xattn_tokens: int = 0,
+                 xattn_dim: int = 128, xattn_heads: int = 8):
         super().__init__()
         self.cond_dim = cond_dim
         self.n_layers = n_layers
@@ -269,6 +420,10 @@ class AdaLNAdapter(nn.Module):
         self.interior_ff = bool(interior_ff)      # L4: pre-FFN FiLM on X,E
         self.interior_attn = bool(interior_attn)  # L10: condition e_mul (edge->attn logits)
         self.base_token = base_token
+        self.cond_fourier = int(cond_fourier)     # Fourier bands on the condition (0 = off)
+        self.xattn_tokens = int(xattn_tokens)     # node->condition cross-attention (0 = off)
+        self.xattn_dim = int(xattn_dim)
+        self.xattn_heads = int(xattn_heads)
 
         # An encoder, when present, sits between the (already normalised) condition and the
         # trunk, so everything downstream — state_dict, ConditionBranch, the package format —
@@ -284,7 +439,49 @@ class AdaLNAdapter(nn.Module):
             cond_encoder = _COND_ENCODERS[kind](**spec)
         self.cond_encoder = cond_encoder
         encoded_dim = cond_dim if cond_encoder is None else int(cond_encoder.out_dim)
-        cond_in = encoded_dim + (time_emb_dim if time_conditioned else 0)
+
+        # --- Fourier features on the (normalised) condition ---------------------
+        # The trunk otherwise sees the property as ONE raw float while the flow-time
+        # gets a 64-dim sinusoidal embedding. Tancik et al. (arXiv:2006.10739): an MLP
+        # over a low-dimensional input converges to the high-frequency part of its
+        # target impractically slowly, so the learned map c -> modulation gets the
+        # smooth part long before the part that distinguishes 3.5 from 4.2. That is
+        # the measured failure signature -- bias without tracking.
+        #
+        # LOW-DIMENSIONAL ONLY, which is the regime the result is about. A fingerprint
+        # or spectrum condition goes through its own encoder instead; expanding 512 hash
+        # bits into bands would be both meaningless and enormous.
+        if self.cond_fourier:
+            if cond_encoder is not None:
+                raise ValueError("cond_fourier is for a raw low-dimensional condition; "
+                                 "this adapter already has a cond_encoder")
+            if cond_dim > 8:
+                raise ValueError(f"cond_fourier with cond_dim={cond_dim}: Fourier features "
+                                 f"are for LOW-dimensional conditions (<= 8)")
+            # Frequencies 0.5, 1, 2, ... cycles per z-unit on the z-scored condition.
+            #
+            # THE BANDWIDTH IS A CEILING, NOT A KNOB TO RAISE. The band vector must stay
+            # SIMILAR for nearby targets (so the adapter interpolates to targets it never
+            # saw, which is most of them) while being clearly DIFFERENT for far ones.
+            # Measured cosine similarity of the feature vector on ZINC logP
+            # (cond_std 1.158, targets spanning ~9.3 units, i.e. ~8 z):
+            #
+            #     n   f_max   cycles/range   cos(0.1 logP)   cos(2.5 logP)
+            #     2     1.0        8            0.910            0.722     under-resolved
+            #     3     2.0       16            0.763            0.358     <- default
+            #     4     4.0       32            0.432            0.087
+            #     6    16.0      128            0.105           -0.099     aliased
+            #     8    64.0      512           -0.039            0.162     noise
+            #
+            # n=3 keeps neighbours correlated while separating the ends; by n=6 a
+            # 0.1-logP step has already decorrelated the features and the mapping is
+            # memorisation, not interpolation. The raw normalised scalar rides alongside
+            # and carries the smooth component, so the bands only have to add resolution.
+            # `test_fourier_bandwidth_keeps_neighbours_correlated` fails if this aliases.
+            self.register_buffer("fourier_freqs",
+                                 0.5 * (2.0 ** torch.arange(self.cond_fourier, dtype=torch.float32)))
+        fourier_dim = 2 * cond_dim * self.cond_fourier
+        cond_in = encoded_dim + fourier_dim + (time_emb_dim if time_conditioned else 0)
         self.trunk = nn.Sequential(
             nn.Linear(cond_in, hidden), nn.SiLU(),
             nn.LayerNorm(hidden), nn.Linear(hidden, hidden), nn.SiLU(),
@@ -327,6 +524,14 @@ class AdaLNAdapter(nn.Module):
                 a_l["gate"] = g
                 self.attn.append(a_l)
 
+        # --- node -> condition cross-attention (one module per layer) -----------
+        if self.xattn_tokens:
+            self.tok = nn.Linear(hidden, self.xattn_tokens * self.xattn_dim)
+            self.xattn = nn.ModuleList([
+                NodeConditionCrossAttention(dims["dx"], self.xattn_dim, self.xattn_heads)
+                for _ in range(n_layers)
+            ])
+
         m = torch.zeros(cond_dim) if cond_mean is None else torch.as_tensor(cond_mean, dtype=torch.float32).reshape(-1)
         s = torch.ones(cond_dim) if cond_std is None else torch.as_tensor(cond_std, dtype=torch.float32).reshape(-1).clamp_min(1e-6)
         self.register_buffer("cond_mean", m)   # buffer -> follows .to(device) and is in state_dict
@@ -347,16 +552,31 @@ class AdaLNAdapter(nn.Module):
     def normalize(self, c: torch.Tensor) -> torch.Tensor:
         return (c - self.cond_mean) / self.cond_std
 
+    def _fourier(self, c_norm: torch.Tensor) -> torch.Tensor:
+        """(B, D) normalised condition -> (B, 2*D*n_bands) sin/cos features."""
+        ang = 2.0 * math.pi * c_norm.unsqueeze(-1) * self.fourier_freqs   # (B, D, F)
+        return torch.cat([ang.sin(), ang.cos()], dim=-1).flatten(1)
+
     def forward(self, c: torch.Tensor, t: Optional[torch.Tensor] = None) -> Modulation:
-        c = self.normalize(c.float())
-        if self.cond_encoder is not None:
-            c = self.cond_encoder(c)
+        c_norm = self.normalize(c.float())
+        # The encoder replaces the raw condition; Fourier features ACCOMPANY it. The raw
+        # normalised scalar is kept alongside the bands so nothing the trunk could learn
+        # before is taken away -- turning the feature on cannot lose information.
+        parts = [self.cond_encoder(c_norm) if self.cond_encoder is not None else c_norm]
+        if self.cond_fourier:
+            parts.append(self._fourier(c_norm))
         if self.time_conditioned:
             assert t is not None, "time_conditioned adapter requires t"
-            temb = timestep_embedding(t.reshape(-1, 1), self.time_emb_dim)
-            h = self.trunk(torch.cat([c, temb], dim=-1))
-        else:
-            h = self.trunk(c)
+            parts.append(timestep_embedding(t.reshape(-1, 1), self.time_emb_dim))
+        h = self.trunk(torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0])
+
+        xattn = None
+        if self.xattn_tokens:
+            tokens = self.tok(h).view(h.size(0), self.xattn_tokens, self.xattn_dim)
+            # slice(None) here; Modulation.stack_groups re-homes each closure onto its
+            # group's rows when the branches are batched together.
+            xattn = [[(slice(None), _bind_xattn(mod, tokens))] for mod in self.xattn]
+
         layers = []
         for L in range(self.n_layers):
             d = {}
@@ -372,7 +592,7 @@ class AdaLNAdapter(nn.Module):
                 sc, sh = self.attn[L]["ss"](h).chunk(2, dim=-1)
                 d["scale_emul"], d["shift_emul"], d["gate_emul"] = sc, sh, self.attn[L]["gate"](h)
             layers.append(d)
-        return Modulation(layers)
+        return Modulation(layers, xattn=xattn)
 
     def interior_attn_parameters(self):
         """L10 head params (for an optional smaller-LR optimizer group)."""
@@ -401,7 +621,9 @@ class AdaLNAdapter(nn.Module):
                     streams=list(self.streams), time_emb_dim=self.time_emb_dim,
                     name=self.name, cond_type=self.cond_type,
                     interior_ff=self.interior_ff, interior_attn=self.interior_attn,
-                    base_token=self.base_token)
+                    base_token=self.base_token,
+                    cond_fourier=self.cond_fourier, xattn_tokens=self.xattn_tokens,
+                    xattn_dim=self.xattn_dim, xattn_heads=self.xattn_heads)
 
     def config(self) -> dict:
         """The architecture config needed to rebuild this adapter (public alias).
@@ -468,13 +690,34 @@ class ConditionBranch:
     weight: float = 2.0
 
 
+@dataclass
+class GuideBranch:
+    """The negative branch for autoguidance: a DEGRADED conditional model.
+
+    Ordinary CFG blends away from the frozen unconditional base. Autoguidance blends
+    away from a deliberately worse version of the *conditional* model -- undertrained,
+    or lower-capacity -- so that the flaws the two share cancel and only the quality
+    difference is amplified. The guide is normally conditioned on the SAME target as
+    the branch it negates.
+
+    Deliberately NOT a :class:`ConditionBranch`. That type carries a ``weight``, and a
+    weight on group 0 does nothing: ``_blend_logp`` reads group 0 as the baseline the
+    other branches are measured against, so a ``weight`` field here would be silently
+    ignored. Having no such field is the difference between a knob that does nothing
+    and a knob that *looks* like it does something.
+    """
+
+    adapter: AdaLNAdapter
+    condition: torch.Tensor
+
+
 class AdapterComposition:
     """N-branch product-of-experts spec consumed by ``denoise_step`` /
     ``AdaptedSampler``. ``mode='product'`` sums the log-ratios; ``'mean'`` averages
     (recommended for N>1 to keep the effective uncond coefficient bounded)."""
 
     def __init__(self, branches: Sequence[ConditionBranch], base=None, mode: str = "product",
-                 blend_space: str = "prob"):
+                 blend_space: str = "prob", guide: Optional[GuideBranch] = None):
         """
         ``mode`` is the FORM of the blend (geometric product vs its per-branch mean).
         ``blend_space`` is WHERE it is applied, and the two are independent axes:
@@ -499,27 +742,71 @@ class AdapterComposition:
         self.branches = list(branches)
         self.mode = mode
         self.blend_space = blend_space
+        self.guide = guide
+        if guide is not None:
+            # One guide negates one branch. With N>1 there is no defined answer to
+            # "which target is the guide conditioned on", and silently reusing one
+            # branch's target would make the other branches' guidance mean something
+            # nobody chose.
+            if len(self.branches) != 1:
+                raise ValueError(
+                    f"autoguidance is defined for a single branch; got {len(self.branches)}. "
+                    f"Compose without a guide, or run one property at a time.")
+            # blend_space="rate" reads group 0 as the base in a way autoguidance breaks:
+            # `_blend_rates` zeroes any transition where R[0] == 0, on the reasoning that
+            # a structurally-forbidden transition stays forbidden. With a guide, R[0] is
+            # the GUIDE's rate matrix, so that guard would silently start deriving the
+            # forbidden set from a degraded model. Untested, and the combination has no
+            # use: the w>1 sweep autoguidance exists to enable is exactly what rate space
+            # cannot do.
+            if blend_space != "prob":
+                raise ValueError(
+                    f"autoguidance requires blend_space='prob', got {blend_space!r}. "
+                    f"In rate space the forbidden-transition guard would be derived from "
+                    f"the guide instead of the base, and w>1 is broken there anyway.")
+        # Cross-attention branches: single-branch only, for now, ON PURPOSE.
+        # Modulation carries them as (row_slice, closure) per layer, so a second branch
+        # is structurally just one more entry at a different offset -- the door is open.
+        # It is refused rather than allowed because nothing tests it, and an untested
+        # composition path that "should work" is how a wrong number gets shipped. Delete
+        # this guard together with a test that stacks two xattn adapters.
+        n_xattn = sum(1 for b in self.branches if getattr(b.adapter, "xattn_tokens", 0))
+        if n_xattn > 1:
+            raise NotImplementedError(
+                f"{n_xattn} branches use node cross-attention; stacking them is untested. "
+                f"Compose at most one cross-attention adapter (FiLM-only adapters stack "
+                f"as before), or add a test and remove this guard.")
         if base is not None:
             for b in self.branches:
                 b.adapter.check_compatible(base)
+            if guide is not None:
+                guide.adapter.check_compatible(base)
 
     def __len__(self):
         return len(self.branches)
 
+    @staticmethod
+    def _broadcast_condition(condition, bs: int, device) -> torch.Tensor:
+        c = torch.as_tensor(condition, dtype=torch.float32, device=device)
+        if c.dim() == 1:
+            c = c.unsqueeze(0)
+        if c.size(0) == 1 and bs > 1:
+            c = c.expand(bs, -1)
+        assert c.size(0) == bs, f"branch condition batch {c.size(0)} != {bs}"
+        return c
+
     @torch.no_grad()
     def build_modulation(self, bs: int, t: torch.Tensor) -> Modulation:
-        """Combined ``(N+1)·bs`` modulation: group 0 uncond bypass, group i = adapter_i."""
+        """Combined ``(N+1)·bs`` modulation: group 0 = the negative branch (the frozen
+        base by default, the guide under autoguidance), group i = adapter_i."""
         device = t.device
-        mods = []
-        for br in self.branches:
-            c = torch.as_tensor(br.condition, dtype=torch.float32, device=device)
-            if c.dim() == 1:
-                c = c.unsqueeze(0)
-            if c.size(0) == 1 and bs > 1:
-                c = c.expand(bs, -1)
-            assert c.size(0) == bs, f"branch condition batch {c.size(0)} != {bs}"
-            mods.append(br.adapter(c, t=t))
-        return Modulation.stack_groups(mods, bs, device)
+        mods = [br.adapter(self._broadcast_condition(br.condition, bs, device), t=t)
+                for br in self.branches]
+        guide_mod = None
+        if self.guide is not None:
+            guide_mod = self.guide.adapter(
+                self._broadcast_condition(self.guide.condition, bs, device), t=t)
+        return Modulation.stack_groups(mods, bs, device, guide=guide_mod)
 
     def weights(self, device, dtype=torch.float32) -> torch.Tensor:
         """``(N,)`` for scalar branch weights, ``(N, bs)`` if any branch carries a
