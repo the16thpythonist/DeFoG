@@ -441,6 +441,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                  head_scale: float = 1.0, head_clamp: float = 3.0,
                  t_sampler: str = "match", debias: str = "snis",
                  null_adjoint: bool = False, coupled: bool = False,
+                 n_z: int = 1, sub_chunk_rows: int = 256,
                  lr: float = 1e-5, weight_decay: float = 1e-5, ema_decay=0.999,
                  **gdpo_kw):
         super().__init__(base, adapter, cond_reward, ref_adapter=None, kl_coef=0.0,
@@ -476,6 +477,24 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         # jumps of one of the trajectory" presupposes line 6's trajectories, and the
         # one-shot head draws Z at y with no path connecting it to the denominator.
         self.coupled = bool(coupled)
+        # Continuations per trajectory. Measured on the real model
+        # (`scripts/snr.py`): resolving ONE edit's effect on the final score takes
+        # ~21 continuations at t=0.978 and ~38 at t=0.75, against the ONE the
+        # estimator uses -- a 20-40x sample shortfall on every adjoint it computes.
+        # Common random numbers do not fix it (1.1-1.5x; the process is chaotic, only
+        # 17-54% of matched pairs reach the same molecule), so the lever is simply
+        # more samples.
+        #
+        # These are averaged into BOTH sides of the ratio, because the K bundles are
+        # the denominator and one of them is the numerator. Improving the numerator
+        # alone would cap the gain at 1 + 1/K ~ 9x however large n_z got.
+        self.n_z = int(n_z)
+        self.sub_chunk_rows = int(sub_chunk_rows)
+        if self.n_z > 1 and not self.coupled:
+            raise ValueError(
+                "n_z > 1 averages continuations within each of Alg. 1 line 6's K "
+                "trajectories, which only exist under coupled=True."
+            )
         if self.coupled and candidate_mode != "simulate":
             raise ValueError(
                 "coupled=True implements DAM Alg. 1 line 7, which takes (Y, Z) from "
@@ -536,6 +555,28 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                                eta=self.eta, omega=0.0,
                                composition=self._composition(cr))
 
+    def _bundle_scores(self, X, E, nm, cond, t_int, n_z):
+        """``-log mean_r exp(-g)`` over ``n_z`` continuations from each row of (X, E).
+
+        The value at a state is ``E[e^{-g}]``, so the average must be taken in the
+        EXPONENTIATED scores. Averaging ``g`` and exponentiating afterwards is a
+        different quantity -- smaller by Jensen -- and would bias the adjoint.
+
+        Chunked over reps because ``n_z * K * bs`` rows do not fit: at n_z=50, K=8,
+        bs=16 that is 6400 graphs in one sub-rollout.
+        """
+        bs = X.shape[0]
+        per = max(1, self.sub_chunk_rows // max(bs, 1))
+        out, done = [], 0
+        while done < n_z:
+            r = min(per, n_z - done)
+            sX, sE = self._simulate_endpoints(X, E, nm, cond, t_int, r)
+            g = self._terminal_loss(sX, sE, nm.repeat(r, 1), cond.repeat(r, 1))
+            out.append(g.view(r, bs))
+            done += r
+        g_all = torch.cat(out, 0)                                   # (n_z, bs)
+        return -(torch.logsumexp(-g_all, dim=0) - math.log(n_z))
+
     def _coupled_draws(self, uX, uE, X_t, E_t, nm, cond, t_int):
         """DAM Alg. 1 lines 6-7: (Y, Z) are the first and last jumps of ONE trajectory.
 
@@ -573,8 +614,7 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
             X_t.repeat(K, 1, 1), E_t.repeat(K, 1, 1, 1), nmk)
         # ...then each trajectory runs to t=1. Its endpoint serves as a denominator
         # sample for every state, and as the numerator's Z for the chosen one.
-        s1X, s1E = self._simulate_endpoints(XY_a, EY_a, nmk, ck, t_int, 1)
-        g_a = self._terminal_loss(s1X, s1E, nmk, ck)
+        g_a = self._bundle_scores(XY_a, EY_a, nmk, ck, t_int, self.n_z)
         g_X1 = g_a.view(K, bs).t().contiguous()
         lr_X1 = torch.zeros_like(g_X1)          # ratios are 1: Prop 2.3 / Eq. (12)
 

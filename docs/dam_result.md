@@ -149,6 +149,49 @@ that. The paired differences meanwhile stay within +-0.010 across seeds on edges
 null is what absorbs the shared variance; without it nothing at this scale is
 resolvable, which is why no configuration before it produced an interpretable number.
 
+## Why it does not work: the estimator is short by 20-40x
+
+`scripts/snr.py` measures the thing the adjoint actually needs -- the effect of ONE
+edit on the final score -- against the noise of everything the trajectory does after
+it. 4 states x 3 edits, 24 continuations per side, matched seeds:
+
+| t | steps left | n needed (unpaired) | n needed (paired) | CRN variance reduction |
+|---|---|---|---|---|
+| 0.978 | 15 | **21** | 14 | 1.5x |
+| 0.750 | 50 | **38** | 33 | 1.1x |
+
+**DAM uses ONE continuation per estimate. It needs 20-40.** Per-edit effects are real
+(0.01-0.20) but sit under a spread of 0.1-1.3 from downstream randomness, so every
+correction the method computes is several sigma of noise around a one-sigma signal.
+The training config (`subsample='late'`) sits at t=0.938, so ~21-25.
+
+That is the answer to "it is a published method, why does it not work here". Two
+differences from DAM's own experiments, which are masked diffusion LANGUAGE models:
+
+* **Their edits are permanent.** Unmasking a token can never be undone, so the first
+  jump's effect reaches the endpoint intact. DeFoG is a general CTMC -- a bond can go
+  single -> double -> single, so an edit at t=0.9 may simply be reverted.
+* **Their reward is decisive per edit.** A wrong digit in Sudoku takes the reward from
+  1 to 0. logP averages over ~40 atoms, so no single bond moves it much.
+
+One edit is nearly the whole outcome there; it is a rounding error here. Same
+estimator, different noise regime.
+
+### Common random numbers do not fix it
+
+Running the continuations from `x` and from `y` on an identical random stream gives
+only 1.1-1.5x. The `same_end` column says why: 17-54% of matched pairs reach the same
+molecule. The two states differ by one coordinate, but the network conditions on the
+whole graph, so its output shifts everywhere, coordinates flip on the first step and
+the trajectories decorrelate immediately. **Any variance reduction that relies on
+coupling two trajectories will hit this same wall.**
+
+### Correction: signal does NOT rise as t falls
+
+The t-band sweep read rising `g_spread` (0.413 -> 0.541) as more signal at low t. It
+is not. This shows the spread grows while the per-edit effect SHRINKS -- `n` goes from
+21 to 38 -- so what rises at low t is noise. The late band was the better one.
+
 ## Established / not established
 
 **Established.** `resid`'s ceiling is 1.0 and its pass mark was unreachable; its
