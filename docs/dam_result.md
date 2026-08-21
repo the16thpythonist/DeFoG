@@ -192,14 +192,68 @@ The t-band sweep read rising `g_spread` (0.413 -> 0.541) as more signal at low t
 is not. This shows the spread grows while the per-edit effect SHRINKS -- `n` goes from
 21 to 38 -- so what rises at low t is noise. The late band was the better one.
 
+## Averaging continuations: the shortfall was real but NOT the constraint
+
+`n_z` continuations averaged inside each of the K trajectories, lambda=0.3, lr=3e-4,
+K=8, minibatch 16, pre-RL base (`scripts/nz_sweep.py`):
+
+| n_z | iters | sd(a_hat) | diff nodes | diff edges | drift real/null | noop real/null |
+|---|---|---|---|---|---|---|
+| 1 | 12 | 0.568 | -0.039 | -0.005 | 0.044 / 0.030 | -- |
+| 10 | 12 | **0.116** | +0.121 | +0.046 | 0.031 / 0.032 | -- |
+| 50 | 6 | **0.116** | -0.605 | +1.382 | 0.034 / 0.052 | 0.027 / 0.092 |
+
+**1. The averaging worked, and it saturates at n_z=10.** `sd(a_hat)` falls 0.568 ->
+0.116 and then does NOT move at n_z=50. So estimator noise is gone by n_z=10 and the
+remaining 0.116 is genuine between-jump and between-state variation, which averaging
+continuations cannot remove. Back out the noise at n_z=1:
+`sqrt(0.568^2 - 0.116^2) = 0.556`, a noise/signal ratio of 4.8, implying ~23 samples
+-- an independent confirmation of `snr.py`'s 21-25 by a completely different route.
+
+**2. Removing the noise does not make the update helpful.** The n_z=10 comparison is
+clean -- drift 0.031 vs 0.032, `sd(a_hat)` 0.116 vs 0.111 -- and the real arm is WORSE
+than its null in both channels. The 20-40x sample shortfall is real and was not the
+binding constraint.
+
+**3. The n_z=50 row is confounded; do not read it.** Drift differs 1.5x (0.034 vs
+0.052) and the target scale `noop` differs 3.4x (0.027 vs 0.092), so real and null are
+not on a common footing. `-0.605 / +1.382` means nothing.
+
+**4. First outcome measurement.** Untrained: reward -1.4741, 54/64 decode, logP MAE
+0.6730. After 6 iterations at n_z=50: reward -1.6229, 51/64, MAE 0.6640. No change in
+either direction -- the MAE difference is nothing at n=52 and the reward drop tracks
+the validity drop, itself within binomial noise. Six iterations is far too little
+training for this to rule anything out, but it establishes the harness and baseline.
+
+### Retraction: the edge effect does not survive noise removal
+
+`docs/dam_result.md` previously reported edges as a reproducible signal, -0.026 +-
+0.010 across three seeds at n_z=1. It flips to **+0.046 at n_z=10 with matched drift**.
+A genuine directional signal should get CLEARER when estimator noise is removed, not
+reverse. The likeliest reading is that the effect was an artifact of noise interacting
+with the ratio, not the adjoint pointing anywhere useful. **The "edges replicate,
+nodes are noise" finding is withdrawn.** What replicated was a property of the metric.
+
+### `resid` has now failed in three distinct ways
+
+1. Its ceiling is 1.0 when the target carries no learnable signal, so the pass mark
+   was unreachable (`d30062c`).
+2. Its absolute value has ~0.8 run-to-run scatter, swallowing every reported cell.
+3. Its denominator `noop` varies between arms and shrinks as the adjoint sharpens, so
+   it is comparable neither across `n_z` nor, at n_z=50, between real and null.
+
+It should not be used again. Any further DAM work here has to be judged on generated
+outcomes at realistic training length.
+
 ## Established / not established
 
-**Established.** `resid`'s ceiling is 1.0 and its pass mark was unreachable; its
-absolute value has ~0.8 run-to-run scatter and is uninterpretable unpaired. Against a
-matched null the adjoint carries a small, reproducible directional signal **on edges**
-(-0.026 +- 0.010 over three seeds, negative in 8/9 cells) and **none on nodes** (sign
-flips, 36x the spread). Alg. 1's coupling fixes `E[a_hat]` at 1 as specified. Neither
-the coupling nor a restored temperature increases the signal.
+**Established.** `resid` is unusable (three independent failure modes above). The
+estimator's noise/signal ratio is ~4.8 at one continuation per estimate, needing ~23
+to resolve -- measured two independent ways -- and `n_z=10` removes it entirely.
+Alg. 1's coupling fixes `E[a_hat]` at 1 as specified. **None of the three suppressors
+was the binding constraint**: not the estimator bias (coupling), not the temperature
+(lambda=1.0), not the sample shortfall (n_z). Each was removed and measured; none
+produced a usable update.
 
 **Not established.** That DAM steers DeFoG. A 2.6% residual reduction on one channel is
 not a property shift; no molecules were generated and no logP was measured in any of

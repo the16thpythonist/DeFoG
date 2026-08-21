@@ -708,7 +708,8 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         tot, log_a_sum, clamp_sum = 0.0, 0.0, 0.0
         resid_sum = {"resid_ratio": 0.0, "resid_nodes": 0.0, "resid_edges": 0.0,
                      "g_spread": 0.0, "drift": 0.0, "drift_nodes": 0.0,
-                     "a_mean": 0.0, "a_sd": 0.0, "orc_flat": 0.0, "orc_state": 0.0}
+                     "a_mean": 0.0, "a_sd": 0.0, "orc_flat": 0.0, "orc_state": 0.0,
+                     "noop_mag": 0.0}
         resid_n = {k: 0 for k in resid_sum}
         for (X_t, E_t, t), t_i in zip(states, step_idx):
             loss, d = self._state_loss(X_t, E_t, t, nm, cond, t_i)
@@ -732,7 +733,8 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
         out["resid_gkl_ratio"] = resid_sum["resid_ratio"] / max(resid_n["resid_ratio"], 1)
         out["resid_gkl_nodes"] = resid_sum["resid_nodes"] / max(resid_n["resid_nodes"], 1)
         out["resid_gkl_edges"] = resid_sum["resid_edges"] / max(resid_n["resid_edges"], 1)
-        for k in ("drift", "drift_nodes", "a_mean", "a_sd", "orc_flat", "orc_state"):
+        for k in ("drift", "drift_nodes", "a_mean", "a_sd", "orc_flat",
+                  "orc_state", "noop_mag"):
             out[k] = resid_sum[k] / max(resid_n[k], 1)
         return out
 
@@ -841,6 +843,12 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                     return float("nan")
                 return float((per[mask].detach().sum() / noop[mask].sum().clamp_min(1e-12)).clamp(0, 1e6))
             resid = float((per.sum() / noop.sum().clamp_min(1e-12)).clamp(0, 1e6))
+            # The SCALE of that ratio's denominator. `resid` is normalised by how far
+            # the adjoint asks the rate to move, so as the adjoint sharpens toward 1
+            # (larger n_z) `noop` shrinks and the SAME drift yields a larger ratio.
+            # resid is therefore comparable between arms at one n_z and NOT across
+            # n_z; this is the number that makes that visible.
+            noop_mag = float(noop.mean())
 
             # --- what `resid` is actually made of ---------------------------------
             # `target` is `u_base * a_hat` with a_hat redrawn every iteration, so
@@ -876,4 +884,5 @@ class AdapterDAMTrainer(AdapterGDPOTrainer):
                       "resid_edges": _ratio(~is_node),
                       "drift": drift, "drift_nodes": drift_nodes,
                       "a_mean": a_mean, "a_sd": a_sd,
-                      "orc_flat": orc_flat, "orc_state": orc_state}
+                      "orc_flat": orc_flat, "orc_state": orc_state,
+                      "noop_mag": noop_mag}
