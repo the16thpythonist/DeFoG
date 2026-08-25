@@ -294,13 +294,52 @@ per-token statements -- "cell (3,4) must be 7" moves that token's marginal from 
 1. Their reward is native to the channel; a target on a sum over the molecule is
 orthogonal to it.
 
-### The confirming test, not yet run
+### Confirmed by controlled contrast: it is the SHAPE of the reward
 
-Swap logP for a DECOMPOSABLE reward -- e.g. the count of oxygen atoms, which is a
-direct per-node preference. The prediction is a large dTV/floor ratio and a DAM update
-that steers. If that holds, the diagnosis is nailed and the boundary is drawn: DAM
-transfers to graph generation for rewards that decompose over coordinates, and not for
-rewards defined on aggregate properties.
+`scripts/decomp.py` scores the SAME 256 completions from the SAME states three ways --
+`logp-match` = -|logP - target|, `oxy-max` = #oxygens, `oxy-match` = -|#oxygens - mean|.
+`oxy-max` vs `oxy-match` holds the chemical quantity fixed and varies only the shape:
+`exp(lam * #O)` factorises over atoms exactly, while a target on the COUNT is a
+constraint on a sum. lambda is bisected per reward to a COMMON effective sample size,
+because standardising to unit sd does NOT equalise tilt strength (oxygen count takes
+few discrete values, so the same lambda concentrates its weights far harder).
+
+| reward | lambda | ESS | d p(O) | shuffled | node dTV | shuf | coherence |
+|---|---|---|---|---|---|---|---|
+| logp-match | 3.24 | 64.0 | +0.0036 | -0.0007 | 0.0436 | 0.0155 | 0.577 |
+| oxy-max | 0.82 | 64.0 | **+0.0313** | -0.0001 | 0.0440 | 0.0175 | **1.000** |
+| oxy-match | 200.00 | 170.2 | -0.0028 | -0.0001 | 0.0213 | 0.0088 | 0.215 |
+
+`coherence` = |mean signed shift| / mean |shift|: 1.0 means every slot moved the same
+way, 0 means the movements cancel.
+
+At **identical ESS and identical gross movement** (dTV 0.0436 vs 0.0440, within 1%),
+`oxy-max` delivers **8.7x the net directional signal** with coherence exactly 1.000,
+while `logp-match` moves each slot a fifth as far at 58% coherence so much of it
+cancels. Same model, same states, same completions -- only the reward's shape differs.
+
+`oxy-match` is sharper still: it **could not reach ESS 64** at any lambda up to the
+bisection ceiling of 200. A target on a count, when the base is already centred there,
+offers almost nothing to select on, and what it selects gives `d p(O)` = -0.0028, i.e.
+zero. The identical quantity is a strong coherent instruction as "more of this" and no
+instruction at all as "exactly this many".
+
+### What was wrong along the way
+
+* "Correlations are lost because the head is factorised" -- WRONG as stated. DeFoG
+  builds correlations across steps; per-step factorisation is not the issue.
+* "The dTV ratio separates decomposable from aggregate rewards" -- FALSIFIED. dTV is
+  unsigned and cannot tell coherent movement from jitter; all three rewards sit at
+  2.4-2.8x. The signed `d p(O)` and `coherence` are what separate them.
+* The channel claim itself -- HOLDS, against a shuffled-weight floor throughout.
+
+### Still not run
+
+The training confirmation: DAM on `oxy-max`. The prediction is that it steers, where
+every logP run did not. That would complete the boundary: **DAM transfers to graph
+generation for rewards that decompose over coordinates, and not for rewards defined on
+aggregate properties** -- with `scripts/decomp.py` as a minutes-long diagnostic that
+says which case you are in before spending days on training.
 
 ## Established / not established
 
