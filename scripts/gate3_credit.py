@@ -20,7 +20,7 @@ from defog.core import DeFoGModel, AdaLNAdapter
 from defog.core.adapter import AdapterComposition, ConditionBranch
 from defog.core.credit import CreditHead, CreditGuidance
 from defog.core.data import dense_to_pyg
-from defog.core.sampler import Sampler
+from defog.core.rl import RolloutSampler
 from defog.domains.molecule import build_encoders, mol_to_smiles, pyg_data_to_mol
 from rdkit import Chem, RDLogger; RDLogger.DisableLog('rdApp.*')
 from rdkit.Chem import Crippen
@@ -33,12 +33,17 @@ def evaluate(base, adapter, head, cond, scale, args, dev, adec, bdec, seed):
     comp = AdapterComposition([ConditionBranch(adapter, cond, 1.0)], base=base,
                               mode="product")
     guide = None if head is None else CreditGuidance(head, cond, scale=scale)
-    s = Sampler(base, eta=args.eta, omega=0.0, sample_steps=args.steps,
-                time_distortion="polydec", posterior_transform=guide)
+    # RolloutSampler, not Sampler: it stashes the terminal one-hot in the NETWORK's
+    # class space via _post_loop, before ignore_virtual_classes strips it -- which is
+    # the space dense_to_pyg/pyg_data_to_mol decode from. It forwards **kwargs to
+    # Sampler, so posterior_transform reaches the denoise loop unchanged.
+    s = RolloutSampler(base, eta=args.eta, omega=0.0, sample_steps=args.steps,
+                       time_distortion="polydec", posterior_transform=guide,
+                       record_trace=False)
     s.composition = comp
     s.sample(cond.shape[0], condition=cond, device=dev, show_progress=False)
     X1, E1 = s.endpoint; nm = s.end_node_mask
-    tgt = cond.reshape(-1)[:cond.shape[0]].tolist()
+    tgt = cond[:, 0].tolist()
     errs, smis = [], []
     for i, d in enumerate(dense_to_pyg(X1, E1, None, nm, nm.sum(-1))):
         m = pyg_data_to_mol(d, adec, bdec)
