@@ -124,6 +124,40 @@ samples is worth **+0.97 reward** at lambda=1 (`scripts/marginal.py`). Report gu
 sampling's gain as a fraction of that ceiling. This is a number, not a pass/fail, and it
 is what the write-up needs.
 
+## 6a. Gate methodology, as corrected during the build
+
+Three defects in the gates themselves were found and fixed before any result was read.
+All three were in the EVALUATION, not the method -- the same class of error that made
+`resid` fail three separate ways in the DAM work, and the reason each gate got re-read
+rather than trusted.
+
+* **Oracle baselines (Gate 1).** Both reference predictors were fitted on the
+  VALIDATION batch's own labels, so they had seen the answers while the head had not.
+  Measured cost: the baselines scored ~12% better than they should, which reads as a
+  clean FAIL for any head. Now fitted on the training split, where the head was fitted.
+* **Unpaired comparison (Gate 1).** The reward is a whole-molecule property, so every
+  supervised coordinate of one endpoint carries the SAME target and most of the spread
+  is shared. Comparing two aggregate means cannot resolve the couple of percent a
+  per-coordinate credit can buy. Paired per-entry differences do: on the smoke pool the
+  same effect reads `+0.22%` unpaired and `t = -13.62` paired.
+* **Wrong reference population (Gate 2).** The per-class predictor was computed from
+  the class of the ORIGINAL endpoint and the per-state MEAN reward -- a different
+  quantity from the one under test. Recomputed over the completions it scores +0.384
+  where the broken version scored +0.032, i.e. it was ~12x too weak and flattered the
+  head.
+
+Two criteria were also tightened. Gate 1 now requires paired `d < 0` and `t < -3`
+against BOTH references, and averages the held-out score over several `t` draws because
+the gate is an expectation over `t`. Gate 2 is judged on the MEAN OF PER-STATE
+correlations with its standard error, not one pooled number, because a pooled
+correlation over 16 states can be carried by a single lucky graph.
+
+One design assumption was corrected by data: the per-class scalar was assumed to be the
+stronger of the two Gate 1 references. At small N it is WEAKER than a global constant
+(0.1027 vs 0.1017 on the smoke pool) because classes with few examples overfit. Whether
+that reverses at 8192 endpoints is now something the run reports rather than something
+this document asserts.
+
 ## 7. What kills it
 
 * **Gate 1 fails.** The high-reward region is rare under base sampling, so `m` is fitted

@@ -109,40 +109,66 @@ def main():
 
     with torch.no_grad():
         lmX, lmE = head(X_t, E_t, t, nm, cond)
-        clsX = X1.argmax(-1)
-        pcX = per_class_baseline((a.lam*R.mean(0))[:,None].expand_as(clsX), clsX,
-                                 X1.shape[-1], nm)
-        pcX = torch.where(torch.isfinite(pcX), pcX, torch.zeros_like(pcX))
+        # The per-class reference must be E[w | coordinate class = c] over the SAME
+        # population the empirical shift is computed from -- the completions. An
+        # earlier version took it from the class of the original endpoint X1 and the
+        # per-state MEAN reward, which is a different quantity entirely and made the
+        # reference far weaker than it should be, flattering the head.
+        w_all = (a.lam * R).exp()                                  # (K, states)
+        wgt = w_all[:, :, None, None] * ZX * nm[None, :, :, None]
+        cnt = (ZX * nm[None, :, :, None]).sum((0, 1, 2))
+        num = wgt.sum((0, 1, 2))
+        pcX = torch.log((num / cnt.clamp_min(1)).clamp_min(1e-12))
+        pcX = torch.where(cnt > 0, pcX, torch.zeros_like(pcX))
 
-    def shift(logm, shuffle=False, w=None):
-        base_m = ZX.mean(0)
-        if w is None:
-            w = torch.softmax(a.lam * R, dim=0)
-            if shuffle:
-                w = w[torch.randperm(w.shape[0], device=w.device)]
-            return (w[:,:,None,None] * ZX).sum(0) - base_m
+    base_m = ZX.mean(0)
+
+    def empirical_shift(shuffle=False):
+        """What exp(-g)-reweighting the base's own completions does to the marginals."""
+        w = torch.softmax(a.lam * R, dim=0)
+        if shuffle:
+            w = w[torch.randperm(w.shape[0], device=w.device)]
+        return (w[:, :, None, None] * ZX).sum(0) - base_m
+
+    def predicted_shift(logm):
+        """What multiplying by m does -- from the SAME empirical base marginal, so any
+        mismatch between the model's one-shot head and the true p(x1|xt) cancels."""
         q = base_m * logm.exp()
         return q / q.sum(-1, keepdim=True).clamp_min(1e-12) - base_m
 
-    D_emp = shift(None)
-    D_null = shift(None, shuffle=True)
-    D_head = shift(lmX, w=1)
-    D_pc = shift(pcX.expand_as(lmX), w=1)
+    D_emp = empirical_shift()
+    D_null = empirical_shift(shuffle=True)
+    D_head = predicted_shift(lmX)
+    D_pc = predicted_shift(pcX.expand_as(lmX))
 
     print(f"Gate 2  |  {a.states} states x {a.k} completions, eta={a.eta:g}, "
           f"t_int={a.t_int}/{a.steps}, t={float(t[0,0]):.3f}")
-    print(f"  {'predictor':10s} | {'raw':>7s} {'resid-2':>8s}")
+    print(f"  {'predictor':10s} | {'raw':>7s} {'resid-2':>8s} | "
+          f"{'per-state mean +- SE':>21s}")
     res = {}
+    E2 = resid2(D_emp, nm, a.states)
     for tag, D in (("head", D_head), ("per-class", D_pc), ("null", D_null)):
+        R2 = resid2(D, nm, a.states)
         r_raw = corr(D[nm], D_emp[nm])
-        r_r2 = corr(resid2(D, nm, a.states)[nm], resid2(D_emp, nm, a.states)[nm])
-        res[tag] = {"raw": r_raw, "resid2": r_r2}
-        print(f"  {tag:10s} | {r_raw:+7.3f} {r_r2:+8.3f}")
+        r_r2 = corr(R2[nm], E2[nm])
+        # PER-STATE correlations too: one pooled number can be carried by a single
+        # state, and with 16 states that is a real risk. Mean +- SE across states says
+        # whether the agreement is a property of the head or of one lucky graph.
+        ps = [corr(R2[b][nm[b]], E2[b][nm[b]]) for b in range(a.states)
+              if int(nm[b].sum()) > 2]
+        mu = sum(ps) / max(len(ps), 1)
+        se = (sum((x - mu) ** 2 for x in ps) / max(len(ps) - 1, 1) / max(len(ps), 1)) ** 0.5
+        res[tag] = {"raw": r_raw, "resid2": r_r2, "per_state_mean": mu,
+                    "per_state_se": se, "n_states": len(ps)}
+        print(f"  {tag:10s} | {r_raw:+7.3f} {r_r2:+8.3f} | {mu:+7.3f} +- {se:.3f}")
     print(f"  ceiling (split-half reliability): {a.ceiling:+.3f}")
-    ok = res["head"]["resid2"] >= a.pass_at and \
-        res["head"]["resid2"] > res["per-class"]["resid2"] + 0.05
-    print(f"  -> {'PASS' if ok else 'FAIL'}  "
-          f"(need resid-2 >= {a.pass_at} and > per-class + 0.05)")
+    # Judge on the per-state mean, not the pooled number, and require it to clear
+    # both the noise floor and the reference by more than its own standard error.
+    hm, hs = res["head"]["per_state_mean"], res["head"]["per_state_se"]
+    ok = (hm >= a.pass_at and hm - 2 * hs > res["null"]["per_state_mean"]
+          and hm - 2 * hs > res["per-class"]["per_state_mean"])
+    print(f"  -> {'PASS' if ok else 'FAIL'}  (need per-state mean >= {a.pass_at} "
+          f"and mean-2SE above BOTH null and per-class)")
     if a.out:
         json.dump({"gate2": res, "pass": bool(ok), "args": vars(a)}, open(a.out,"w"), indent=1)
     print("GATE2-DONE", flush=True)
