@@ -245,6 +245,63 @@ nodes are noise" finding is withdrawn.** What replicated was a property of the m
 It should not be used again. Any further DAM work here has to be judged on generated
 outcomes at realistic training length.
 
+## THE ANSWER: the reward's information does not fit through the channel
+
+DAM's target posterior is `p*(x1|xt) ~ p_base(x1|xt) * exp(-g(x1))`. But DeFoG's rate
+is `R_i(xt->j) = sum_c p_theta(x1^i=c|xt) * R_i(xt->j|c,t)` -- it reads ONE
+coordinate's MARGINAL at a time. So the entire instruction DAM can deliver is the
+difference between the base marginals and the tilted marginals.
+
+`scripts/marginal.py` draws K=256 endpoints from a state, weights them by `exp(-g)`,
+and measures what the tilt does to the JOINT (mean reward) against what it does to the
+CHANNEL (per-coordinate total variation). The control permutes the same weights across
+samples: identical spread, no relationship to the molecules, so its shift is the
+finite-sample noise floor.
+
+| t | lambda | ESS | E[r] base | E[r] tilt | gain | node dTV | shuffled | ratio |
+|---|---|---|---|---|---|---|---|---|
+| 0.938 | 0.3 | 231.3 | -2.2090 | -1.6975 | +0.5115 | 0.0056 | 0.0034 | 1.65x |
+| 0.938 | 1.0 | 153.2 | -2.2090 | -1.2399 | +0.9691 | 0.0160 | 0.0091 | 1.76x |
+| 0.938 | 3.0 | 36.8 | -2.2090 | -0.6700 | +1.5390 | 0.0416 | 0.0207 | 2.01x |
+| 0.750 | 0.3 | 231.0 | -1.5828 | -0.9733 | +0.6094 | 0.0075 | 0.0066 | 1.14x |
+| 0.750 | 1.0 | 176.3 | -1.5828 | -0.6316 | +0.9511 | 0.0155 | 0.0129 | 1.20x |
+| 0.750 | 3.0 | 85.5 | -1.5828 | -0.3240 | +1.2588 | 0.0347 | 0.0309 | 1.12x |
+
+**The tilt is excellent and the channel is nearly closed.** Reweighting cuts the logP
+error threefold at lambda=3 using only the base model's own samples -- the target is
+not the problem. But the marginals move 1.1-2.0x above a shuffled-weight floor, and at
+t=0.75 the edge channel at lambda=3 is 0.0134 against a 0.0137 floor, i.e. BELOW noise.
+
+**Temperature does not open it.** From lambda=0.3 to 3.0 the absolute shift grows 7x
+while the ratio to the floor moves 1.65 -> 2.01 and ESS collapses 231 -> 37. Shift and
+noise are bought in equal measure.
+
+### Why: the reward is about combinations, the channel carries positions
+
+Hitting a target total logP is a constraint on WHICH ATOMS AND BONDS OCCUR TOGETHER.
+Reweighting reshuffles the joint dramatically while leaving each individual coordinate's
+marginal essentially unmoved. The adjoint asks for an ~11.6% rate correction
+(`sd(a_hat)`=0.116) where the marginals support ~1.6%: it is mostly asking for
+something the parameterisation cannot deliver.
+
+This closes every thread at once. Fixing the estimator bias, raising lambda, removing
+the estimator noise with `n_z`, common random numbers -- **none was the constraint,
+because the information never enters the channel.** The "edge signal" was spurious for
+the same reason: the true edge shift is 0.1-0.3%, at the noise floor.
+
+And it is why the paper's results are real. GSM8K, Countdown and Sudoku rewards ARE
+per-token statements -- "cell (3,4) must be 7" moves that token's marginal from 1/9 to
+1. Their reward is native to the channel; a target on a sum over the molecule is
+orthogonal to it.
+
+### The confirming test, not yet run
+
+Swap logP for a DECOMPOSABLE reward -- e.g. the count of oxygen atoms, which is a
+direct per-node preference. The prediction is a large dTV/floor ratio and a DAM update
+that steers. If that holds, the diagnosis is nailed and the boundary is drawn: DAM
+transfers to graph generation for rewards that decompose over coordinates, and not for
+rewards defined on aggregate properties.
+
 ## Established / not established
 
 **Established.** `resid` is unusable (three independent failure modes above). The
