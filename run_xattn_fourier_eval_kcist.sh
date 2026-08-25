@@ -51,7 +51,19 @@ BASELINE_JSON="adapter_improvements/blend_results/e2_prob_w2.0.json"
 # re-run) would be accepted silently, and "newest" is not the same as "the one I meant".
 # So the fallback refuses when it is ambiguous instead of guessing. Stage 1 prints the
 # exact ADAPTER_CKPT= line to use.
+# A chained training job writes its resolved checkpoint path here, which is how the
+# ablation arms are evaluated without `ls -t` having to choose between several runs.
 ADAPTER_CKPT="${ADAPTER_CKPT:-}"
+ADAPTER_CKPT_FILE="${ADAPTER_CKPT_FILE:-}"
+if [ -z "$ADAPTER_CKPT" ] && [ -n "$ADAPTER_CKPT_FILE" ]; then
+    if [ ! -s "$ADAPTER_CKPT_FILE" ]; then
+        echo "ERROR: ADAPTER_CKPT_FILE=$ADAPTER_CKPT_FILE is missing or empty -- the"
+        echo "       training job it should come from did not finish verification."
+        exit 1
+    fi
+    ADAPTER_CKPT=$(tail -1 "$ADAPTER_CKPT_FILE")
+    echo "adapter path read from $ADAPTER_CKPT_FILE"
+fi
 if [ -z "$ADAPTER_CKPT" ]; then
     mapfile -t _CANDS < <(ls -t experiments/results/adapter_training__zinc/*/clogp_adapter.ckpt 2>/dev/null)
     if [ "${#_CANDS[@]}" -eq 0 ]; then
@@ -88,27 +100,44 @@ print("CUDA preflight OK:", torch.cuda.device_count(), "device(s)")
 PY
 
 # ---- preflight: the checkpoint really is the architecture we are reporting ----
-$PY - "$ADAPTER_CKPT" <<'PY' || { echo "ERROR: adapter preflight failed"; exit 1; }
+$PY - "$ADAPTER_CKPT" "${EXPECT_FOURIER:-}" "${EXPECT_XATTN:-}" <<'PY' || { echo "ERROR: adapter preflight failed"; exit 1; }
 import sys, torch
 sys.path.insert(0, ".")   # molsmith is found the same way e2_targeting.py finds it
 from defog.core import AdaLNAdapter
 a = AdaLNAdapter.load(sys.argv[1], device="cpu")
 cfg = a._config()
+# Declared expectation, when the caller sets one. Defaults to "at least one mechanism",
+# so a plain FiLM checkpoint (the wrong file) is still refused while the ablation arms --
+# fourier alone, cross-attention alone -- are evaluated rather than rejected.
+exp_f = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
+exp_x = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
+got_f, got_x = cfg.get("cond_fourier") or 0, cfg.get("xattn_tokens") or 0
 print(f"adapter: {sum(p.numel() for p in a.parameters()):,} params  "
       f"fourier={cfg.get('cond_fourier')} xattn_tokens={cfg.get('xattn_tokens')} "
       f"hidden={cfg['hidden']} n_layers={cfg['n_layers']}")
 print(f"  cond_mean={a.cond_mean.tolist()} cond_std={a.cond_std.tolist()}")
-if not cfg.get("cond_fourier") or not cfg.get("xattn_tokens"):
-    print("FAIL: this checkpoint does not carry both mechanisms -- it is not the arm "
-          "this job claims to evaluate."); sys.exit(1)
+if exp_f is not None and got_f != exp_f:
+    print(f"FAIL: cond_fourier={got_f} but this job declares EXPECT_FOURIER={exp_f} -- "
+          f"it is not the arm it claims to evaluate."); sys.exit(1)
+if exp_x is not None and got_x != exp_x:
+    print(f"FAIL: xattn_tokens={got_x} but this job declares EXPECT_XATTN={exp_x} -- "
+          f"it is not the arm it claims to evaluate."); sys.exit(1)
+if exp_f is None and exp_x is None and not (got_f or got_x):
+    print("FAIL: this checkpoint carries NEITHER mechanism, so it is a plain FiLM adapter "
+          "-- almost certainly the wrong file. Set EXPECT_FOURIER/EXPECT_XATTN to "
+          "evaluate one deliberately."); sys.exit(1)
+print(f"  arm: fourier={got_f} xattn={got_x}")
 # An untrained cross-attention path is zero-init by construction, so a zero here means
 # the mechanism never learned anything and the run would report a FiLM adapter under a
 # cross-attention label.
-xa = sum(float(m.out.weight.abs().sum() + m.out.bias.abs().sum()) for m in a.xattn)
-print(f"  xattn output-projection L1 = {xa:.4e}")
-if xa == 0.0:
-    print("FAIL: cross-attention output projections are still exactly zero -- the "
-          "mechanism is inert."); sys.exit(1)
+if got_x:
+    xa = sum(float(m.out.weight.abs().sum() + m.out.bias.abs().sum()) for m in a.xattn)
+    print(f"  xattn output-projection L1 = {xa:.4e}")
+    if xa == 0.0:
+        print("FAIL: cross-attention output projections are still exactly zero -- the "
+              "mechanism is inert."); sys.exit(1)
+else:
+    print("  (no cross-attention on this arm; skipping the inertness and entropy checks)")
 
 # A NON-ZERO OUTPUT PROJECTION IS NOT EVIDENCE OF ROUTING. At init the keys are
 # unnormalised and the token producer's output is small, so the attention is almost
@@ -119,38 +148,41 @@ if xa == 0.0:
 # apart. Reported, not enforced: a partially-sharpened router is still a real result, and
 # the number belongs beside the MAE when it is interpreted.
 import math, torch
-m_tok = a.xattn_tokens
-c = torch.tensor([[a.cond_mean.reshape(-1)[0].item()]])
-cn = a.normalize(c)
-parts = [cn] + ([a._fourier(cn)] if a.cond_fourier else [])
-if a.time_conditioned:
-    from defog.core.layers import timestep_embedding
-    parts.append(timestep_embedding(torch.full((1, 1), 0.5), a.time_emb_dim))
-h = a.trunk(torch.cat(parts, dim=-1))
-tokens = a.tok(h).view(1, m_tok, a.xattn_dim)
-torch.manual_seed(0)
-X = torch.randn(1, 24, a.dims["dx"])
-ents = []
-for mod in a.xattn:
-    nh, dh = mod.n_heads, mod.dx // mod.n_heads
-    q = mod.q(mod.norm(X)).view(1, -1, nh, dh).transpose(1, 2)
-    k = mod.k(tokens).view(1, -1, nh, dh).transpose(1, 2)
-    att = torch.softmax(q @ k.transpose(-1, -2) / math.sqrt(dh), dim=-1)
-    ents.append(float(-(att * att.clamp_min(1e-12).log()).sum(-1).mean()))
-uni = math.log(m_tok)
-mean_ent, min_ent = sum(ents) / len(ents), min(ents)
-print(f"  attention entropy: mean {mean_ent:.4f}, min {min_ent:.4f} "
-      f"(uniform max {uni:.4f} = a pure broadcast)")
-# Reported as a ratio, NOT as a pass/fail verdict: the queries here are Gaussian rather
-# than the frozen base's real activations, and no trained adapter has yet been measured
-# to calibrate a threshold against. 1.0000 means a pure per-graph broadcast (every atom
-# reads the same token mixture, i.e. FiLM with extra parameters); lower means the router
-# discriminates. Quote it beside the MAE.
-print(f"  entropy ratio {mean_ent/uni:.4f} of uniform "
-      f"({(1 - mean_ent/uni)*100:.2f}% below; 1.0000 would be a pure broadcast)")
-if mean_ent > 0.999 * uni:
-    print(f"  NOTE: essentially indistinguishable from uniform -- treat any result below "
-          f"as 'FiLM with more parameters' until this number is understood.")
+if got_x:
+    # A NON-ZERO OUTPUT PROJECTION IS NOT EVIDENCE OF ROUTING. At init the keys are
+    # unnormalised and the token producer's output is small, so the attention is almost
+    # uniform and every atom reads the same token average -- cross-attention starts life
+    # as a per-graph broadcast and only becomes content-addressed if training moves q/k.
+    # A checkpoint whose attention is still uniform IS a FiLM adapter with extra
+    # parameters, and the L1 check above would call it healthy. Entropy against ln(m) is
+    # what tells them apart. Reported as a RATIO, not a verdict: the queries are Gaussian
+    # rather than real activations (fair, since both pass through a LayerNorm), and no
+    # trained adapter has been measured to calibrate a threshold against.
+    m_tok = a.xattn_tokens
+    cn = a.normalize(torch.tensor([[a.cond_mean.reshape(-1)[0].item()]]))
+    parts = [cn] + ([a._fourier(cn)] if a.cond_fourier else [])
+    if a.time_conditioned:
+        from defog.core.layers import timestep_embedding
+        parts.append(timestep_embedding(torch.full((1, 1), 0.5), a.time_emb_dim))
+    tokens = a.tok(a.trunk(torch.cat(parts, dim=-1))).view(1, m_tok, a.xattn_dim)
+    torch.manual_seed(0)
+    X = torch.randn(1, 24, a.dims["dx"])
+    ents = []
+    for mod in a.xattn:
+        nh, dh = mod.n_heads, mod.dx // mod.n_heads
+        q = mod.q(mod.norm(X)).view(1, -1, nh, dh).transpose(1, 2)
+        k = mod.k(tokens).view(1, -1, nh, dh).transpose(1, 2)
+        att = torch.softmax(q @ k.transpose(-1, -2) / math.sqrt(dh), dim=-1)
+        ents.append(float(-(att * att.clamp_min(1e-12).log()).sum(-1).mean()))
+    uni = math.log(m_tok)
+    mean_ent = sum(ents) / len(ents)
+    print(f"  attention entropy: mean {mean_ent:.4f}, min {min(ents):.4f} "
+          f"(uniform max {uni:.4f} = a pure broadcast)")
+    print(f"  entropy ratio {mean_ent/uni:.4f} of uniform "
+          f"({(1 - mean_ent/uni)*100:.2f}% below; 1.0000 would be a pure broadcast)")
+    if mean_ent > 0.999 * uni:
+        print("  NOTE: essentially indistinguishable from uniform -- treat any result "
+              "below as 'FiLM with more parameters' until this number is understood.")
 print("adapter preflight OK")
 PY
 

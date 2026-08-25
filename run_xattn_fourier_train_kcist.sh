@@ -73,8 +73,13 @@ CKPT_EVERY_K=10
 EVAL_ETA=25          # module default is 5.0; the shipped run used 25
 HIDDEN=256
 LR=4e-4
-COND_FOURIER=3
-XATTN_TOKENS=8
+# Overridable so the attribution ablation runs from this same script:
+#   COND_FOURIER=3 XATTN_TOKENS=0  -> Fourier bands alone
+#   COND_FOURIER=0 XATTN_TOKENS=8  -> cross-attention alone
+# The preflight, the flag list and the post-training verification all read these, so an
+# ablation arm is checked against what it actually declares rather than against 3 and 8.
+COND_FOURIER="${COND_FOURIER:-3}"
+XATTN_TOKENS="${XATTN_TOKENS:-8}"
 XATTN_DIM=128
 XATTN_HEADS=8
 WANT_TOKEN="-94.15126384728774"
@@ -178,16 +183,24 @@ echo "training exited ${rc} at $(date)"
 RESULT_DIR=$(ls -td experiments/results/adapter_training__zinc/*/ 2>/dev/null | head -1)
 echo "result dir: ${RESULT_DIR:-<none>}"
 
-$PY - "$RESULT_DIR" "${WANT_MEAN}" "${WANT_STD}" "${COND_FOURIER}" "${XATTN_TOKENS}" <<'PY'
+CKPT_PATH_FILE="xafo_ckpt_${SLURM_JOB_ID:-local}.path"
+$PY - "$RESULT_DIR" "${WANT_MEAN}" "${WANT_STD}" "${COND_FOURIER}" "${XATTN_TOKENS}" <<'PY' > "$CKPT_PATH_FILE"
 import glob, os, sys, torch
 sys.path.insert(0, ".")
+
+# EVERY report line goes to stderr; stdout carries ONE thing, the checkpoint path, so a
+# chained eval can read it from a file. `ls -t` cannot be used once the ablation arms
+# exist -- there are then several candidates and the eval rightly refuses to guess.
+def say(*a):
+    print(*a, file=sys.stderr)
+
 d, want_mean, want_std = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 # Read from the launcher instead of hardcoded, so the attribution ablation this
 # experiment's own analysis prescribes (each mechanism alone) can be run with this script.
 want_fourier, want_xattn = int(sys.argv[4]), int(sys.argv[5])
 final = os.path.join(d, "clogp_adapter.ckpt")
 if not os.path.exists(final):
-    print(f"FAIL: {final} missing"); sys.exit(1)
+    say(f"FAIL: {final} missing"); sys.exit(1)
 bad = 0
 for f in [final] + sorted(glob.glob(os.path.join(d, "clogp_adapter_ep*.ckpt"))):
     ck = torch.load(f, map_location="cpu", weights_only=False)
@@ -197,19 +210,28 @@ for f in [final] + sorted(glob.glob(os.path.join(d, "clogp_adapter_ep*.ckpt"))):
     arch_ok = (cfg.get("cond_fourier") == want_fourier
                and cfg.get("xattn_tokens") == want_xattn)
     # A trained adapter whose xattn output projections are still exactly zero learned
-    # nothing through that path -- the mechanism would be inert and the run would be
-    # reporting a FiLM adapter under a cross-attention label.
+    # nothing through that path: the mechanism would be inert and the run would report a
+    # FiLM adapter under a cross-attention label. Only meaningful when xattn is enabled.
     xa = sum(float(v.abs().sum()) for k, v in sd.items()
              if k.startswith("xattn.") and ".out." in k)
     live = (xa > 0.0) if want_xattn else True
     bad += not (scale_ok and arch_ok and live)
-    print(f"{os.path.basename(f):30s} fourier={cfg.get('cond_fourier')} "
-          f"xattn={cfg.get('xattn_tokens')} cond=({m:.6f},{s:.6f}) xattn_out_L1={xa:.3e} "
-          f"{'OK' if (scale_ok and arch_ok and live) else 'PROBLEM'}")
+    say(f"{os.path.basename(f):30s} fourier={cfg.get('cond_fourier')} "
+        f"xattn={cfg.get('xattn_tokens')} cond=({m:.6f},{s:.6f}) xattn_out_L1={xa:.3e} "
+        f"{'OK' if (scale_ok and arch_ok and live) else 'PROBLEM'}")
 if bad:
-    print(f"\nFAIL: {bad} checkpoint(s) are wrong (scale mismatch, missing architecture, "
-          f"or an inert cross-attention path).")
+    say(f"\nFAIL: {bad} checkpoint(s) are wrong: scale mismatch, architecture other than "
+        f"the declared fourier={want_fourier}/xattn={want_xattn}, or an inert "
+        f"cross-attention path.")
     sys.exit(1)
-print(f"\nOK. Evaluate with:")
-print(f"  ADAPTER_CKPT={final} sbatch run_xattn_fourier_eval_kcist.sh")
+say(f"\nOK. Evaluate with:")
+say(f"  ADAPTER_CKPT={final} sbatch run_xattn_fourier_eval_kcist.sh")
+print(final)                                   # stdout: the path, and nothing else
 PY
+vrc=$?
+# The verification block prints its report on stderr and the checkpoint path on stdout,
+# so a chained eval can read the path from a file instead of guessing with `ls -t` --
+# which, once the ablation arms exist, has several candidates and rightly refuses.
+cat "$CKPT_PATH_FILE"
+[ $vrc -eq 0 ] || { echo "verification FAILED"; rm -f "$CKPT_PATH_FILE"; exit $vrc; }
+echo "checkpoint path written to $CKPT_PATH_FILE"
