@@ -119,7 +119,7 @@ def fit_baselines(pool, tr, lam):
     return cst, pc
 
 
-def gate1(head, base, pool, va, args, dev, cst, pc):
+def gate1(head, base, pool, va, args, dev, cst, pc, t_ints=None):
     """Held-out gKL of the head against the two reference predictors.
 
     `cst` and `pc` come from :func:`fit_baselines` on the TRAINING split -- see the note
@@ -127,15 +127,22 @@ def gate1(head, base, pool, va, args, dev, cst, pc):
     """
     per = {"head": [], "const": [], "class": []}
     pc = pc.to(dev)
-    draws = max(1, int(getattr(args, "eval_t_draws", 4)))
     # Average over several t draws: the gate is an expectation over t, and a single
-    # draw makes it a noisy statistic (measured ~0.02% wobble on the smoke pool).
-    for _ in range(draws):
+    # draw makes it a noisy statistic. The SAME t values are used for every slice this
+    # is called on, so a train-vs-val comparison reflects the split and not the noise
+    # level each happened to be scored at -- otherwise the gap conflates overfitting
+    # with t difficulty, and both seeds came out with val "better" than train, which is
+    # not a coherent overfitting story.
+    if t_ints is None:
+        t_ints = [int(torch.randint(1, args.steps, (1,)))
+                  for _ in range(max(1, int(getattr(args, "eval_t_draws", 4))))]
+    for t_int in t_ints:
         for i in range(0, len(va), args.batch_train):
             idx = va[i:i + args.batch_train]
             with torch.no_grad():
                 _, _, _, aux = batch_loss(head, base, pool, idx, args.lam, dev,
-                                          sample_steps=args.steps, grad=False)
+                                          t_int=t_int, sample_steps=args.steps,
+                                          grad=False)
             lmX, lmE, X1, E1, nm, em, log_w = aux
             gX, _ = gather_log_m(lmX, lmE, X1, E1)
             lw = log_w[:, None].expand_as(gX)
@@ -275,9 +282,11 @@ def main():
     if args.eval_only:
         head.load_state_dict(torch.load(args.eval_only, map_location=dev,
                                         weights_only=False)["state_dict"])
-        res = gate1(head, base, pool, va, args, dev, cst, pc)
-        tr_s = tr[:len(va)]
-        res_tr = gate1(head, base, pool, tr_s, args, dev, cst, pc)
+        head.eval()
+        tvals = [int(torch.randint(1, args.steps, (1,)))
+                 for _ in range(max(1, args.eval_t_draws))]
+        res = gate1(head, base, pool, va, args, dev, cst, pc, tvals)
+        res_tr = gate1(head, base, pool, tr[:len(va)], args, dev, cst, pc, tvals)
         print(f"\nGATE 1 (re-scored, training-split baselines)  {args.eval_only}")
         ok = _report(res, res_tr)
         print("FIT-DONE", flush=True)
@@ -299,13 +308,16 @@ def main():
             print(f"  it {it:5d}  loss {float(loss):.5f}  (node {ln:.5f} edge {le:.5f})"
                   f"  |g| {float(gn):.3f}  [{time.time()-t0:.0f}s]", flush=True)
 
-    res = gate1(head, base, pool, va, args, dev, cst, pc)
+    head.eval()
+    tvals = [int(torch.randint(1, args.steps, (1,)))
+             for _ in range(max(1, args.eval_t_draws))]
+    res = gate1(head, base, pool, va, args, dev, cst, pc, tvals)
     # Same-sized slice of the TRAINING split, so a failure can be diagnosed instead of
     # merely reported: beats the references on train but not val => overfitting, and
     # the fix is data or regularisation; fails on train too => the head cannot express
     # or reach the target at all, which is a capacity or optimisation problem. Without
     # this a FAIL is a dead end.
-    res_tr = gate1(head, base, pool, tr[:len(va)], args, dev, cst, pc)
+    res_tr = gate1(head, base, pool, tr[:len(va)], args, dev, cst, pc, tvals)
     print(f"\nGATE 1  held-out gKL, node channel ({len(va)} endpoints)")
     ok = _report(res, res_tr)
 
