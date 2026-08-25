@@ -229,3 +229,91 @@ def test_init_bias_rejects_reusing_node_classes_for_edges():
     # an explicit edge vector is honoured
     h.init_bias(want, torch.tensor([-1.0, -2.0, -3.0, -4.0]))
     assert torch.allclose(h.bias_E, torch.tensor([-1.0, -2.0, -3.0, -4.0]), atol=1e-6)
+
+
+# ===========================================================================
+# CreditGuidance: the posterior_transform hook
+# ===========================================================================
+class _StubHead:
+    """A credit head with a fixed, known log m -- so the guidance algebra is tested
+    without dragging a transformer into a unit test."""
+
+    def __init__(self, lmX, lmE):
+        self.lmX, self.lmE = lmX, lmE
+
+    def __call__(self, X_t, E_t, t, node_mask, cond):
+        b = X_t.shape[0]
+        return self.lmX[:b], self.lmE[:b]
+
+
+def _noisy(b, n, dx, de):
+    return {"X_t": torch.zeros(b, n, dx), "E_t": torch.zeros(b, n, n, de),
+            "t": torch.zeros(b, 1)}
+
+
+def test_guidance_at_scale_zero_is_bit_identical():
+    """The Gate 3 control arm is scale=0. It must reproduce the unguided sampler
+    exactly, not approximately -- otherwise the control is not a control."""
+    from defog.core.credit import CreditGuidance
+
+    torch.manual_seed(SEED)
+    pX = F.softmax(torch.randn(3, 5, 9), -1)
+    pE = F.softmax(torch.randn(3, 5, 5, 4), -1)
+    g = CreditGuidance(_StubHead(torch.randn(3, 5, 9) * 3, torch.randn(3, 5, 5, 4) * 3),
+                       torch.zeros(3, 1), scale=0.0)
+    qX, qE = g(pX, pE, _noisy(3, 5, 9, 4), torch.ones(3, 5, dtype=torch.bool))
+    assert qX is pX and qE is pE
+
+
+def test_guidance_matches_the_product_rule_and_stays_normalised():
+    from defog.core.credit import CreditGuidance
+
+    torch.manual_seed(SEED)
+    pX = F.softmax(torch.randn(2, 4, 9), -1)
+    pE = F.softmax(torch.randn(2, 4, 4, 4), -1)
+    lmX, lmE = torch.randn(2, 4, 9) * 0.5, torch.zeros(2, 4, 4, 4)
+    g = CreditGuidance(_StubHead(lmX, lmE), torch.zeros(2, 1), scale=1.0)
+    qX, qE = g(pX, pE, _noisy(2, 4, 9, 4), torch.ones(2, 4, dtype=torch.bool))
+    want = pX * lmX.exp()
+    want = want / want.sum(-1, keepdim=True)
+    assert torch.allclose(qX, want, atol=1e-5)
+    assert torch.allclose(qX.sum(-1), torch.ones(2, 4), atol=1e-5)
+    assert torch.allclose(qE.sum(-1), torch.ones(2, 4, 4), atol=1e-5)
+
+
+def test_guidance_keeps_edges_symmetric():
+    """DeFoG symmetrises edges; guidance that breaks it corrupts the rate silently."""
+    from defog.core.credit import CreditGuidance
+
+    torch.manual_seed(SEED)
+    pE = F.softmax(torch.randn(2, 5, 5, 4), -1)
+    pE = 0.5 * (pE + pE.transpose(1, 2))
+    lmE = torch.randn(2, 5, 5, 4)                       # deliberately ASYMMETRIC
+    g = CreditGuidance(_StubHead(torch.zeros(2, 5, 9), lmE), torch.zeros(2, 1))
+    _, qE = g(F.softmax(torch.randn(2, 5, 9), -1), pE,
+              _noisy(2, 5, 9, 4), torch.ones(2, 5, dtype=torch.bool))
+    assert torch.allclose(qE, qE.transpose(1, 2), atol=1e-6)
+
+
+def test_guidance_refuses_a_condition_that_does_not_divide_the_batch():
+    """A cond/marginal batch mismatch guides rows toward the WRONG target and is
+    invisible in the output, so it must raise rather than broadcast."""
+    from defog.core.credit import CreditGuidance
+
+    g = CreditGuidance(_StubHead(torch.zeros(7, 4, 9), torch.zeros(7, 4, 4, 4)),
+                       torch.zeros(3, 1), scale=1.0)
+    with pytest.raises(ValueError, match="does not divide"):
+        g(F.softmax(torch.randn(7, 4, 9), -1), F.softmax(torch.randn(7, 4, 4, 4), -1),
+          _noisy(7, 4, 9, 4), torch.ones(7, 4, dtype=torch.bool))
+
+
+def test_guidance_repeats_a_condition_that_does_divide():
+    """Composition/Feynman-Kac call with rep*bs rows; that must still work."""
+    from defog.core.credit import CreditGuidance
+
+    torch.manual_seed(SEED)
+    g = CreditGuidance(_StubHead(torch.zeros(6, 4, 9), torch.zeros(6, 4, 4, 4)),
+                       torch.zeros(3, 1), scale=1.0)
+    qX, _ = g(F.softmax(torch.randn(6, 4, 9), -1), F.softmax(torch.randn(6, 4, 4, 4), -1),
+              _noisy(6, 4, 9, 4), torch.ones(6, 4, dtype=torch.bool))
+    assert qX.shape == (6, 4, 9)

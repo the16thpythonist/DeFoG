@@ -140,6 +140,7 @@ from .layers import XEyTransformerLayer, NodeEdgeBlock, timestep_embedding
 
 from .credit import (
     CreditHead,
+    CreditGuidance,
     credit_gkl,
     guided_logmarginals,
     gather_log_m,
@@ -194,6 +195,7 @@ __all__ = [
     "Modulation",
     "AdaLNAdapter",
     "CreditHead",
+    "CreditGuidance",
     "credit_gkl",
     "guided_logmarginals",
     "gather_log_m",

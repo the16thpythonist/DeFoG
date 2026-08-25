@@ -64,6 +64,7 @@ from .adapter import AdaLNAdapter
 
 __all__ = [
     "CreditHead",
+    "CreditGuidance",
     "credit_gkl",
     "gather_log_m",
     "guided_logmarginals",
@@ -249,3 +250,51 @@ class CreditHead(nn.Module):
                 backbone=ck.get("backbone", "copy"), **kw)
         h.load_state_dict(ck["state_dict"])
         return h.to(device)
+
+
+class CreditGuidance:
+    """``posterior_transform`` hook: steer the clean-graph marginals by the credit head.
+
+    Matches :meth:`defog.core.guidance.ExactGuidance.reweight` exactly -- same
+    signature, same softmax-in-log-space form, same ``eps`` clamp -- so it drops into
+    :class:`~defog.core.sampler.Sampler`, the Feynman-Kac sampler, and
+    :class:`~defog.core.guidance.CompositeGuidance` without any of them knowing what it
+    is. The base model stays guidance-agnostic.
+
+        q ~ p_base * m^scale,   renormalised
+
+    ``scale`` is the guidance strength, free at INFERENCE: the head is fitted once and
+    the strength chosen at use time, so a sweep costs sampling and not retraining.
+    ``scale=0`` reproduces the unguided sampler bit-for-bit, which is what the Gate 3
+    control arm uses.
+
+    ``cond`` must be the SAME conditioning tensor the sampler was given -- ``m`` depends
+    on the target through ``g``, so a mismatch silently guides toward a different
+    target. Batch size is checked against the marginals on every call rather than
+    trusted, because that failure is invisible in the output.
+    """
+
+    def __init__(self, head: "CreditHead", cond: torch.Tensor, *, scale: float = 1.0):
+        self.head = head
+        self.cond = cond
+        self.scale = float(scale)
+
+    @torch.no_grad()
+    def __call__(self, pred_X, pred_E, noisy_data, node_mask, eps: float = 1e-8):
+        cond = self.cond
+        if cond.shape[0] != pred_X.shape[0]:
+            if pred_X.shape[0] % cond.shape[0]:
+                raise ValueError(
+                    f"credit guidance: condition batch {cond.shape[0]} does not divide "
+                    f"marginal batch {pred_X.shape[0]}; the sampler is guiding rows "
+                    "toward the wrong targets."
+                )
+            cond = cond.repeat(pred_X.shape[0] // cond.shape[0], 1)
+        if self.scale == 0.0:
+            return pred_X, pred_E
+        lmX, lmE = self.head(noisy_data["X_t"], noisy_data["E_t"], noisy_data["t"],
+                             node_mask, cond)
+        q_X = F.softmax(self.scale * lmX + torch.log(pred_X.clamp_min(eps)), dim=-1)
+        q_E = F.softmax(self.scale * lmE + torch.log(pred_E.clamp_min(eps)), dim=-1)
+        q_E = 0.5 * (q_E + q_E.transpose(1, 2))          # keep edges symmetric
+        return q_X, q_E
