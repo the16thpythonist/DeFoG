@@ -168,10 +168,9 @@ The training config (`subsample='late'`) sits at t=0.938, so ~21-25.
 That is the answer to "it is a published method, why does it not work here". Two
 differences from DAM's own experiments, which are masked diffusion LANGUAGE models:
 
-* ~~**Their edits are permanent and ours are not.**~~ **MEASURED AND FALSE** -- see
-  the permanence section below. DeFoG's edits are nearly as permanent as masked
-  diffusion's: ~1.08 changes per atom over a 100-step run, and a 0.3% reversion rate at
-  t=0.91.
+* **Their edits are permanent; ours are at realistic eta, but were not in these
+  experiments.** At `eta=30` DeFoG churns hard (9.15 changes per atom); at the `eta=1.0`
+  every DAM run here used, it does not (1.08). See the permanence section below.
 * **Their reward is decisive per edit.** A wrong digit in Sudoku takes the reward from
   1 to 0. logP averages over ~40 atoms, so no single bond moves it much.
 
@@ -360,7 +359,7 @@ instruction at all as "exactly this many".
   2.4-2.8x. The signed `d p(O)` and `coherence` are what separate them.
 * The channel claim itself -- HOLDS, against a shuffled-weight floor throughout.
 
-### Permanence is NOT the difference (measured)
+### Permanence: measured at the WRONG eta first, then corrected
 
 The natural rival explanation is that masked diffusion's edits are irreversible by
 construction while DeFoG's are not, so an edit's effect on the endpoint is diluted here.
@@ -381,10 +380,31 @@ last change is 0.000 for both, i.e. **over half of atoms and over three quarters
 bonds never change at all**. At t=0.938 -- the operating point of every DAM run here --
 the reversion rate is ~0.3%.
 
-DeFoG is therefore far closer to masked diffusion than assumed: theirs is exactly one
-change per token by construction, ours is ~1.08 per atom empirically. **Permanence is
-excluded as the explanation**, which strengthens the reward-shape account by removing
-its rival.
+**That table is at `eta=1.0`, and eta is the stochasticity knob itself.** Re-measured at
+realistic settings (`eta=30`, 500 steps, `scripts/churn30.py`) the picture inverts:
+
+| t | agree_X | settled_X | gap | agree_E | settled_E | gap |
+|---|---|---|---|---|---|---|
+| 0.000 | 0.564 | **0.006** | 0.558 | 0.821 | 0.124 | 0.697 |
+| 0.360 | 0.547 | 0.058 | 0.488 | 0.819 | 0.345 | 0.474 |
+| 0.510 | 0.529 | 0.128 | **0.401** | 0.814 | 0.485 | 0.329 |
+| 0.750 | 0.698 | 0.535 | 0.163 | 0.877 | 0.784 | 0.092 |
+| 0.910 | 0.913 | 0.878 | 0.035 | 0.961 | 0.945 | 0.016 |
+| 0.990 | 0.977 | 0.977 | 0.000 | 0.995 | 0.995 | 0.000 |
+
+Mean flips per coordinate: **nodes 9.15, edges 3.80** -- against 1.08 and 0.39 at
+eta=1. At t=0 essentially nothing is in its final state; through the middle ~40% of
+atoms are momentarily correct and will move again; solidification is abrupt between
+t~0.64 and t~0.91. The "churns wildly, then suddenly solidifies" picture is CORRECT at
+realistic eta, and the eta=1 conclusion above was an artifact of measuring one
+unrepresentative configuration.
+
+**But it does not rescue permanence as the explanation of what we observed.** Every DAM
+run in this document used `eta=1.0` -- the regime where edits ARE near-permanent
+(1.08 flips/atom) -- and DAM failed there, on the axis most favourable to it. So
+permanence is excluded for the observed failures, not because DeFoG's edits are
+permanent in general (they are not) but because they were permanent at the operating
+point that was tested.
 
 (Caveat: much of the raw `agree` figure is coincidence -- the noise distribution is the
 data marginal and carbon is 73.7% of atoms, so chance agreement is ~57%. The GAP and the
@@ -395,6 +415,21 @@ pairs reach the same molecule). That is not the edit being reverted: it is the e
 changing which OTHER coordinates move, because one altered coordinate shifts the
 network's predictions across the whole graph. Downstream divergence, not instability in
 the edited coordinate.
+
+### Open, and bigger than DAM: the eta regime gap
+
+`experiments/adapter_rl_finetune__zinc.py:180` sets `ROLLOUT_ETA = 1.0`, documented as a
+sweep winner (job 1006501) because under CRN eta is the sole within-group diversity
+source. Evaluation harnesses use `eta=25` (27 occurrences). For GDPO that is defensible
+-- it optimises trajectory log-probabilities and the sweep validates it.
+
+**For DAM it is not.** DAM fits a RATE, and the rate is `R* + eta*R^DB + omega*R^TG`.
+At eta=25 the detailed-balance term is 25x larger, so `rate_basis` -- and therefore the
+map from head marginals into rate space -- is a substantially different object from the
+one deployed. Every DAM number here was fitted at eta=1.0. Even a successful fit would
+not obviously transfer to eta=25.
+
+This is untested and applies to any rate-space method, not just DAM.
 
 ### Still not run
 
