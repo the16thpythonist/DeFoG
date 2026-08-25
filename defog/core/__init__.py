@@ -138,6 +138,16 @@ from .features import ExtraFeatures, RRWPFeatures
 from .loss import TrainLoss, compute_loss_components
 from .layers import XEyTransformerLayer, NodeEdgeBlock, timestep_embedding
 
+from .credit import (
+    CreditHead,
+    credit_gkl,
+    guided_logmarginals,
+    gather_log_m,
+    edge_mask_of,
+    constant_baseline,
+    per_class_baseline,
+)
+
 __all__ = [
     # Main model
     "DeFoGModel",
@@ -183,6 +193,13 @@ __all__ = [
     "AdaptedSampler",
     "Modulation",
     "AdaLNAdapter",
+    "CreditHead",
+    "credit_gkl",
+    "guided_logmarginals",
+    "gather_log_m",
+    "edge_mask_of",
+    "constant_baseline",
+    "per_class_baseline",
     "FingerprintEncoder",
     "NodeConditionCrossAttention",
     "SpectrumEncoder",
