@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=16:00:00
+#SBATCH --time=24:00:00
 #SBATCH --job-name=xafo_train
 #SBATCH --output=xafo_train_%j.out
 
@@ -68,8 +68,16 @@ VOCAB="e1_kekulized"
 # arm on this cluster (adapter_improvements/capacity_results/train_A_base.log): ~10 min per
 # epoch, so 40 epochs is ~7 h of a 16 h wall. Without this, a null result at +75%
 # parameters has two explanations and no way to separate them.
-EPOCHS=40
-CKPT_EVERY_K=10
+# Overridable. 20 is the matched control against the shipped adapter; 40 was already
+# well short of convergence -- the combined arm improved by 0.070 MAE between ep20 and
+# ep40, nearly two thirds of what the architecture change itself bought, and its
+# cross-attention norm was still climbing. CKPT_EVERY_K keeps the earlier epochs so a
+# longer run still yields the matched-20 and matched-40 comparisons.
+EPOCHS="${EPOCHS:-40}"
+CKPT_EVERY_K="${CKPT_EVERY_K:-10}"
+# MAX_TIME_HOURS bounds trainer.fit and NOTHING else, so it has to clear the epoch
+# budget or training is silently truncated: at ~13 min/epoch, 60 epochs needs ~13 h.
+MAX_TIME_HOURS="${MAX_TIME_HOURS:-10.0}"
 EVAL_ETA=25          # module default is 5.0; the shipped run used 25
 HIDDEN=256
 LR=4e-4
@@ -168,7 +176,7 @@ $PY -u experiments/adapter_training__zinc.py \
     --XATTN_HEADS ${XATTN_HEADS} \
     --ETA ${EVAL_ETA} \
     --CKPT_EVERY_K ${CKPT_EVERY_K} \
-    --MAX_TIME_HOURS 10.0 \
+    --MAX_TIME_HOURS ${MAX_TIME_HOURS} \
     --PROBE_EVERY_K 10 \
     --GUIDANCE_WEIGHTS "[2.0]" \
     --N_PER_TARGET 32 \
