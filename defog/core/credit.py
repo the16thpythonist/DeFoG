@@ -203,6 +203,7 @@ class CreditHead(nn.Module):
 
     def __init__(self, base, *, cond_dim: int = 1, cond_mean=None, cond_std=None,
                  log_clamp: float = 12.0, backbone: str = "copy",
+                 readout: str = "scaled", readout_scale: float = 0.3,
                  n_node_classes: Optional[int] = None,
                  n_edge_classes: Optional[int] = None, **adapter_kw):
         super().__init__()
@@ -234,6 +235,10 @@ class CreditHead(nn.Module):
         # cannot happen.
         dx = n_node_classes or base.limit_dist.num_node_classes
         de = n_edge_classes or base.limit_dist.num_edge_classes
+        if readout not in ("scaled", "gated"):
+            raise ValueError("readout must be 'scaled' or 'gated'")
+        self.readout = readout
+        self.readout_scale = float(readout_scale)
         self.gate_X = nn.Parameter(torch.zeros(1))
         self.gate_E = nn.Parameter(torch.zeros(1))
         self.bias_X = nn.Parameter(torch.zeros(dx))
@@ -251,11 +256,27 @@ class CreditHead(nn.Module):
         extra = net._compute_extra_data(nd)
         mod = self.adapter(cond, t)
         pred = net.forward(nd, extra, node_mask, cond_modulation=mod)
-        # Centre before gating: only the SHAPE of the backbone's logits should enter,
-        # the level is the bias's job. Without centring the gate would have to cancel an
+        # Centre first: only the SHAPE of the backbone's logits should enter, the level
+        # is the bias's job. Without centring the readout would have to cancel an
         # arbitrary offset before it could express anything.
-        lX = self.bias_X + self.gate_X * (pred.X - pred.X.mean(-1, keepdim=True))
-        lE = self.bias_E + self.gate_E * (pred.E - pred.E.mean(-1, keepdim=True))
+        cX = pred.X - pred.X.mean(-1, keepdim=True)
+        cE = pred.E - pred.E.mean(-1, keepdim=True)
+        if self.readout == "gated":
+            # Original: a learned scalar, zero-init. Safe, but it MULTIPLIES every
+            # gradient reaching the trainable backbone -- measured gate_X = 0.008 after
+            # 8000 steps, so the backbone received 0.8% of its gradient and never
+            # trained. Zero-init in front of a FROZEN backbone is the AdaLN idiom;
+            # in front of a trainable one it starves it. Kept for reproducibility.
+            lX = self.bias_X + self.gate_X * cX
+            lE = self.bias_E + self.gate_E * cE
+        else:
+            # Normalise the shape and scale it by a FIXED constant. The explosion this
+            # replaces came from exp(arbitrary logit) -- normalising bounds the init
+            # magnitude to about +-readout_scale without putting a learned zero in the
+            # gradient path, so the backbone trains from step one.
+            n = cX.shape[-1]
+            lX = self.bias_X + self.readout_scale * cX / cX.std(-1, keepdim=True).clamp_min(1e-6)
+            lE = self.bias_E + self.readout_scale * cE / cE.std(-1, keepdim=True).clamp_min(1e-6)
         c = self.log_clamp
         return lX.clamp(-c, c), lE.clamp(-c, c)
 
@@ -279,13 +300,16 @@ class CreditHead(nn.Module):
     # --- persistence, matching the repo's adapter convention ----------------
     def save(self, path: str, **meta):
         torch.save({"state_dict": self.state_dict(), "backbone": self.backbone,
-                    "log_clamp": self.log_clamp, "meta": meta}, path)
+                    "log_clamp": self.log_clamp, "readout": self.readout,
+                    "readout_scale": self.readout_scale, "meta": meta}, path)
 
     @classmethod
     def load(cls, path: str, base, device="cpu", **kw):
         ck = torch.load(path, map_location=device, weights_only=False)
         h = cls(base, log_clamp=ck.get("log_clamp", 12.0),
-                backbone=ck.get("backbone", "copy"), **kw)
+                backbone=ck.get("backbone", "copy"),
+                readout=ck.get("readout", "gated"),          # old ckpts predate 'scaled'
+                readout_scale=ck.get("readout_scale", 0.3), **kw)
         h.load_state_dict(ck["state_dict"])
         return h.to(device)
 

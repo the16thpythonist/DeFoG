@@ -367,3 +367,74 @@ def test_assemble_reconciles_ragged_batches():
     assert pool["E1"].shape == (6, 7, 7, 4)
     assert pool["reward"].shape == (6,)
     assert int(pool["node_mask"].sum()) == 2 * 5 + 3 * 7 + 1 * 6
+
+
+def _mini_base():
+    class _Attn:
+        dx, de, dy = 8, 4, 2
+
+    class _Layer:
+        self_attn = _Attn()
+
+    class _Inner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tf_layers = [_Layer()]
+            self.mlp_in_X = torch.nn.Sequential(torch.nn.Linear(4, 8))
+
+    class _Lim:
+        num_node_classes, num_edge_classes = 9, 4
+
+    class _Base(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _Inner()
+            self.limit_dist = _Lim()
+
+    return _Base()
+
+
+def test_scaled_readout_bounds_the_init_magnitude():
+    """The explosion this replaces was exp(arbitrary backbone logit): loss 10085 and
+    |grad| 4.8e5 on the first smoke run. The scaled readout must bound log m near the
+    bias for ANY logit magnitude, so exp() of it is always safe."""
+    from defog.core.credit import CreditHead
+
+    h = CreditHead(_mini_base(), backbone="shared", cond_mean=[0.0], cond_std=[1.0],
+                   readout="scaled", readout_scale=0.3)
+    h.init_bias(-1.7)
+    for mag in (1.0, 50.0, 5000.0):
+        c = torch.randn(4, 6, 9) * mag
+        c = c - c.mean(-1, keepdim=True)
+        out = h.bias_X + h.readout_scale * c / c.std(-1, keepdim=True).clamp_min(1e-6)
+        assert float(out.min()) > -1.7 - 2.0, f"unbounded below at magnitude {mag}"
+        assert float(out.max()) < -1.7 + 2.0, f"unbounded above at magnitude {mag}"
+        assert float(out.exp().max()) < 5.0, "exp(log m) must stay small at init"
+
+
+def test_scaled_readout_passes_gradient_to_the_backbone_at_init():
+    """The gated readout multiplies every backbone gradient by a zero-init scalar --
+    measured gate_X = 0.008 after 8000 steps, i.e. the trainable backbone received 0.8%
+    of its gradient and never trained. The scaled readout must not have that property."""
+    from defog.core.credit import CreditHead
+
+    torch.manual_seed(SEED)
+    h = CreditHead(_mini_base(), backbone="shared", cond_mean=[0.0], cond_std=[1.0],
+                   readout="scaled", readout_scale=0.3)
+    logits = (torch.randn(2, 5, 9) * 3).requires_grad_(True)
+    c = logits - logits.mean(-1, keepdim=True)
+    out = h.bias_X + h.readout_scale * c / c.std(-1, keepdim=True).clamp_min(1e-6)
+    # An ASYMMETRIC reduction. out.sum() sums over the class axis, and the readout
+    # centres on that axis, so the sum is constant in the logits and its gradient
+    # vanishes by algebra -- a degenerate test, not a finding about the readout.
+    (out * torch.randn_like(out)).sum().backward()
+    assert logits.grad is not None and float(logits.grad.abs().max()) > 1e-6, \
+        "no gradient reaches the backbone at init"
+
+    # and the gated variant demonstrably does starve it
+    hg = CreditHead(_mini_base(), backbone="shared", cond_mean=[0.0], cond_std=[1.0],
+                    readout="gated")
+    l2 = (torch.randn(2, 5, 9) * 3).requires_grad_(True)
+    og = hg.bias_X + hg.gate_X * (l2 - l2.mean(-1, keepdim=True))
+    (og * torch.randn_like(og)).sum().backward()
+    assert float(l2.grad.abs().max()) == 0.0, "gated readout should give exactly zero"

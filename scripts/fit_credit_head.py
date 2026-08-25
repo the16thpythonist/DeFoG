@@ -218,6 +218,8 @@ def main():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--backbone", default="copy", choices=["copy", "shared"])
+    p.add_argument("--readout", default="scaled", choices=["scaled", "gated"])
+    p.add_argument("--readout-scale", type=float, default=0.3)
     p.add_argument("--base", default="ckpts/zinc_e1_seed42_kek.ckpt")
     p.add_argument("--adapter", default="ckpts/clogp_v11/clogp_adapter.ckpt")
     p.add_argument("--pool-cache", default="")
@@ -260,6 +262,7 @@ def main():
     va, tr = perm[:nval].tolist(), perm[nval:].tolist()
 
     head = CreditHead(base, cond_dim=1, backbone=args.backbone,
+                      readout=args.readout, readout_scale=args.readout_scale,
                       cond_mean=[float(pool["cond"].mean())],
                       cond_std=[float(pool["cond"].std()) or 1.0]).to(dev)
 

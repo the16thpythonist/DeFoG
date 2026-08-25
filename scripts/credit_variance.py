@@ -45,8 +45,8 @@ X1, E1 = s.endpoint; nm = s.end_node_mask
 em = edge_mask_of(nm)
 
 print(f"{a.states} states, eta={a.eta:g}\n")
-print(f"  {'t_int':>6s} {'t':>6s} | {'between-state sd':>17s} {'within-state sd':>16s} "
-      f"{'within/total':>13s}")
+print(f"  {'t_int':>6s} {'t':>6s} | {'total sd':>10s} {'per-class sd':>12s} "
+      f"{'beyond-class sd':>14s} {'beyond/total':>13s}")
 for t_int in [int(x) for x in a.t_ints.split(",")]:
     times = draw_times(base, a.states, dev, mode="match", n_draws=1,
                        step_indices=[t_int], sample_steps=a.steps,
@@ -55,12 +55,19 @@ for t_int in [int(x) for x in a.t_ints.split(",")]:
                                  torch.zeros(a.states, 0, device=dev), nm, times)[0]
     with torch.no_grad():
         lmX, _ = head(X_t, E_t, t, nm, cond)
-    # per-state mean over REAL coordinates and their classes
-    vals = [lmX[b][nm[b]] for b in range(a.states) if int(nm[b].sum()) > 1]
-    mus = torch.stack([v.mean() for v in vals])
-    between = float(mus.std())
-    within = float(torch.stack([v.std() for v in vals]).mean())
-    tot = (between ** 2 + within ** 2) ** 0.5
-    print(f"  {t_int:6d} {float(t[0,0]):6.3f} | {between:17.5f} {within:16.5f} "
-          f"{within/max(tot,1e-12):13.3f}")
+    # Decompose log m over real (state, coordinate, class) entries into the part a
+    # per-class vector explains and the part it cannot.
+    #
+    # NOTE: do NOT average over the class axis to get a "state mean". The readout
+    # centres pred.X on exactly that axis, so such a mean is state-independent BY
+    # ALGEBRA and reports 0.00000 whatever the head learned -- a degenerate diagnostic,
+    # the same shape of mistake as an A - B test where A and B are the same quantity.
+    v = lmX[nm]                                   # (n_real, dx)
+    per_class = v.mean(0, keepdim=True)           # the per-class component
+    resid = v - per_class                         # everything beyond it
+    tot_sd = float(v.std())
+    pc_sd = float(per_class.squeeze(0).std())
+    rs_sd = float(resid.std())
+    print(f"  {t_int:6d} {float(t[0,0]):6.3f} | {tot_sd:10.5f} {pc_sd:12.5f} "
+          f"{rs_sd:14.5f} {rs_sd/max(tot_sd,1e-12):13.3f}")
 print("\nVAR-DONE", flush=True)
