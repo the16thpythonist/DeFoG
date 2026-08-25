@@ -431,6 +431,65 @@ not obviously transfer to eta=25.
 
 This is untested and applies to any rate-space method, not just DAM.
 
+## The instruction IS learnable: split-half reliability 0.89
+
+`scripts/splithalf.py`. 24 states x 384 completions (568 node, 6709 edge coordinates).
+Split each state's completions in half, compute the signed per-coordinate shift
+independently in each half, correlate. Three levels: `raw`; `resid-1` with the per-class
+global mean removed; `resid-2` with the per-state per-class mean removed -- the last
+asks whether, GIVEN the state and the class, knowing which coordinate it is carries
+reproducible information. Null = weights shuffled within each half.
+
+| eta | lambda | channel | level | r_half | null | r_full (Spearman-Brown) |
+|---|---|---|---|---|---|---|
+| 1 | 1.0 | node | raw | +0.816 | -0.025 | **+0.899** |
+| 1 | 1.0 | node | resid-2 | +0.802 | -0.032 | **+0.890** |
+| 1 | 1.0 | edge | raw | +0.810 | +0.081 | +0.895 |
+| 1 | 1.0 | edge | resid-2 | **+0.810** | -0.058 | **+0.895** |
+| 1 | 3.0 | node | resid-2 | +0.673 | -0.061 | +0.804 |
+| 30 | 1.0 | node | resid-2 | +0.634 | +0.062 | +0.776 |
+| 30 | 1.0 | edge | resid-2 | +0.396 | -0.012 | +0.567 |
+
+**Two findings, both positive.**
+
+1. **The instruction is highly reproducible.** Both halves condition on the SAME `x_t`,
+   so whatever reproduces across them is by definition a function of
+   `(x_t, coordinate, class)` -- precisely the object a regressor would fit. It is
+   learnable in principle, not merely present.
+2. **It survives residualisation essentially untouched.** `resid-2` 0.802 against `raw`
+   0.816 for nodes, and 0.810 vs 0.810 for edges. Removing the per-state per-class mean
+   removes almost NONE of the signal, so this is not a per-element preference in
+   disguise. Nine numbers per element would capture nearly nothing of it.
+
+### This does not contradict the channel measurement
+
+They measure different things. `dTV` against a shuffled floor asks how BIG the shift is
+(1.8x, small). Split-half correlation asks how REPRODUCIBLE its pattern is (0.89, very
+high). **Small but extremely consistent** is exactly what a regressor exploits and what
+per-state Monte Carlo cannot.
+
+### The pooling deficit as one number
+
+Extrapolating the same reliability down by Spearman-Brown:
+
+| samples per instruction | reliability |
+|---|---|
+| **8 -- what DAM used** | **0.144** |
+| 12 | 0.202 |
+| 50 | 0.513 |
+| 100 | 0.678 |
+| 384 | 0.890 |
+
+DAM estimated each instruction at reliability 0.14-0.20, i.e. mostly noise. The same
+instruction is 0.89 reliable at 384 samples. A regressor needs neither, because every
+coordinate of every sample at every state supervises one shared function.
+
+At eta=30 the structure is ~30% weaker but alive (nodes 0.634, edges 0.396, nulls ~0),
+so it does not evaporate in the regime where it would be deployed.
+
+**This is the first clearly positive result in this investigation, and it is the
+justification for [`credit_head_design.md`](credit_head_design.md).**
+
 ### Still not run
 
 The training confirmation: DAM on `oxy-max`. The prediction is that it steers, where
