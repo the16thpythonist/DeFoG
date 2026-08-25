@@ -113,23 +113,57 @@ def gate1(head, base, pool, va, args, dev, cst, pc):
     `cst` and `pc` come from :func:`fit_baselines` on the TRAINING split -- see the note
     there about why fitting them on the validation data invalidates the comparison.
     """
-    tot = {"head": 0.0, "const": 0.0, "class": 0.0}
-    n = 0
+    per = {"head": [], "const": [], "class": []}
     pc = pc.to(dev)
-    for i in range(0, len(va), args.batch_train):
-        idx = va[i:i + args.batch_train]
-        with torch.no_grad():
-            _, _, _, aux = batch_loss(head, base, pool, idx, args.lam, dev,
-                                      sample_steps=args.steps, grad=False)
-        lmX, lmE, X1, E1, nm, em, log_w = aux
-        gX, _ = gather_log_m(lmX, lmE, X1, E1)
-        lw = log_w[:, None].expand_as(gX)
-        cls = X1.argmax(-1)
-        tot["head"] += float(credit_gkl(gX, lw)[nm].sum())
-        tot["const"] += float(credit_gkl(torch.full_like(gX, cst), lw)[nm].sum())
-        tot["class"] += float(credit_gkl(pc[cls], lw)[nm].sum())
-        n += int(nm.sum())
-    return {k: v / max(n, 1) for k, v in tot.items()}
+    draws = max(1, int(getattr(args, "eval_t_draws", 4)))
+    # Average over several t draws: the gate is an expectation over t, and a single
+    # draw makes it a noisy statistic (measured ~0.02% wobble on the smoke pool).
+    for _ in range(draws):
+        for i in range(0, len(va), args.batch_train):
+            idx = va[i:i + args.batch_train]
+            with torch.no_grad():
+                _, _, _, aux = batch_loss(head, base, pool, idx, args.lam, dev,
+                                          sample_steps=args.steps, grad=False)
+            lmX, lmE, X1, E1, nm, em, log_w = aux
+            gX, _ = gather_log_m(lmX, lmE, X1, E1)
+            lw = log_w[:, None].expand_as(gX)
+            cls = X1.argmax(-1)
+            per["head"].append(credit_gkl(gX, lw)[nm].detach().cpu())
+            per["const"].append(credit_gkl(torch.full_like(gX, cst), lw)[nm].cpu())
+            per["class"].append(credit_gkl(pc[cls], lw)[nm].cpu())
+    v = {k: torch.cat(x) for k, x in per.items()}
+    out = {k: float(x.mean()) for k, x in v.items()}
+    # PAIRED differences. Head and baselines are scored on the SAME entries, so the
+    # per-entry difference has far less variance than either mean -- and the reward is
+    # a whole-molecule property, so most of the spread is shared and cancels. Comparing
+    # two aggregate means with unknown variance cannot resolve the couple of percent
+    # that is all a per-coordinate credit can buy here.
+    for ref in ("const", "class"):
+        d = v["head"] - v[ref]
+        se = float(d.std() / math.sqrt(max(d.numel(), 1)))
+        out[f"d_{ref}"] = float(d.mean())
+        out[f"se_{ref}"] = se
+        out[f"t_{ref}"] = float(d.mean()) / se if se > 0 else float("nan")
+    out["n_entries"] = int(v["head"].numel())
+    return out
+
+
+def _report(res):
+    """Paired reporting. A bare mean comparison cannot resolve a 1-2% margin; the
+    per-entry paired difference and its standard error can."""
+    for k in ("head", "const", "class"):
+        print(f"  {k:6s} {res[k]:.6f}")
+    ok = True
+    for ref, label in (("const", "constant"), ("class", "per-class")):
+        d, se, t = res[f"d_{ref}"], res[f"se_{ref}"], res[f"t_{ref}"]
+        rel = 100 * (1 - res["head"] / max(res[ref], 1e-12))
+        print(f"  vs {label:9s}: {rel:+6.2f}%   paired d {d:+.6f} +- {se:.6f}"
+              f"  t = {t:+7.2f}")
+        ok = ok and d < 0 and t < -3.0
+    print(f"  n entries: {res['n_entries']:,}")
+    print(f"  -> {'PASS' if ok else 'FAIL'}  (need paired d < 0 and t < -3 vs BOTH)",
+          flush=True)
+    return ok
 
 
 def main():
@@ -149,6 +183,9 @@ def main():
     p.add_argument("--pool-cache", default="")
     p.add_argument("--out", default="ckpts/credit_head.ckpt")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--eval-t-draws", type=int, default=4,
+                   help="t draws to average the held-out gate over; the gate is an "
+                        "expectation over t and one draw makes it noisy.")
     p.add_argument("--eval-only", default="",
                    help="Path to a fitted head: recompute Gate 1 from the CACHED pool "
                         "without redoing the rollouts. Used to re-score a run whose "
@@ -204,12 +241,8 @@ def main():
                                         weights_only=False)["state_dict"])
         res = gate1(head, base, pool, va, args, dev, cst, pc)
         print(f"\nGATE 1 (re-scored, training-split baselines)  {args.eval_only}")
-        for k in ("head", "const", "class"):
-            print(f"  {k:6s} {res[k]:.6f}")
-        print(f"  vs constant : {100*(1-res['head']/max(res['const'],1e-12)):+6.2f}%")
-        print(f"  vs per-class: {100*(1-res['head']/max(res['class'],1e-12)):+6.2f}%")
-        ok = res["head"] < res["const"] and res["head"] < res["class"]
-        print(f"  -> {'PASS' if ok else 'FAIL'}\nFIT-DONE", flush=True)
+        _report(res)
+        print("FIT-DONE", flush=True)
         return
 
     npar = sum(q.numel() for q in head.parameters() if q.requires_grad)
@@ -230,12 +263,7 @@ def main():
 
     res = gate1(head, base, pool, va, args, dev, cst, pc)
     print(f"\nGATE 1  held-out gKL, node channel ({len(va)} endpoints)")
-    for k in ("head", "const", "class"):
-        print(f"  {k:6s} {res[k]:.6f}")
-    ok = res["head"] < res["const"] and res["head"] < res["class"]
-    print(f"  vs constant : {100*(1-res['head']/max(res['const'],1e-12)):+6.2f}%")
-    print(f"  vs per-class: {100*(1-res['head']/max(res['class'],1e-12)):+6.2f}%")
-    print(f"  -> {'PASS' if ok else 'FAIL'}", flush=True)
+    ok = _report(res)
 
     head.save(args.out, gate1=res, args=vars(args))
     json.dump({"gate1": res, "pass": bool(ok), "args": vars(args)},
