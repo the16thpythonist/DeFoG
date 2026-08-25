@@ -148,7 +148,7 @@ def gate1(head, base, pool, va, args, dev, cst, pc):
     return out
 
 
-def _report(res):
+def _report(res, res_tr=None):
     """Paired reporting. A bare mean comparison cannot resolve a 1-2% margin; the
     per-entry paired difference and its standard error can."""
     for k in ("head", "const", "class"):
@@ -157,10 +157,31 @@ def _report(res):
     for ref, label in (("const", "constant"), ("class", "per-class")):
         d, se, t = res[f"d_{ref}"], res[f"se_{ref}"], res[f"t_{ref}"]
         rel = 100 * (1 - res["head"] / max(res[ref], 1e-12))
+        extra = ""
+        if res_tr is not None:
+            extra = f"   [train d {res_tr[f'd_{ref}']:+.6f} t {res_tr[f't_{ref}']:+6.2f}]"
         print(f"  vs {label:9s}: {rel:+6.2f}%   paired d {d:+.6f} +- {se:.6f}"
-              f"  t = {t:+7.2f}")
+              f"  t = {t:+7.2f}{extra}")
         ok = ok and d < 0 and t < -3.0
     print(f"  n entries: {res['n_entries']:,}")
+    if res_tr is not None:
+        # Diagnose from the HEAD's own train-vs-val gap, not from whether it beats the
+        # baselines on train. The per-class reference is fitted on train, so it is
+        # in-sample there and out-of-sample on val -- it looks strong on train for
+        # reasons that have nothing to do with the head. (Observed on the smoke pool:
+        # head loses to per-class on train at t=+20 while beating it on val at t=-13.6,
+        # which is the baseline overfitting, not the head underfitting.)
+        gap = (res["head"] - res_tr["head"]) / max(abs(res_tr["head"]), 1e-12)
+        print(f"  head gKL  train {res_tr['head']:.6f}  val {res['head']:.6f}"
+              f"   gap {100*gap:+.2f}%")
+        if not ok:
+            print("  diagnosis: " + (
+                "val is much worse than train -> OVERFITTING; the fix is more "
+                "endpoints or regularisation, not architecture."
+                if gap > 0.02 else
+                "train and val agree, so the head is not overfitting -- it simply does "
+                "not separate the target. Capacity, optimisation, or no learnable "
+                "signal at this t/lambda."))
     print(f"  -> {'PASS' if ok else 'FAIL'}  (need paired d < 0 and t < -3 vs BOTH)",
           flush=True)
     return ok
@@ -240,8 +261,10 @@ def main():
         head.load_state_dict(torch.load(args.eval_only, map_location=dev,
                                         weights_only=False)["state_dict"])
         res = gate1(head, base, pool, va, args, dev, cst, pc)
+        tr_s = tr[:len(va)]
+        res_tr = gate1(head, base, pool, tr_s, args, dev, cst, pc)
         print(f"\nGATE 1 (re-scored, training-split baselines)  {args.eval_only}")
-        _report(res)
+        ok = _report(res, res_tr)
         print("FIT-DONE", flush=True)
         return
 
@@ -262,8 +285,14 @@ def main():
                   f"  |g| {float(gn):.3f}  [{time.time()-t0:.0f}s]", flush=True)
 
     res = gate1(head, base, pool, va, args, dev, cst, pc)
+    # Same-sized slice of the TRAINING split, so a failure can be diagnosed instead of
+    # merely reported: beats the references on train but not val => overfitting, and
+    # the fix is data or regularisation; fails on train too => the head cannot express
+    # or reach the target at all, which is a capacity or optimisation problem. Without
+    # this a FAIL is a dead end.
+    res_tr = gate1(head, base, pool, tr[:len(va)], args, dev, cst, pc)
     print(f"\nGATE 1  held-out gKL, node channel ({len(va)} endpoints)")
-    ok = _report(res)
+    ok = _report(res, res_tr)
 
     head.save(args.out, gate1=res, args=vars(args))
     json.dump({"gate1": res, "pass": bool(ok), "args": vars(args)},
