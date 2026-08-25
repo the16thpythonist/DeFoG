@@ -245,7 +245,7 @@ nodes are noise" finding is withdrawn.** What replicated was a property of the m
 It should not be used again. Any further DAM work here has to be judged on generated
 outcomes at realistic training length.
 
-## THE ANSWER: the reward's information does not fit through the channel
+## Why it fails here: per-coordinate credit assignment is thousands of times harder
 
 DAM's target posterior is `p*(x1|xt) ~ p_base(x1|xt) * exp(-g(x1))`. But DeFoG's rate
 is `R_i(xt->j) = sum_c p_theta(x1^i=c|xt) * R_i(xt->j|c,t)` -- it reads ONE
@@ -267,32 +267,49 @@ finite-sample noise floor.
 | 0.750 | 1.0 | 176.3 | -1.5828 | -0.6316 | +0.9511 | 0.0155 | 0.0129 | 1.20x |
 | 0.750 | 3.0 | 85.5 | -1.5828 | -0.3240 | +1.2588 | 0.0347 | 0.0309 | 1.12x |
 
-**The tilt is excellent and the channel is nearly closed.** Reweighting cuts the logP
-error threefold at lambda=3 using only the base model's own samples -- the target is
-not the problem. But the marginals move 1.1-2.0x above a shuffled-weight floor, and at
-t=0.75 the edge channel at lambda=3 is 0.0134 against a 0.0137 floor, i.e. BELOW noise.
+**The tilt is excellent, and the per-state instruction is tiny.** Reweighting cuts the
+logP error threefold at lambda=3 using only the base model's own samples -- the target
+is not the problem. But the marginals move 1.1-2.0x above a shuffled-weight floor, and
+at t=0.75 the edge channel at lambda=3 is 0.0134 against a 0.0137 floor, i.e. BELOW
+noise. Raising lambda does not change this: 0.3 -> 3.0 grows the shift 7x while the
+ratio to the floor moves 1.65 -> 2.01 and ESS collapses 231 -> 37.
 
-**Temperature does not open it.** From lambda=0.3 to 3.0 the absolute shift grows 7x
-while the ratio to the floor moves 1.65 -> 2.01 and ESS collapses 231 -> 37. Shift and
-noise are bought in equal measure.
+### What this does NOT show (corrected)
 
-### Why: the reward is about combinations, the channel carries positions
+An earlier revision of this document concluded "the information does not fit through the
+channel" and "DeFoG can only move marginals". **Both are wrong and are retracted.**
 
-Hitting a target total logP is a constraint on WHICH ATOMS AND BONDS OCCUR TOGETHER.
-Reweighting reshuffles the joint dramatically while leaving each individual coordinate's
-marginal essentially unmoved. The adjoint asks for an ~11.6% rate correction
-(`sd(a_hat)`=0.116) where the marginals support ~1.6%: it is mostly asking for
-something the parameterisation cannot deliver.
+* **DeFoG represents combinations perfectly well.** The head predicts
+  `p(x1^i|x_t)` conditioned on the WHOLE graph through many transformer layers, and
+  sampling is sequential, so correlations are built across steps exactly as in any
+  autoregressive or diffusion model. Validity is the proof: a valid molecule is nothing
+  but correlations, and DeFoG produces them.
+* **Decisive counter-evidence is in this repo.** GDPO policy-gradient RL steers logP on
+  this model; so does the CFG adapter (MAE 0.6453 -> 0.5420); so does Feynman-Kac
+  particle steering. Same model, same property, three methods that work. logP is not
+  unreachable for this architecture.
+* **A tiny per-step instruction is arithmetically expected.** The whole tilt is worth
+  ~1 nat at the path level; spread over 250 steps x ~3000 coordinates that is ~1e-6
+  nats per coordinate-step. Smallness is not evidence of an obstruction, and the
+  earlier revision treated it as though it were. What the shuffled control actually
+  establishes is narrower: *with 256 samples the instruction is hard to distinguish
+  from noise* -- a statement about the ESTIMATOR, not the model.
 
-This closes every thread at once. Fixing the estimator bias, raising lambda, removing
-the estimator noise with `n_z`, common random numbers -- **none was the constraint,
-because the information never enters the channel.** The "edge signal" was spurious for
-the same reason: the true edge shift is 0.1-0.3%, at the noise floor.
+### The real difference: DAM needs per-coordinate credit, GDPO does not
 
-And it is why the paper's results are real. GSM8K, Countdown and Sudoku rewards ARE
-per-token statements -- "cell (3,4) must be 7" moves that token's marginal from 1/9 to
-1. Their reward is native to the channel; a target on a sum over the molecule is
-orthogonal to it.
+GDPO takes one scalar reward per finished molecule and pushes the whole trajectory's
+log-probability. It never works out which atom was responsible. DAM must estimate,
+separately for every coordinate at every state, how much that specific edit changed the
+expected outcome -- strictly more information, and strictly harder to obtain.
+
+How hard depends on whether the instruction is the SAME across coordinates. When it is,
+an estimator pools across all ~3000 of them, an enormous effective-sample-size gain.
+When each coordinate's instruction differs and partly cancels, it must be resolved
+coordinate by coordinate. That is the pooling deficit, and it is of order thousands --
+against which the bias fix, the temperature and the 20-40x sample shortfall are
+corrections of order 1-50x. **That is why none of them helped.**
+
+This is a COST argument, not an impossibility one.
 
 ### Confirmed by controlled contrast: it is the SHAPE of the reward
 
@@ -318,6 +335,11 @@ At **identical ESS and identical gross movement** (dTV 0.0436 vs 0.0440, within 
 while `logp-match` moves each slot a fifth as far at 58% coherence so much of it
 cancels. Same model, same states, same completions -- only the reward's shape differs.
 
+Coherence 1.000 is exactly the poolability above: every coordinate receiving the same
+instruction is what lets an estimator average across coordinates instead of resolving
+each one. This contrast holds the PROCESS fixed and varies only the reward, so it
+demonstrates the reward-shape effect independently of any claim about permanence.
+
 `oxy-match` is sharper still: it **could not reach ESS 64** at any lambda up to the
 bisection ceiling of 200. A target on a count, when the base is already centred there,
 offers almost nothing to select on, and what it selects gives `d p(O)` = -0.0028, i.e.
@@ -328,6 +350,10 @@ instruction at all as "exactly this many".
 
 * "Correlations are lost because the head is factorised" -- WRONG as stated. DeFoG
   builds correlations across steps; per-step factorisation is not the issue.
+* "The information does not fit through the channel" / "DeFoG can only move marginals"
+  -- WRONG, retracted above. GDPO, the CFG adapter and FK steering all move logP on
+  this model. The barrier is the cost of per-coordinate credit assignment, not
+  expressiveness.
 * "The dTV ratio separates decomposable from aggregate rewards" -- FALSIFIED. dTV is
   unsigned and cannot tell coherent movement from jitter; all three rewards sit at
   2.4-2.8x. The signed `d p(O)` and `coherence` are what separate them.
@@ -336,14 +362,21 @@ instruction at all as "exactly this many".
 ### Still not run
 
 The training confirmation: DAM on `oxy-max`. The prediction is that it steers, where
-every logP run did not. That would complete the boundary: **DAM transfers to graph
+every logP run did not. It now also SEPARATES two explanations that both fit the
+evidence: reward shape (poolability) and process permanence (masked diffusion's edits
+are irreversible; DeFoG's are not). `oxy-max` fixes the reward shape while leaving the
+process untouched -- so if it steers, shape was dominant; if it does not, permanence is
+the binding constraint and no reward reshaping fixes it. That would complete the boundary: **DAM transfers to graph
 generation for rewards that decompose over coordinates, and not for rewards defined on
 aggregate properties** -- with `scripts/decomp.py` as a minutes-long diagnostic that
 says which case you are in before spending days on training.
 
 ## Established / not established
 
-**Established.** `resid` is unusable (three independent failure modes above). The
+**Established.** DAM's per-coordinate credit assignment is far more expensive for an
+aggregate reward than a decomposable one: at matched tilt strength the decomposable
+reward gives 8.7x the net signal at coherence 1.000 against 0.577. `resid` is unusable
+(three independent failure modes above). The
 estimator's noise/signal ratio is ~4.8 at one continuation per estimate, needing ~23
 to resolve -- measured two independent ways -- and `n_z=10` removes it entirely.
 Alg. 1's coupling fixes `E[a_hat]` at 1 as specified. **None of the three suppressors
