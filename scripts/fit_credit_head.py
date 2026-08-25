@@ -85,10 +85,37 @@ def batch_loss(head, base, pool, idx, lam, dev, t_int=None, sample_steps=100,
     return 0.5 * (ln + le), float(ln), float(le), (lmX, lmE, X1, E1, nm, em, log_w)
 
 
-def gate1(head, base, pool, va, args, dev):
-    """Held-out gKL of the head against the two reference predictors."""
+def fit_baselines(pool, tr, lam):
+    """Fit the two reference predictors ON THE TRAINING SPLIT.
+
+    They must be fitted where the head was fitted. Computing them from the validation
+    batch's own labels -- as an earlier version of this function did -- makes them
+    ORACLES that peeked at the answers, and the head, which only ever saw the training
+    split, then has to beat predictors that cannot be beaten fairly. The gate would
+    read FAIL for a perfectly good head.
+
+    The class a coordinate takes is read straight off the endpoint, so no re-noising is
+    needed and these are exact over the whole split.
+    """
+    X1, E1 = pool["X1"][tr], pool["E1"][tr]
+    nm = pool["node_mask"][tr]
+    lw = lam * pool["reward"][tr]
+    clsX = X1.argmax(-1)
+    cst = constant_baseline(lw[:, None].expand_as(clsX)[nm])
+    pc = per_class_baseline(lw[:, None].expand_as(clsX), clsX, X1.shape[-1], nm)
+    pc = torch.where(torch.isfinite(pc), pc, torch.full_like(pc, cst))
+    return cst, pc
+
+
+def gate1(head, base, pool, va, args, dev, cst, pc):
+    """Held-out gKL of the head against the two reference predictors.
+
+    `cst` and `pc` come from :func:`fit_baselines` on the TRAINING split -- see the note
+    there about why fitting them on the validation data invalidates the comparison.
+    """
     tot = {"head": 0.0, "const": 0.0, "class": 0.0}
     n = 0
+    pc = pc.to(dev)
     for i in range(0, len(va), args.batch_train):
         idx = va[i:i + args.batch_train]
         with torch.no_grad():
@@ -98,11 +125,9 @@ def gate1(head, base, pool, va, args, dev):
         gX, _ = gather_log_m(lmX, lmE, X1, E1)
         lw = log_w[:, None].expand_as(gX)
         cls = X1.argmax(-1)
-        cst = constant_baseline(lw[nm])
-        pc = per_class_baseline(lw, cls, X1.shape[-1], nm)
         tot["head"] += float(credit_gkl(gX, lw)[nm].sum())
         tot["const"] += float(credit_gkl(torch.full_like(gX, cst), lw)[nm].sum())
-        tot["class"] += float(credit_gkl(pc[cls].clamp_min(-30), lw)[nm].sum())
+        tot["class"] += float(credit_gkl(pc[cls], lw)[nm].sum())
         n += int(nm.sum())
     return {k: v / max(n, 1) for k, v in tot.items()}
 
@@ -124,6 +149,10 @@ def main():
     p.add_argument("--pool-cache", default="")
     p.add_argument("--out", default="ckpts/credit_head.ckpt")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--eval-only", default="",
+                   help="Path to a fitted head: recompute Gate 1 from the CACHED pool "
+                        "without redoing the rollouts. Used to re-score a run whose "
+                        "gate was computed with the oracle-baseline bug.")
     args = p.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
@@ -159,19 +188,30 @@ def main():
     # over the whole training split. With the gate at zero the head then reproduces the
     # per-class baseline bit-for-bit at iteration 0, which is what makes any held-out
     # improvement attributable to learning rather than to initialisation.
+    cst, pc = fit_baselines(pool, tr, args.lam)
     with torch.no_grad():
-        trX = pool["X1"][tr].argmax(-1); trE = pool["E1"][tr].argmax(-1)
-        trM = pool["node_mask"][tr]; trEM = edge_mask_of(trM)
+        trE = pool["E1"][tr].argmax(-1)
+        trEM = edge_mask_of(pool["node_mask"][tr])
         lw_tr = (args.lam * pool["reward"][tr])
-        bx = per_class_baseline(lw_tr[:, None].expand_as(trX), trX,
-                                pool["X1"].shape[-1], trM)
         be = per_class_baseline(lw_tr[:, None, None].expand_as(trE), trE,
                                 pool["E1"].shape[-1], trEM)
-        fill = float(lw_tr.mean())
-        head.init_bias(torch.where(torch.isfinite(bx), bx, torch.full_like(bx, fill)).to(dev),
-                       torch.where(torch.isfinite(be), be, torch.full_like(be, fill)).to(dev))
+        be = torch.where(torch.isfinite(be), be, torch.full_like(be, cst))
+        head.init_bias(pc.to(dev), be.to(dev))
     print("  init bias (nodes, log E[w|class]): "
           + " ".join(f"{float(v):+.3f}" for v in head.bias_X), flush=True)
+    if args.eval_only:
+        head.load_state_dict(torch.load(args.eval_only, map_location=dev,
+                                        weights_only=False)["state_dict"])
+        res = gate1(head, base, pool, va, args, dev, cst, pc)
+        print(f"\nGATE 1 (re-scored, training-split baselines)  {args.eval_only}")
+        for k in ("head", "const", "class"):
+            print(f"  {k:6s} {res[k]:.6f}")
+        print(f"  vs constant : {100*(1-res['head']/max(res['const'],1e-12)):+6.2f}%")
+        print(f"  vs per-class: {100*(1-res['head']/max(res['class'],1e-12)):+6.2f}%")
+        ok = res["head"] < res["const"] and res["head"] < res["class"]
+        print(f"  -> {'PASS' if ok else 'FAIL'}\nFIT-DONE", flush=True)
+        return
+
     npar = sum(q.numel() for q in head.parameters() if q.requires_grad)
     print(f"credit head: {npar:,} trainable params (backbone={args.backbone})", flush=True)
     opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -188,7 +228,7 @@ def main():
             print(f"  it {it:5d}  loss {float(loss):.5f}  (node {ln:.5f} edge {le:.5f})"
                   f"  |g| {float(gn):.3f}  [{time.time()-t0:.0f}s]", flush=True)
 
-    res = gate1(head, base, pool, va, args, dev)
+    res = gate1(head, base, pool, va, args, dev, cst, pc)
     print(f"\nGATE 1  held-out gKL, node channel ({len(va)} endpoints)")
     for k in ("head", "const", "class"):
         print(f"  {k:6s} {res[k]:.6f}")
