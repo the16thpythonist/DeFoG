@@ -113,11 +113,17 @@ ceiling of 0.89 set by the data's own reliability (nothing can exceed it). Cost:
 minutes-GPU. **This gate cannot be passed by a per-class scalar**, which is what makes
 it worth running.
 
-**Gate 3 -- does it move a molecule.** Guided sampling vs (a) base+adapter unguided and
-(b) GDPO, on logP MAE against the conditioning target. Paired, >= 3 seeds, >= 256
-molecules per arm, validity reported alongside. Baseline already measured: **MAE 0.6730,
-54/64 decode**. Pass: MAE improvement outside the seed spread, with validity not
-degraded. Cost: hours-GPU.
+**Gate 3 -- does it move a molecule.** Guided sampling against base+adapter unguided, on
+logP MAE against the conditioning target. Paired, >= 3 seeds, >= 256 molecules per arm,
+validity and uniqueness reported alongside. Pass: MAE improvement outside the seed
+spread, with validity not degraded. Cost: hours-GPU.
+
+The control is the `scale=0` arm of the same sweep, which is bit-identical to unguided
+sampling (`tests/test_credit.py`) and shares the seed and the conditions with every
+guided arm, so the comparison is paired within the run. Do NOT compare against the
+**MAE 0.6730, 54/64** figure recorded in `dam_result.md`: that was measured at eta=1
+with 100 sampling steps for the DAM arm, and Gate 3 runs at eta=30 with 500 steps.
+Different sampling regime, not a baseline for this.
 
 **Gate 4 -- how much of the available gain was captured.** Reweighting the base's own
 samples is worth **+0.97 reward** at lambda=1 (`scripts/marginal.py`). Report guided
