@@ -168,9 +168,10 @@ The training config (`subsample='late'`) sits at t=0.938, so ~21-25.
 That is the answer to "it is a published method, why does it not work here". Two
 differences from DAM's own experiments, which are masked diffusion LANGUAGE models:
 
-* **Their edits are permanent.** Unmasking a token can never be undone, so the first
-  jump's effect reaches the endpoint intact. DeFoG is a general CTMC -- a bond can go
-  single -> double -> single, so an edit at t=0.9 may simply be reverted.
+* ~~**Their edits are permanent and ours are not.**~~ **MEASURED AND FALSE** -- see
+  the permanence section below. DeFoG's edits are nearly as permanent as masked
+  diffusion's: ~1.08 changes per atom over a 100-step run, and a 0.3% reversion rate at
+  t=0.91.
 * **Their reward is decisive per edit.** A wrong digit in Sudoku takes the reward from
   1 to 0. logP averages over ~40 atoms, so no single bond moves it much.
 
@@ -359,14 +360,50 @@ instruction at all as "exactly this many".
   2.4-2.8x. The signed `d p(O)` and `coherence` are what separate them.
 * The channel claim itself -- HOLDS, against a shuffled-weight floor throughout.
 
+### Permanence is NOT the difference (measured)
+
+The natural rival explanation is that masked diffusion's edits are irreversible by
+construction while DeFoG's are not, so an edit's effect on the endpoint is diluted here.
+`scripts/churn.py` measures it. For each step: `agree` = fraction of coordinates already
+holding their FINAL value, `settled` = fraction holding it at that step AND every step
+after. Masked diffusion's gap between the two is exactly 0 by construction.
+
+| t | agree_X | settled_X | gap | agree_E | settled_E | gap |
+|---|---|---|---|---|---|---|
+| 0.000 | 0.638 | 0.503 | 0.135 | 0.850 | 0.774 | 0.077 |
+| 0.510 | 0.728 | 0.691 | 0.037 | 0.904 | 0.878 | 0.025 |
+| 0.750 | 0.829 | 0.809 | 0.020 | 0.940 | 0.931 | 0.009 |
+| 0.910 | 0.907 | 0.904 | **0.003** | 0.972 | 0.968 | **0.004** |
+| 0.990 | 0.992 | 0.992 | 0.000 | 0.995 | 0.995 | 0.000 |
+
+Mean flips per coordinate over the whole run: **nodes 1.08, edges 0.39**. Median t of
+last change is 0.000 for both, i.e. **over half of atoms and over three quarters of
+bonds never change at all**. At t=0.938 -- the operating point of every DAM run here --
+the reversion rate is ~0.3%.
+
+DeFoG is therefore far closer to masked diffusion than assumed: theirs is exactly one
+change per token by construction, ours is ~1.08 per atom empirically. **Permanence is
+excluded as the explanation**, which strengthens the reward-shape account by removing
+its rival.
+
+(Caveat: much of the raw `agree` figure is coincidence -- the noise distribution is the
+data marginal and carbon is 73.7% of atoms, so chance agreement is ~57%. The GAP and the
+flip count are free of that base rate and carry the argument.)
+
+This also corrects the earlier reading of the CRN result (only 17-54% of seed-matched
+pairs reach the same molecule). That is not the edit being reverted: it is the edit
+changing which OTHER coordinates move, because one altered coordinate shifts the
+network's predictions across the whole graph. Downstream divergence, not instability in
+the edited coordinate.
+
 ### Still not run
 
 The training confirmation: DAM on `oxy-max`. The prediction is that it steers, where
 every logP run did not. It now also SEPARATES two explanations that both fit the
 evidence: reward shape (poolability) and process permanence (masked diffusion's edits
 are irreversible; DeFoG's are not). `oxy-max` fixes the reward shape while leaving the
-process untouched -- so if it steers, shape was dominant; if it does not, permanence is
-the binding constraint and no reward reshaping fixes it. That would complete the boundary: **DAM transfers to graph
+process untouched. With permanence now excluded by measurement, it is a cleaner test
+than it was: the process is not a confound. That would complete the boundary: **DAM transfers to graph
 generation for rewards that decompose over coordinates, and not for rewards defined on
 aggregate properties** -- with `scripts/decomp.py` as a minutes-long diagnostic that
 says which case you are in before spending days on training.
