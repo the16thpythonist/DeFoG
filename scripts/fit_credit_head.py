@@ -23,8 +23,9 @@ import torch.nn.functional as F
 
 from defog.core import DeFoGModel, AdaLNAdapter
 from defog.core.adapter import AdapterComposition, ConditionBranch
-from defog.core.credit import (CreditHead, constant_baseline, credit_gkl, edge_mask_of,
-                               gather_log_m, per_class_baseline)
+from defog.core.credit import (CreditHead, assemble, constant_baseline, credit_gkl,
+                               edge_mask_of, gather_log_m, pad_batch,
+                               per_class_baseline)
 from defog.core.renoise import draw_times, renoise_states
 from defog.core.rl import PropertyMatchReward, RolloutSampler
 from defog.domains.molecule import build_encoders
@@ -40,8 +41,12 @@ def build_pool(base, adapter, args, dev):
     only expensive part, and the training loop reuses it for every epoch."""
     _, adec, _, bdec = build_encoders(ATOMS, BONDS)
     rew = PropertyMatchReward(adec, bdec, lambda m: float(Crippen.MolLogP(m)), scale=1.0)
-    X1s, E1s, nms, cds, rs = [], [], [], [], []
-    done, t0 = 0, time.time()
+    batches, done, t0 = [], 0, time.time()
+    part = (args.pool_cache + ".part") if args.pool_cache else ""
+    if part and os.path.exists(part):
+        batches = torch.load(part, weights_only=False)["batches"]
+        done = sum(b["reward"].shape[0] for b in batches)
+        print(f"  resuming from {part}: {done}/{args.pool} already sampled", flush=True)
     while done < args.pool:
         b = min(args.batch, args.pool - done)
         cond = (torch.rand(b, 1, device=dev) * 4.0 - 1.0)
@@ -55,13 +60,20 @@ def build_pool(base, adapter, args, dev):
         nm = s.end_node_mask
         Xr, Er, _ = base.limit_dist.ignore_virtual_classes(X1.clone(), E1.clone())
         r = rew(Xr, Er, nm, cond).to(dev).float().reshape(-1)
-        X1s.append(X1.cpu()); E1s.append(E1.cpu()); nms.append(nm.cpu())
-        cds.append(cond.cpu()); rs.append(r.cpu())
+        batches.append({"X1": X1.cpu(), "E1": E1.cpu(), "node_mask": nm.cpu(),
+                        "cond": cond.cpu(), "reward": r.cpu()})
         done += b
-        print(f"  pool {done}/{args.pool}  mean r {float(torch.cat(rs).mean()):+.4f}  "
+        mr = float(torch.cat([q["reward"] for q in batches]).mean())
+        print(f"  pool {done}/{args.pool}  mean r {mr:+.4f}  n={X1.shape[1]}  "
               f"[{time.time()-t0:.0f}s]", flush=True)
-    return {"X1": torch.cat(X1s), "E1": torch.cat(E1s), "node_mask": torch.cat(nms),
-            "cond": torch.cat(cds), "reward": torch.cat(rs)}
+        # Checkpoint the RAW batches, before any step that can fail. The first version
+        # saved only after concatenating, and the concatenation was the thing that
+        # crashed -- losing 100 minutes of sampling per job. Sampling is the expensive
+        # part; it must never be at risk from a cheap step that follows it.
+        if part and len(batches) % 4 == 0:
+            torch.save({"batches": batches}, part + ".tmp")
+            os.replace(part + ".tmp", part)
+    return assemble(batches)
 
 
 def batch_loss(head, base, pool, idx, lam, dev, t_int=None, sample_steps=100,
@@ -226,7 +238,10 @@ def main():
     else:
         pool = build_pool(base, adapter, args, dev)
         if args.pool_cache:
-            torch.save(pool, args.pool_cache)
+            torch.save(pool, args.pool_cache + ".tmp")
+            os.replace(args.pool_cache + ".tmp", args.pool_cache)
+            if os.path.exists(args.pool_cache + ".part"):
+                os.remove(args.pool_cache + ".part")
     r = pool["reward"]
     print(f"pool: {len(r)} endpoints  reward {float(r.mean()):+.4f} +- {float(r.std()):.4f}"
           f"  log_w range [{float(args.lam*r.min()):+.2f}, {float(args.lam*r.max()):+.2f}]",

@@ -317,3 +317,53 @@ def test_guidance_repeats_a_condition_that_does_divide():
     qX, _ = g(F.softmax(torch.randn(6, 4, 9), -1), F.softmax(torch.randn(6, 4, 4, 4), -1),
               _noisy(6, 4, 9, 4), torch.ones(6, 4, dtype=torch.bool))
     assert qX.shape == (6, 4, 9)
+
+
+# ===========================================================================
+# Pool assembly across ragged rollout batches
+# ===========================================================================
+def test_pad_batch_preserves_content_and_masks_the_padding():
+    """Rollout batches pad to THEIR OWN max node count, so the pool has to reconcile
+    e.g. 35 and 37. This is the bug that killed two 100-minute cluster jobs."""
+    from defog.core.credit import pad_batch
+
+    torch.manual_seed(SEED)
+    X1 = F.one_hot(torch.randint(0, 9, (3, 5)), 9).float()
+    E1 = F.one_hot(torch.randint(0, 4, (3, 5, 5)), 4).float()
+    nm = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 0, 0], [1] * 5]).bool()
+    pX, pE, pM = pad_batch(X1, E1, nm, 8)
+    assert pX.shape == (3, 8, 9) and pE.shape == (3, 8, 8, 4) and pM.shape == (3, 8)
+    assert torch.equal(pX[:, :5], X1) and torch.equal(pE[:, :5, :5], E1)
+    assert torch.equal(pM[:, :5], nm)
+    assert not pM[:, 5:].any(), "padded slots must be masked out"
+    # padded slots are a VALID one-hot, so argmax cannot yield a silent wrong answer
+    assert torch.equal(pX[:, 5:].sum(-1), torch.ones(3, 3))
+    assert torch.equal(pE[:, 5:].sum(-1), torch.ones(3, 3, 8))
+
+
+def test_pad_batch_is_a_noop_at_the_target_size():
+    from defog.core.credit import pad_batch
+
+    X1 = F.one_hot(torch.randint(0, 9, (2, 4)), 9).float()
+    E1 = F.one_hot(torch.randint(0, 4, (2, 4, 4)), 4).float()
+    nm = torch.ones(2, 4, dtype=torch.bool)
+    pX, pE, pM = pad_batch(X1, E1, nm, 4)
+    assert pX is X1 and pE is E1 and pM is nm
+
+
+def test_assemble_reconciles_ragged_batches():
+    """The exact failure: cat() of batches with 5 and 7 nodes. Must succeed and keep
+    every real coordinate, with the pool padded to the widest batch."""
+    from defog.core.credit import assemble
+
+    def mk(b, n):
+        return {"X1": F.one_hot(torch.randint(0, 9, (b, n)), 9).float(),
+                "E1": F.one_hot(torch.randint(0, 4, (b, n, n)), 4).float(),
+                "node_mask": torch.ones(b, n, dtype=torch.bool),
+                "cond": torch.randn(b, 1), "reward": torch.randn(b)}
+
+    pool = assemble([mk(2, 5), mk(3, 7), mk(1, 6)])
+    assert pool["X1"].shape == (6, 7, 9)
+    assert pool["E1"].shape == (6, 7, 7, 4)
+    assert pool["reward"].shape == (6,)
+    assert int(pool["node_mask"].sum()) == 2 * 5 + 3 * 7 + 1 * 6

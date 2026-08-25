@@ -64,6 +64,8 @@ from .adapter import AdaLNAdapter
 
 __all__ = [
     "CreditHead",
+    "assemble",
+    "pad_batch",
     "CreditGuidance",
     "credit_gkl",
     "gather_log_m",
@@ -116,6 +118,42 @@ def edge_mask_of(node_mask: torch.Tensor) -> torch.Tensor:
     n = node_mask.shape[1]
     iu = torch.triu(torch.ones(n, n, device=node_mask.device, dtype=torch.bool), 1)
     return (node_mask[:, :, None] & node_mask[:, None, :]) & iu[None]
+
+
+# ===========================================================================
+# Pool assembly across ragged rollout batches
+# ===========================================================================
+def pad_batch(X1, E1, nm, n):
+    """Pad one rollout batch out to ``n`` nodes.
+
+    Each rollout pads to ITS OWN batch max -- 37 nodes in one, 35 in the next -- so the
+    batches cannot be concatenated as they come. Padded slots get a valid one-hot
+    (class 0: carbon / no-bond) rather than all-zeros, because downstream code takes
+    ``argmax`` over the class axis and an all-zero row is not a distribution; they are
+    excluded everywhere by ``node_mask`` regardless, but a valid one-hot cannot become
+    a silent wrong answer if some path ever forgets the mask.
+    """
+    b_, cur, dx = X1.shape
+    if cur == n:
+        return X1, E1, nm
+    de = E1.shape[-1]
+    pX = torch.zeros(b_, n, dx, dtype=X1.dtype); pX[:, :cur] = X1; pX[:, cur:, 0] = 1
+    pE = torch.zeros(b_, n, n, de, dtype=E1.dtype)
+    pE[:, :cur, :cur] = E1; pE[:, cur:, :, 0] = 1; pE[:, :, cur:, 0] = 1
+    pM = torch.zeros(b_, n, dtype=nm.dtype); pM[:, :cur] = nm
+    return pX, pE, pM
+
+
+def assemble(batches):
+    """Pad every batch to the pool-wide max and concatenate."""
+    n = max(b["X1"].shape[1] for b in batches)
+    Xs, Es, Ms = [], [], []
+    for b in batches:
+        x, e, m = pad_batch(b["X1"], b["E1"], b["node_mask"], n)
+        Xs.append(x); Es.append(e); Ms.append(m)
+    return {"X1": torch.cat(Xs), "E1": torch.cat(Es), "node_mask": torch.cat(Ms),
+            "cond": torch.cat([b["cond"] for b in batches]),
+            "reward": torch.cat([b["reward"] for b in batches])}
 
 
 # ===========================================================================
