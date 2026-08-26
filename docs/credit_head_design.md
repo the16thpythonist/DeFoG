@@ -164,6 +164,61 @@ stronger of the two Gate 1 references. At small N it is WEAKER than a global con
 that reverses at 8192 endpoints is now something the run reports rather than something
 this document asserts.
 
+## 6b. Results: gated readout (jobs 43391-43396)
+
+Pre-RL zinc-kek base, clogp_v11 adapter, 8192 endpoints at eta=30 / 500 steps,
+lambda=1.0, K=8000 iterations, two independent seeds.
+
+**Gate 1: PASS on both seeds.**
+
+| seed | head | const | class | vs const | vs per-class |
+|---|---|---|---|---|---|
+| 42 | 0.078364 | 0.078927 | 0.078921 | d -0.000563 +- 0.000091, t = -6.17 | t = -6.12 |
+| 43 | 0.074559 | 0.077262 | 0.077241 | d -0.002703 +- 0.000070, t = -38.64 | t = -38.61 |
+
+Note the per-class reference collapsed onto the global constant (0.078927 vs 0.078921).
+At 8192 endpoints an atom's ELEMENT carries no information about the molecule's reward,
+which refutes the prediction in section 6a that per-class would become the stronger
+reference at scale -- and removes the "per-element shaping in disguise" objection.
+
+**Gate 2: FAIL on both seeds.** Per-state mean correlation with the empirically measured
+shift, against a ceiling of 0.890:
+
+| | head | null | per-class |
+|---|---|---|---|
+| seed 43 | +0.200 +- 0.113 | +0.097 +- 0.090 | +0.041 +- 0.116 |
+| seed 42 | +0.099 +- 0.138 | +0.097 +- 0.090 | +0.041 +- 0.116 |
+
+Seed 42 is indistinguishable from a shuffled null; seed 43's mean minus 2SE is below it.
+
+**Gate 3: null.** Control 0.6519 MAE, validity 0.945, sd 0.0171 over 3 seeds. Best
+guided arms -0.0043 (seed 43, scale 2) and -0.0156 (seed 42, scale 1) -- both inside
+the control's own seed spread, and both selected post hoc from four scales, where the
+minimum of four draws sits ~1 sd below the mean by chance. The only consistent effect is
+in the wrong direction: **validity falls as guidance strengthens**, 0.945 -> 0.874 at
+scale 4.
+
+### Why Gate 1 passed and Gate 2 failed: the readout starved the backbone
+
+Both gates are correct. The fitted parameters say what happened:
+
+    gate_X = 0.008    gate_E = 0.014    after 8000 steps
+
+The readout was `bias + gate * centred_logits` with `gate` zero-init. That scalar
+multiplies every gradient reaching the backbone -- and the backbone is TRAINABLE, 524
+tensors. It received 0.8% of its gradient and never trained. What Gate 1 rewarded was a
+marginally better per-class bias plus a 0.8%-strength copy of the base's own
+x1-prediction logits; Gate 2 correctly reports that this carries no credit.
+
+**Zero-init in front of a FROZEN backbone is the AdaLN idiom. In front of a trainable
+one it starves it.** The zero-init was itself introduced to fix the previous defect --
+`exp(arbitrary backbone logit)` opening at loss 10085 with |grad| 4.8e5 -- so one fix
+created the next. The `scaled` readout normalises the centred logits and scales them by
+a FIXED constant: bounded at init, which is all the zero-init was buying, with no
+learned zero in the gradient path.
+
+Gate 3's numbers therefore describe an underfit head and are not a test of the method.
+
 ## 7. What kills it
 
 * **Gate 1 fails.** The high-reward region is rare under base sampling, so `m` is fitted
