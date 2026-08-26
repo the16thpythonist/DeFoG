@@ -386,6 +386,63 @@ held-out states. That is a calibration correction for the one-shot factorised he
 needs no reward, and it is orthogonal to everything above. Whether it improves generated
 molecules is untested and would be worth a Gate 3.
 
+## 6e. Round 5 is void, and a prediction registered before round 6
+
+Round 5 targeted the reward TILT only (`p*/p_emp`, both from the same completions, so
+the base model's miscalibration cancels). Gate 1 FAILED on both seeds -- the head came
+out slightly WORSE than not guiding (d = +0.0028, +0.0038).
+
+That result is void. The split-half reliability of the tilt target was measured directly
+on a cached pool and is **~0.00 at K=6-8**: two independent halves of the completions
+give UNCORRELATED targets (logp +0.002, oxy +0.019). The head was regressing noise.
+
+It is not that the coordinates are settled -- only 9.9% have all completions agreeing,
+and each sees 2.35 distinct classes on average. There is something to estimate; a
+handful of completions cannot estimate it.
+
+**This casts the same doubt backwards.** Rounds 1-4 all used K=8, so every experiment
+behind the claim "credit is not amortisable" was incapable of detecting credit if it
+were there. The lambda=0 control and the calibration finding survive -- those concerned
+a different, much larger signal -- but the central negative does not. The target's
+reliability should have been measured before the first fit; it is a two-minute check,
+and it is the same "is there anything to learn" question `splithalf.py` asked of the
+INSTRUCTION and I never asked of the TRAINING TARGET.
+
+### Reliability rises with K for oxygen and not for logP
+
+Same 48 states throughout, so this is a controlled dose-response:
+
+| K | per half | logp | oxy |
+|---|---|---|---|
+| 4 | 2 | -0.0088 | -0.0158 |
+| 8 | 4 | +0.0192 | +0.0516 |
+| 12 | 6 | +0.0348 | +0.1007 |
+| 16 | 8 | +0.0140 | +0.1046 |
+| 24 | 12 | +0.0019 | **+0.1217** |
+
+Oxygen climbs monotonically across four increases; logP has no trend. That is the same
+boundary the controlled reward-shape contrast found (oxy-max coherence 1.000 against
+logp-match 0.577, 8.7x the directional signal), now visible in the TRAINING TARGET
+rather than in an offline measurement.
+
+### Prediction, registered before round 6 runs
+
+Spearman-Brown from the oxygen row: r ~ 0.22 at K=24, **~0.43 at K=64**. logP cannot be
+extrapolated because there is no trend.
+
+So, at K=64 on 1024 states:
+
+* **oxygen** should show a usable target and, if per-coordinate credit is amortisable at
+  all, Gate 1 and Gate 2 should move. If they do not move even here, amortisation fails
+  with a usable target and the negative is earned.
+* **logP** is expected to remain near zero reliability and to fail. If it fails while
+  oxygen succeeds, the boundary is DEMONSTRATED rather than inferred: per-coordinate
+  credit amortises for decomposable rewards and not for targets on an aggregate.
+* If **both** succeed, the whole earlier negative was K and nothing else.
+
+Registering this in advance because every previous round was read after the fact, and
+three conclusions in this project were later overturned for exactly that reason.
+
 ### What would still be worth doing
 
 * **More states with K completions.** Round 3 conflated the target fix with an 8x cut in
