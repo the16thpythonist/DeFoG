@@ -474,9 +474,10 @@ Gate 2, identical states and pipeline, only the reward's shape differing:
 | reward | raw | resid-2 | per-state mean +- SE | null |
 |---|---|---|---|---|
 | **oxygen** (decomposable) | +0.757 / +0.781 | +0.729 / +0.757 | **+0.679 +- 0.058 / +0.737 +- 0.046** | -0.154 |
-| **logP** (aggregate) | +0.111 | +0.080 | **+0.023 +- 0.114** | +0.101 |
+| **logP** (aggregate) | +0.111 / -0.038 | +0.080 / -0.054 | **+0.023 +- 0.114 / +0.054 +- 0.119** | +0.101 |
 
-Ceiling 0.890. Oxygen reaches 0.68-0.74; logP sits at 0.023, BELOW its own null. Across
+Ceiling 0.890. Oxygen reaches 0.68-0.74 on both seeds; logP sits at 0.023 and 0.054,
+at or BELOW its own null on both. Complete replication in both directions. Across
 four earlier rounds and eight heads Gate 2 never left the 0.10-0.23 band -- it just
 moved 3.5x, because for the first time the target was estimable and the reward had
 per-coordinate content.
