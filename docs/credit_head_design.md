@@ -219,6 +219,89 @@ learned zero in the gradient path.
 
 Gate 3's numbers therefore describe an underfit head and are not a test of the method.
 
+## 6c. Rounds 2 and 3, and the conclusion
+
+**Round 2 (scaled readout, jobs 43397-43400).** Removing the output throttle worked as
+intended and made the two seeds agree, but changed nothing that matters.
+
+| | Gate 1 | Gate 2 (per-state mean +- SE) |
+|---|---|---|
+| seed 42 | +1.65%, t = -15.87, PASS | +0.230 +- 0.130 |
+| seed 43 | +3.08%, t = -31.23, PASS | +0.233 +- 0.136 |
+
+Gate 3 null again: best deltas -0.0078 and -0.0203 against a control seed spread of
+0.0171, both selected post hoc from four scales.
+
+A correction to section 6b's diagnosis while we are here. The backbone moved 10.6% from
+its base initialisation under BOTH readouts, so "the backbone never trained" was wrong:
+Adam normalises by gradient magnitude, so a 0.8%-scaled gradient still produces
+near-full-size updates. What the gate throttled was the backbone's CONTRIBUTION to the
+output, not its training. The fix addressed the right thing for a partly wrong reason.
+
+**Round 3 (conditional pool, jobs 43417-43420).** Rounds 1 and 2 re-noised ONE endpoint
+per state, so `E[w | x1^i=c, xt]` was estimated from a single sample and the head could
+satisfy the loss by reconstructing the endpoint -- a per-state value function. Round 3
+gives each state K=8 completions simulated from it. The pool statistics confirm the fix:
+**within-state reward sd 0.83-0.91 against between-state 0.66-0.86**, i.e. 69-81% of the
+variance is now the conditional variation the head is supposed to regress, where before
+it was zero by construction.
+
+| | Gate 1 | Gate 2 |
+|---|---|---|
+| seed 42 | +2.96%, t = -13.43, PASS | +0.191 +- 0.121 |
+| seed 43 | -1.28%, t = +4.52, FAIL | +0.195 +- 0.124 |
+
+The cost of the fix was state diversity: 1024 states x 8 completions instead of 8192
+states x 1, so only 871 distinct training states. One seed overfit. That tension is
+inherent to a fixed completion budget and should have been flagged when the change was
+made, not after.
+
+### The conclusion
+
+**Gate 2 does not track Gate 1.** The seed that fit well (+2.96%) and the seed that fit
+worse than a constant (-1.28%) produce the SAME Gate 2 number, 0.191 vs 0.195. Whatever
+Gate 1 rewards is uncorrelated with reproducing the instruction.
+
+Across three rounds and six heads, Gate 2 never leaves the null band:
+
+| round | fix | Gate 2 | null |
+|---|---|---|---|
+| 1 gated | -- | 0.200, 0.099 | 0.097 |
+| 2 scaled | readout no longer throttles the output | 0.233, 0.230 | 0.097 |
+| 3 cond | target is the true conditional expectation | 0.191, 0.195 | 0.097 |
+
+Three candidate explanations were eliminated by measurement: the readout, the training
+target, and element identity (the per-class reference collapsed onto the global constant
+at 8192 endpoints -- an atom's element carries no information about the reward).
+
+**Quantitatively.** A perfect head should score ~0.9 on Gate 2: the empirical shift at
+K=256 has reliability ~0.85-0.89, so a truth-vs-estimate correlation is ~sqrt(0.87) =
+0.93. Observed 0.19 means the head captures roughly **4% of the instruction's variance**.
+
+Meanwhile `scripts/splithalf.py` measures that same instruction at **r = 0.89** -- it is
+stable and reproducible GIVEN THE STATE. So:
+
+> The per-coordinate credit is **estimable** -- ~23 simulations from a state recover it
+> at r ~ 0.89 -- but not **amortisable**. Three training setups and 12.3M parameters
+> conditioned on `x_t` capture ~4% of it. The information exists per state; a learned
+> function does not shortcut the simulation.
+
+That is a sharper boundary than "DAM does not transfer", and it is the case the DAM
+authors name as open (p.11: "Applying DAM to non-masked CTMC's presents an interesting
+future work"). It also explains the whole DAM arm: if the credit cannot be amortised,
+the only way to obtain it is per-state Monte Carlo, and per-state Monte Carlo at K=8-12
+has reliability 0.14-0.20 (section on the pooling deficit). Both routes are closed for
+the same underlying reason.
+
+### What would still be worth doing
+
+* **More states with K completions.** Round 3 conflated the target fix with an 8x cut in
+  state diversity. 4096 states x 8 completions (~4 GPU-hours) separates them. If Gate 2
+  is unchanged at 4x the states, amortisation is dead rather than under-trained.
+* **Report the instruction's smoothness directly.** Reproducible-given-the-state does not
+  imply predictable-across-states. Correlating the instruction between NEIGHBOURING
+  states (one coordinate apart) would measure that, and it is cheap.
+
 ## 7. What kills it
 
 * **Gate 1 fails.** The high-reward region is rare under base sampling, so `m` is fitted
