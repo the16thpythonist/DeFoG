@@ -316,6 +316,76 @@ Worth fixing if Gate 3 is ever run again: report MAE over all samples with a fix
 penalty for undecodable ones, so improving the numerator by shrinking the denominator
 cannot look like success.
 
+## 6d. Round 4: the gauge-invariant loss, and the control that killed it
+
+Guidance renormalises each coordinate independently, so multiplying `m[i,.]` by any
+constant depending on state and coordinate but not class leaves the sampler's output
+bit-for-bit unchanged. Only the ACROSS-CLASS variation does anything. Rounds 1-3
+minimised the ABSOLUTE value of `m` against the reward, which is not gauge-invariant,
+and the level is the large easy part -- so the optimiser spent its capacity on
+`E[w | x_t]`, which guidance mathematically ignores.
+
+Round 4 therefore trains cross-entropy between the NORMALISED guided marginal and the
+reward-tilted empirical class distribution over the K completions. Held-out, both seeds:
+
+| seed | head CE | unguided | paired d | t |
+|---|---|---|---|---|
+| 42 | 0.690500 | 0.735139 | -0.044639 | -15.95 |
+| 43 | 0.809958 | 0.889109 | -0.079151 | -23.03 |
+
+A 6-9% improvement on the quantity the sampler actually consumes, consistent across
+seeds, where the gKL loss managed ~3% on a gauge-irrelevant quantity.
+
+**And Gate 2 came out NEGATIVE**: -0.113 +- 0.119 and -0.218 +- 0.113, against a null of
++0.097. The head anti-correlates with the measured instruction while fitting its own
+objective better than anything before it.
+
+### The lambda = 0 control
+
+Gate 2 measures the head's shift relative to the EMPIRICAL base marginal; the CE loss
+trains against the MODEL's predicted marginals. DeFoG's one-shot factorised head is a
+good marginal and a poor joint, so the two differ, and `m ~ p*/p_base_model` decomposes
+into CALIBRATION (move the model's marginals toward the empirical ones) plus CREDIT (the
+reward tilt on top). If calibration dominates, applying that `m` to an already-empirical
+base overshoots -- which is exactly the negative correlation.
+
+Setting `lambda = 0` makes the weights uniform and the target the plain empirical
+marginal, so any improvement is pure calibration with no reward content:
+
+| seed | lambda=1 paired d | **lambda=0 paired d** |
+|---|---|---|
+| 42 | -0.044639 (t -15.95) | **-0.046192 (t -17.37)** |
+| 43 | -0.079151 (t -23.03) | **-0.082971 (t -25.91)** |
+
+**Removing the reward entirely makes the head slightly BETTER.** The entire 6-9% gain is
+calibration; the reward-weighted target is just a noisier version of the same problem.
+Round 4 learned nothing about credit.
+
+### The result, after four rounds and eight heads
+
+| round | loss / target | Gate 2 (null +0.097, ceiling 0.890) |
+|---|---|---|
+| 1 gated | gKL on absolute m | 0.200, 0.099 |
+| 2 scaled | + readout does not throttle | 0.233, 0.230 |
+| 3 cond | + target is the true conditional | 0.191, 0.195 |
+| 4 ce | gauge-invariant CE on the guided marginal | **-0.113, -0.218** |
+
+Four formulations, eight heads, and Gate 2 never rose above the noise floor. Everything
+each round improved turned out to be a quantity other than credit: the level (rounds
+1-3) or the base model's calibration (round 4), each confirmed by a control.
+
+> The per-coordinate credit is **estimable** -- ~23 simulations from a state recover it
+> at r ~ 0.89 -- but not **amortisable**. Four training formulations and 12.3M parameters
+> conditioned on `x_t` recover none of it.
+
+### A separable positive result
+
+The round-4 head DOES learn something real and useful: it improves DeFoG's own
+clean-graph marginals by 6-9% in cross-entropy against simulated ground truth, on
+held-out states. That is a calibration correction for the one-shot factorised head, it
+needs no reward, and it is orthogonal to everything above. Whether it improves generated
+molecules is untested and would be worth a Gate 3.
+
 ### What would still be worth doing
 
 * **More states with K completions.** Round 3 conflated the target fix with an 8x cut in
