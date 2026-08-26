@@ -23,12 +23,13 @@
 set -euo pipefail
 
 SEED="${1:-42}"
+READOUT="${2:-scaled}"
 cd "$HOME/Programming/DeFoG-dam"
 mkdir -p logs ckpts/credit
 export PYTHONPATH="$PWD"
 PY="$HOME/Programming/DeFoG/.venv/bin/python"
 
-echo "host=$(hostname) job=${SLURM_JOB_ID:-none} seed=${SEED}"
+echo "host=$(hostname) job=${SLURM_JOB_ID:-none} seed=${SEED} readout=${READOUT}"
 echo "commit=$(git log --oneline -1)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
@@ -36,7 +37,8 @@ srun "$PY" scripts/fit_credit_head.py \
   --seed "$SEED" \
   --pool 8192 --batch 256 --steps 500 --eta 30 \
   --lam 1.0 --iters 8000 --batch-train 32 --lr 1e-4 \
+  --readout "$READOUT" \
   --base ckpts/zinc_e1_seed42_kek.ckpt \
   --adapter ckpts/clogp_v11/clogp_adapter.ckpt \
   --pool-cache "ckpts/credit/pool_seed${SEED}.pt" \
-  --out "ckpts/credit/credit_head_seed${SEED}.ckpt"
+  --out "ckpts/credit/credit_head_${READOUT}_seed${SEED}.ckpt"
