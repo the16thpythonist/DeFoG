@@ -124,6 +124,9 @@ def main():
     p.add_argument("--readout", default="scaled", choices=["scaled", "gated"])
     p.add_argument("--readout-scale", type=float, default=0.3)
     p.add_argument("--out", default="ckpts/credit/credit_head_ce.ckpt")
+    p.add_argument("--use-k", type=int, default=0,
+                   help="use only the first K completions; 0 = all. Lets the "
+                        "K dose-response run on IDENTICAL states.")
     p.add_argument("--reward", default="logp", choices=["logp", "oxy"])
     p.add_argument("--base-mode", default="emp", choices=["emp", "model"],
                    help="emp targets the reward TILT only (calibration "
@@ -138,8 +141,28 @@ def main():
         q.requires_grad_(False)
     adapter = AdaLNAdapter.load(a.adapter, device=dev)
     pool = torch.load(a.pool, weights_only=False)
+    if a.use_k and a.use_k < pool["reward"].shape[0]:
+        for k in ("Z_X", "Z_E", "reward"):
+            pool[k] = pool[k][:a.use_k]
     S, K = pool["t"].shape[0], pool["reward"].shape[0]
     rw = pool_reward(pool, a.reward)
+    # Split-half reliability of the TARGET. Round 5 regressed a target whose reliability
+    # was ~0.00 at K=6-8, which no amount of training can fix; printing it makes an
+    # uninterpretable run obvious from its first line instead of its last.
+    with torch.no_grad():
+        h = K // 2
+        def _tilt(ix):
+            w = torch.softmax(rw[ix], 0)
+            ps = (w[:, :, None, None] * pool["Z_X"][ix]).sum(0)
+            pe = pool["Z_X"][ix].mean(0)
+            return torch.log((ps + 1e-6) / (pe + 1e-6))
+        m = pool["node_mask"]
+        A, B = _tilt(list(range(h)))[m].flatten(), _tilt(list(range(h, 2*h)))[m].flatten()
+        A, B = A - A.mean(), B - B.mean()
+        rel = float((A*B).sum() / (A.norm()*B.norm()).clamp_min(1e-12))
+    print(f"target split-half reliability at K={h}/half: r = {rel:+.4f}"
+          f"   (Spearman-Brown at K={K}: {2*rel/(1+rel) if rel > -1 else float('nan'):+.4f})",
+          flush=True)
     print(f"pool: {S} states x {K} completions | reward={a.reward} "
           f"base-mode={a.base_mode} | within-state sd {float(rw.std(0).mean()):.4f} "
           f"between {float(rw.mean(0).std()):.4f}", flush=True)
