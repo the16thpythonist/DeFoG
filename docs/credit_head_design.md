@@ -293,6 +293,29 @@ the only way to obtain it is per-state Monte Carlo, and per-state Monte Carlo at
 has reliability 0.14-0.20 (section on the pooling deficit). Both routes are closed for
 the same underlying reason.
 
+### Gate 3 across all three rounds is the null distribution
+
+| round | seed | best delta | at scale | validity |
+|---|---|---|---|---|
+| 1 gated | 43 / 42 | -0.0043 / -0.0156 | 2 / 1 | 0.936 / 0.943 |
+| 2 scaled | 43 / 42 | -0.0078 / -0.0203 | 2 / 0.5 | 0.947 / 0.938 |
+| 3 cond | 42 / 43 | **-0.0271** / -0.0188 | 4 / 0.5 | **0.882** / 0.941 |
+
+Control 0.6519, validity 0.945, seed sd 0.0171. Each "best" is the minimum of 4-5 arms,
+and the expected minimum of 5 draws from N(0, 0.0171) is about **-0.020**. Every
+observed best lies in -0.004 to -0.027, i.e. squarely in that distribution. There is no
+arm that beats selection noise.
+
+The largest, round 3's -0.0271, is also the clearest artifact: validity fell 0.945 ->
+0.882 in that arm, and **MAE is computed only over DECODABLE molecules**. Guidance
+strong enough to break 6% more molecules removes them from the average, so the survivors
+score better. That is a confound in the metric, not a result -- and it fails this gate's
+own "validity not degraded" clause.
+
+Worth fixing if Gate 3 is ever run again: report MAE over all samples with a fixed
+penalty for undecodable ones, so improving the numerator by shrinking the denominator
+cannot look like success.
+
 ### What would still be worth doing
 
 * **More states with K completions.** Round 3 conflated the target fix with an 8x cut in
