@@ -443,6 +443,88 @@ So, at K=64 on 1024 states:
 Registering this in advance because every previous round was read after the fact, and
 three conclusions in this project were later overturned for exactly that reason.
 
+## 6f. Round 6: the K dose-response, and the boundary demonstrated
+
+The registered prediction (6e) was tested at K = 8, 16, 32, 64 on IDENTICAL states
+(`--use-k` subsets one pool), both rewards, two seeds. It came out right in its
+conclusion and wrong in one premise.
+
+### K was a real constraint, and rounds 1-5 were measuring noise
+
+Target split-half reliability, and Gate 1 against no guidance at all:
+
+| K | oxy reliability | oxy d vs unguided | logp reliability | logp d vs unguided |
+|---|---|---|---|---|
+| 8 | 0.058 / 0.064 | +0.0056 / +0.0075 | 0.015 / 0.007 | +0.0038 |
+| 16 | 0.112 / 0.108 | +0.0052 / +0.0038 | 0.010 / 0.009 | +0.0038 |
+| 32 | 0.140 / 0.139 | +0.0004 / +0.0015 | 0.015 / 0.012 | +0.0032 |
+| 64 | **0.159 / 0.160** | **-0.0040 / -0.0028** | **0.015 / --** | **+0.0017** |
+
+(two seeds where both are shown)
+
+For oxygen the head goes worse -> worse -> equal -> **better than unguided**,
+monotonically, as the target's reliability rises. Both seeds. That is a clean
+dose-response and it settles the earlier rounds: **K=8 was a binding constraint, and
+every conclusion in sections 6b-6d was drawn from a target that was ~all noise.**
+
+### And the boundary itself, at K=64
+
+Gate 2, identical states and pipeline, only the reward's shape differing:
+
+| reward | raw | resid-2 | per-state mean +- SE | null |
+|---|---|---|---|---|
+| **oxygen** (decomposable) | +0.757 / +0.781 | +0.729 / +0.757 | **+0.679 +- 0.058 / +0.737 +- 0.046** | -0.154 |
+| **logP** (aggregate) | +0.111 | +0.080 | **+0.023 +- 0.114** | +0.101 |
+
+Ceiling 0.890. Oxygen reaches 0.68-0.74; logP sits at 0.023, BELOW its own null. Across
+four earlier rounds and eight heads Gate 2 never left the 0.10-0.23 band -- it just
+moved 3.5x, because for the first time the target was estimable and the reward had
+per-coordinate content.
+
+**logP's reliability is FLAT across an 8x range in K** (0.015, 0.010, 0.015, 0.015).
+Oxygen's nearly tripled over the same range. That is not a sample-size limit anyone can
+spend their way out of: for a target on a SUM, the per-coordinate tilt is essentially
+zero, and no amount of sampling resolves zero.
+
+### Three instruments, one boundary
+
+| measurement | oxygen | logP | ratio |
+|---|---|---|---|
+| net directional signal at matched ESS (6a) | coherence 1.000 | coherence 0.577 | **8.7x** |
+| target reliability at K=32 (this section) | 0.140 | 0.015 | **9.1x** |
+| Gate 2 at K=64 | 0.68-0.74 | 0.023 | -- |
+
+The first two are completely different methods -- marginal shifts within a single state,
+versus split-half reliability of a training target across 1024 states -- and they agree
+to within 5%.
+
+### The premise that was wrong
+
+Oxygen was chosen as the positive control because it has strong per-coordinate signal.
+But its coherence is 1.000, i.e. every coordinate receives the SAME instruction, so
+oxygen has almost no COORDINATE-SPECIFIC content and a 9-number per-element lookup is
+near-optimal for it. Both seeds' heads fail the formal gate for exactly that reason
+(head 0.679/0.737 against per-class 0.697), and that is the gate behaving correctly:
+it is built to exclude per-element shortcuts, and for oxygen the per-element shortcut IS
+the answer.
+
+So oxygen demonstrates that the machinery works and that Gate 2 can detect signal when
+signal exists. It does not demonstrate coordinate-specific amortisation. A reward that
+is decomposable but NOT uniform across coordinates would be needed for that, and none
+was run.
+
+### The result
+
+> Per-coordinate credit assignment amortises for a reward whose per-coordinate
+> instruction is estimable, and does not for a target on an aggregate -- where the
+> instruction is not merely small but has a reliability that does not improve with any
+> practical number of simulations. Demonstrated on identical states, identical
+> pipeline, two seeds, with only the reward's shape varying.
+
+That is the case DAM's authors name as open (p.11, "Applying DAM to non-masked CTMC's
+presents an interesting future work"), and the literature phase found nobody has
+published either the positive or the negative.
+
 ### What would still be worth doing
 
 * **More states with K completions.** Round 3 conflated the target fix with an 8x cut in
