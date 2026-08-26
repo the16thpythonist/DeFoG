@@ -56,25 +56,59 @@ def base_marginals(base, adapter, pool, dev, batch=32):
     return torch.cat(outX), torch.cat(outE)
 
 
-def ce_loss(head, pool, lpX, lpE, idx, lam, dev):
+OXY = 2   # index of O in ["C","N","O","F","P","S","Cl","Br","I"]
+
+
+def pool_reward(pool, kind, dev=None):
+    """The pool stores COMPLETIONS, not rewards -- so a different reward costs nothing
+    to evaluate. Oxygen count is read straight off the one-hot; no RDKit, no resampling.
+
+    Standardised to unit sd so `lam` means the same thing across rewards, which is how
+    the oxy-max vs logp-match contrast was measured at matched effective sample size.
+    """
+    if kind == "logp":
+        r = pool["reward"].clone()
+    elif kind == "oxy":
+        nm = pool["node_mask"][None, :, :].float()
+        r = (pool["Z_X"][..., OXY] * nm).sum(-1)
+    else:
+        raise ValueError(kind)
+    r = (r - r.mean()) / r.std().clamp_min(1e-8)
+    return r.to(dev) if dev is not None else r
+
+
+def ce_loss(head, pool, lpX, lpE, idx, lam, dev, rw=None, base_mode="model"):
     X_t = pool["X_t"][idx].to(dev); E_t = pool["E_t"][idx].to(dev)
     t = pool["t"][idx].to(dev); nm = pool["node_mask"][idx].to(dev)
     cond = pool["cond"][idx].to(dev)
     Z_X = pool["Z_X"][:, idx].to(dev)          # (K, b, n, dx) one-hot completions
     Z_E = pool["Z_E"][:, idx].to(dev)
-    w = torch.softmax(lam * pool["reward"][:, idx].to(dev), dim=0)      # (K, b)
+    r = (pool["reward"][:, idx].to(dev) if rw is None else rw[:, idx].to(dev))
+    w = torch.softmax(lam * r, dim=0)                                   # (K, b)
 
     # the reward-tilted empirical class distribution -- the target guidance should hit
     tX = (w[:, :, None, None] * Z_X).sum(0)
     tE = (w[:, :, None, None, None] * Z_E).sum(0)
 
+    if base_mode == "emp":
+        # Target the TILT ONLY. p* and p_emp come from the SAME completions, so the
+        # base model's miscalibration appears in both and cancels exactly; what is left
+        # is the reward's effect and nothing else. Round 4 used the model's marginals
+        # here, which bundled calibration with credit -- and the lambda=0 control showed
+        # the entire gain was calibration. This also makes the loss and Gate 2 measure
+        # the same object, which they did not before.
+        bX = torch.log(Z_X.mean(0).clamp_min(1e-6))
+        bE = torch.log(Z_E.mean(0).clamp_min(1e-6))
+    else:
+        bX, bE = lpX[idx].to(dev), lpE[idx].to(dev)
+
     lmX, lmE = head(X_t, E_t, t, nm, cond)
-    qX = F.log_softmax(lpX[idx].to(dev) + lmX, dim=-1)                  # normalised =>
-    qE = F.log_softmax(lpE[idx].to(dev) + lmE, dim=-1)                  # gauge-invariant
+    qX = F.log_softmax(bX + lmX, dim=-1)                                # normalised =>
+    qE = F.log_softmax(bE + lmE, dim=-1)                                # gauge-invariant
     em = edge_mask_of(nm)
     ceX = -(tX * qX).sum(-1)[nm].mean()
     ceE = -(tE * qE).sum(-1)[em].mean()
-    return 0.5 * (ceX + ceE), float(ceX), float(ceE), (qX, tX, nm, lpX[idx].to(dev))
+    return 0.5 * (ceX + ceE), float(ceX), float(ceE), (qX, tX, nm, bX)
 
 
 def main():
@@ -90,6 +124,10 @@ def main():
     p.add_argument("--readout", default="scaled", choices=["scaled", "gated"])
     p.add_argument("--readout-scale", type=float, default=0.3)
     p.add_argument("--out", default="ckpts/credit/credit_head_ce.ckpt")
+    p.add_argument("--reward", default="logp", choices=["logp", "oxy"])
+    p.add_argument("--base-mode", default="emp", choices=["emp", "model"],
+                   help="emp targets the reward TILT only (calibration "
+                        "cancels); model bundles calibration with credit")
     p.add_argument("--seed", type=int, default=42)
     a = p.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -101,7 +139,10 @@ def main():
     adapter = AdaLNAdapter.load(a.adapter, device=dev)
     pool = torch.load(a.pool, weights_only=False)
     S, K = pool["t"].shape[0], pool["reward"].shape[0]
-    print(f"pool: {S} states x {K} completions", flush=True)
+    rw = pool_reward(pool, a.reward)
+    print(f"pool: {S} states x {K} completions | reward={a.reward} "
+          f"base-mode={a.base_mode} | within-state sd {float(rw.std(0).mean()):.4f} "
+          f"between {float(rw.mean(0).std()):.4f}", flush=True)
     t0 = time.time()
     lpX, lpE = base_marginals(base, adapter, pool, dev)
     print(f"base marginals cached [{time.time()-t0:.0f}s]", flush=True)
@@ -120,7 +161,7 @@ def main():
     t0 = time.time()
     for it in range(1, a.iters + 1):
         idx = [tr[int(j)] for j in torch.randint(0, len(tr), (a.batch_train,), generator=g)]
-        loss, cx, ce, _ = ce_loss(head, pool, lpX, lpE, idx, a.lam, dev)
+        loss, cx, ce, _ = ce_loss(head, pool, lpX, lpE, idx, a.lam, dev, rw, a.base_mode)
         opt.zero_grad(); loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
         opt.step()
@@ -141,14 +182,14 @@ def main():
             idx = tr[i:i + 64]
             nm = pool["node_mask"][idx].to(dev)
             Z = pool["Z_X"][:, idx].to(dev)
-            w = torch.softmax(a.lam * pool["reward"][:, idx].to(dev), dim=0)
+            w = torch.softmax(a.lam * rw[:, idx].to(dev), dim=0)
             tX = (w[:, :, None, None] * Z).sum(0)
             bX = Z.mean(0)
             acc_n += tX[nm].sum(0); acc_d += bX[nm].sum(0)
         pc = torch.log((acc_n / acc_d.clamp_min(1e-9)).clamp_min(1e-9))
         for i in range(0, len(va), 16):
             idx = va[i:i + 16]
-            _, _, _, aux = ce_loss(head, pool, lpX, lpE, idx, a.lam, dev)
+            _, _, _, aux = ce_loss(head, pool, lpX, lpE, idx, a.lam, dev, rw, a.base_mode)
             qX, tX, nm, lp = aux
             hs.append((-(tX * qX).sum(-1))[nm].cpu())
             us.append((-(tX * F.log_softmax(lp, -1)).sum(-1))[nm].cpu())

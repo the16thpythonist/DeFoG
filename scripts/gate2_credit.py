@@ -60,6 +60,7 @@ def main():
     p.add_argument("--lam", type=float, default=1.0)
     p.add_argument("--ceiling", type=float, default=0.89)
     p.add_argument("--pass-at", type=float, default=0.6)
+    p.add_argument("--reward", default="logp", choices=["logp", "oxy"])
     p.add_argument("--out", default="")
     a = p.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -99,12 +100,18 @@ def main():
                                      composition=AdapterComposition(
                                          [ConditionBranch(adapter, cr, 1.0)],
                                          base=base, mode="product"))
-            Xi, Ei, _ = base.limit_dist.ignore_virtual_classes(sX.clone(), sE.clone())
-            rr = rew(Xi, Ei, nr, cr).to(dev).float().reshape(r, a.states)
+            if a.reward == "oxy":
+                # must match the reward the head was TRAINED on, or this measures the
+                # wrong instruction entirely
+                rr = (sX[..., 2] * nr.float()).sum(-1).reshape(r, a.states)
+            else:
+                Xi, Ei, _ = base.limit_dist.ignore_virtual_classes(sX.clone(), sE.clone())
+                rr = rew(Xi, Ei, nr, cr).to(dev).float().reshape(r, a.states)
             zx.append(sX.view(r, a.states, *sX.shape[1:]))
             ze.append(sE.view(r, a.states, *sE.shape[1:])); rw.append(rr)
             done += r
     ZX, ZE, R = torch.cat(zx), torch.cat(ze), torch.cat(rw)
+    R = (R - R.mean()) / R.std().clamp_min(1e-8)   # same scaling as training
     em = edge_mask_of(nm)
 
     with torch.no_grad():
