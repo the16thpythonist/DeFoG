@@ -1,3 +1,7 @@
+> **CLOSED.** This line of work is finished -- see [`dam_postmortem.md`](dam_postmortem.md) for the verdict and a
+> plain-terms summary of every measurement. This file is the detailed record of the credit-head rescue
+> and is kept as the appendix.
+
 # Amortised credit head: build plan
 
 **Status:** design. Gate 0 passed (`docs/dam_result.md`, split-half reliability 0.89).

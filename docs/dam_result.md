@@ -1,3 +1,7 @@
+> **CLOSED.** This line of work is finished -- see [`dam_postmortem.md`](dam_postmortem.md) for the verdict and a
+> plain-terms summary of every measurement. This file is the detailed record of the DAM arm
+> and is kept as the appendix.
+
 # DAM on DeFoG: measured outcome
 
 **Status:** the earlier negative result is **withdrawn**. It was produced by a metric
