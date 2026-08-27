@@ -90,6 +90,12 @@ COND_FOURIER="${COND_FOURIER:-3}"
 XATTN_TOKENS="${XATTN_TOKENS:-8}"
 XATTN_DIM="${XATTN_DIM:-128}"
 XATTN_HEADS="${XATTN_HEADS:-8}"
+# Every architecture in the capacity sweep was trained at ONE seed, so an unlucky init
+# draw is indistinguishable from a real architectural difference -- the 8/128/8 arm came
+# out worst of thirteen and dragged two sub-sweeps into looking U-shaped. Exposing the
+# seed makes a replicate arm possible, which is what turns "differences under ~0.05 are
+# not interpretable" from a guess into a measurement.
+SEED="${SEED:-42}"
 WANT_TOKEN="-94.15126384728774"
 # The shipped clogp@1.2.0 normalisation. The adapter must land on these or it is
 # conditioned on a different scale than the thing it is being compared to.
@@ -98,7 +104,7 @@ WANT_STD="1.1581127643585205"
 
 echo "xattn+fourier clogP adapter @ $(date) on $(hostname)"
 echo "base=${BASE} property=${PROPERTY} from=${PROPERTY_FROM} vocab=${VOCAB}"
-echo "fourier=${COND_FOURIER} xattn_tokens=${XATTN_TOKENS} dim=${XATTN_DIM} heads=${XATTN_HEADS}"
+echo "fourier=${COND_FOURIER} xattn_tokens=${XATTN_TOKENS} dim=${XATTN_DIM} heads=${XATTN_HEADS} seed=${SEED} epochs=${EPOCHS}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
 if [ ! -f "${BASE}.ckpt" ]; then echo "ERROR: ${BASE}.ckpt missing"; exit 1; fi
@@ -171,6 +177,7 @@ $PY -u experiments/adapter_training__zinc.py \
     --EPOCHS ${EPOCHS} \
     --H_HIDDEN ${HIDDEN} \
     --LEARNING_RATE ${LR} \
+    --SEED ${SEED} \
     --COND_FOURIER ${COND_FOURIER} \
     --XATTN_TOKENS ${XATTN_TOKENS} \
     --XATTN_DIM ${XATTN_DIM} \
