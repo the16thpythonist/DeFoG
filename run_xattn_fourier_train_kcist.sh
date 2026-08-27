@@ -88,8 +88,8 @@ LR=4e-4
 # ablation arm is checked against what it actually declares rather than against 3 and 8.
 COND_FOURIER="${COND_FOURIER:-3}"
 XATTN_TOKENS="${XATTN_TOKENS:-8}"
-XATTN_DIM=128
-XATTN_HEADS=8
+XATTN_DIM="${XATTN_DIM:-128}"
+XATTN_HEADS="${XATTN_HEADS:-8}"
 WANT_TOKEN="-94.15126384728774"
 # The shipped clogp@1.2.0 normalisation. The adapter must land on these or it is
 # conditioned on a different scale than the thing it is being compared to.
@@ -162,6 +162,7 @@ PY
 
 mkdir -p experiments/results/adapter_training__zinc
 
+TRAIN_LOG="xafo_trainlog_${SLURM_JOB_ID:-local}.txt"
 $PY -u experiments/adapter_training__zinc.py \
     --VOCABULARY "'${VOCAB}'" \
     --PROPERTY "'${PROPERTY}'" \
@@ -181,18 +182,26 @@ $PY -u experiments/adapter_training__zinc.py \
     --GUIDANCE_WEIGHTS "[2.0]" \
     --N_PER_TARGET 32 \
     --N_BASELINE 32 \
-    --__DEBUG__ False
+    --__DEBUG__ False 2>&1 | tee "$TRAIN_LOG"
 
-rc=$?
+rc=${PIPESTATUS[0]}
 echo "training exited ${rc} at $(date)"
 [ $rc -eq 0 ] || exit $rc
 
 # ---- confirm what was written actually carries the new architecture ---------
-RESULT_DIR=$(ls -td experiments/results/adapter_training__zinc/*/ 2>/dev/null | head -1)
+# NOT `ls -td | head -1`. That picks the newest directory by mtime, which with several
+# training jobs running concurrently is whichever job wrote last -- not this one. It
+# cross-wired two arms in the 8-arm wave (A7 resolved to A6's directory). pycomex prints
+# the archive path it created; that is this job's own directory, by construction.
+RESULT_DIR=$(grep -oE 'archive path:[[:space:]]+\S+' "$TRAIN_LOG" | head -1 | awk '{print $3}')
+if [ -z "$RESULT_DIR" ] || [ ! -d "$RESULT_DIR" ]; then
+    echo "ERROR: could not resolve this job's own result directory from $TRAIN_LOG"
+    exit 1
+fi
 echo "result dir: ${RESULT_DIR:-<none>}"
 
 CKPT_PATH_FILE="xafo_ckpt_${SLURM_JOB_ID:-local}.path"
-$PY - "$RESULT_DIR" "${WANT_MEAN}" "${WANT_STD}" "${COND_FOURIER}" "${XATTN_TOKENS}" <<'PY' > "$CKPT_PATH_FILE"
+$PY - "$RESULT_DIR" "${WANT_MEAN}" "${WANT_STD}" "${COND_FOURIER}" "${XATTN_TOKENS}" "${XATTN_DIM}" "${XATTN_HEADS}" <<'PY' > "$CKPT_PATH_FILE"
 import glob, os, sys, torch
 sys.path.insert(0, ".")
 
@@ -206,6 +215,7 @@ d, want_mean, want_std = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 # Read from the launcher instead of hardcoded, so the attribution ablation this
 # experiment's own analysis prescribes (each mechanism alone) can be run with this script.
 want_fourier, want_xattn = int(sys.argv[4]), int(sys.argv[5])
+want_dim, want_heads = int(sys.argv[6]), int(sys.argv[7])
 final = os.path.join(d, "clogp_adapter.ckpt")
 if not os.path.exists(final):
     say(f"FAIL: {final} missing"); sys.exit(1)
@@ -215,8 +225,13 @@ for f in [final] + sorted(glob.glob(os.path.join(d, "clogp_adapter_ep*.ckpt"))):
     cfg, sd = ck["config"], ck["state_dict"]
     m, s = float(sd["cond_mean"][0]), float(sd["cond_std"][0])
     scale_ok = abs(m - want_mean) < 1e-4 and abs(s - want_std) < 1e-4
+    # dim/heads included: they were NOT overridable at one point, so every arm silently
+    # trained the default and four 14-hour runs produced the same model. Checking only
+    # fourier/tokens let that through.
     arch_ok = (cfg.get("cond_fourier") == want_fourier
-               and cfg.get("xattn_tokens") == want_xattn)
+               and cfg.get("xattn_tokens") == want_xattn
+               and (not want_xattn or (cfg.get("xattn_dim") == want_dim
+                                       and cfg.get("xattn_heads") == want_heads)))
     # A trained adapter whose xattn output projections are still exactly zero learned
     # nothing through that path: the mechanism would be inert and the run would report a
     # FiLM adapter under a cross-attention label. Only meaningful when xattn is enabled.
@@ -225,7 +240,8 @@ for f in [final] + sorted(glob.glob(os.path.join(d, "clogp_adapter_ep*.ckpt"))):
     live = (xa > 0.0) if want_xattn else True
     bad += not (scale_ok and arch_ok and live)
     say(f"{os.path.basename(f):30s} fourier={cfg.get('cond_fourier')} "
-        f"xattn={cfg.get('xattn_tokens')} cond=({m:.6f},{s:.6f}) xattn_out_L1={xa:.3e} "
+        f"xattn={cfg.get('xattn_tokens')}/{cfg.get('xattn_dim')}/{cfg.get('xattn_heads')} "
+        f"cond=({m:.6f},{s:.6f}) xattn_out_L1={xa:.3e} "
         f"{'OK' if (scale_ok and arch_ok and live) else 'PROBLEM'}")
 if bad:
     say(f"\nFAIL: {bad} checkpoint(s) are wrong: scale mismatch, architecture other than "

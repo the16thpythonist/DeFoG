@@ -100,7 +100,7 @@ print("CUDA preflight OK:", torch.cuda.device_count(), "device(s)")
 PY
 
 # ---- preflight: the checkpoint really is the architecture we are reporting ----
-$PY - "$ADAPTER_CKPT" "${EXPECT_FOURIER:-}" "${EXPECT_XATTN:-}" <<'PY' || { echo "ERROR: adapter preflight failed"; exit 1; }
+$PY - "$ADAPTER_CKPT" "${EXPECT_FOURIER:-}" "${EXPECT_XATTN:-}" "${EXPECT_DIM:-}" "${EXPECT_HEADS:-}" <<'PY' || { echo "ERROR: adapter preflight failed"; exit 1; }
 import sys, torch
 sys.path.insert(0, ".")   # molsmith is found the same way e2_targeting.py finds it
 from defog.core import AdaLNAdapter
@@ -111,7 +111,10 @@ cfg = a._config()
 # fourier alone, cross-attention alone -- are evaluated rather than rejected.
 exp_f = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
 exp_x = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
+exp_d = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else None
+exp_h = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else None
 got_f, got_x = cfg.get("cond_fourier") or 0, cfg.get("xattn_tokens") or 0
+got_d, got_h = cfg.get("xattn_dim") or 0, cfg.get("xattn_heads") or 0
 print(f"adapter: {sum(p.numel() for p in a.parameters()):,} params  "
       f"fourier={cfg.get('cond_fourier')} xattn_tokens={cfg.get('xattn_tokens')} "
       f"hidden={cfg['hidden']} n_layers={cfg['n_layers']}")
@@ -126,7 +129,14 @@ if exp_f is None and exp_x is None and not (got_f or got_x):
     print("FAIL: this checkpoint carries NEITHER mechanism, so it is a plain FiLM adapter "
           "-- almost certainly the wrong file. Set EXPECT_FOURIER/EXPECT_XATTN to "
           "evaluate one deliberately."); sys.exit(1)
-print(f"  arm: fourier={got_f} xattn={got_x}")
+# dim/heads are checked too. They were not always overridable in the training launcher,
+# and four arms of an eight-arm sweep silently trained the DEFAULT architecture while
+# this preflight -- which then looked only at fourier and tokens -- passed all of them.
+for _lab, _got, _exp in (("xattn_dim", got_d, exp_d), ("xattn_heads", got_h, exp_h)):
+    if _exp is not None and _got != _exp:
+        print(f"FAIL: {_lab}={_got} but this job declares {_exp} -- it is not the arm it "
+              f"claims to evaluate."); sys.exit(1)
+print(f"  arm: fourier={got_f} xattn={got_x} dim={got_d} heads={got_h}")
 # An untrained cross-attention path is zero-init by construction, so a zero here means
 # the mechanism never learned anything and the run would report a FiLM adapter under a
 # cross-attention label.
