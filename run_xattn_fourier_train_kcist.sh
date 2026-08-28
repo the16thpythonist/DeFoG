@@ -60,7 +60,7 @@ export PYTHONUNBUFFERED=1
 
 PY=.venv/bin/python
 BASE="ckpts/zinc_kek_base"
-PROPERTY="clogp"
+PROPERTY="${PROPERTY:-clogp}"
 PROPERTY_FROM="decoded"
 VOCAB="e1_kekulized"
 # 20 epochs is the MATCHED control (the shipped recipe); 40 with a checkpoint every 10
@@ -99,11 +99,16 @@ SEED="${SEED:-42}"
 WANT_TOKEN="-94.15126384728774"
 # The shipped clogp@1.2.0 normalisation. The adapter must land on these or it is
 # conditioned on a different scale than the thing it is being compared to.
-WANT_MEAN="2.825129270553589"
-WANT_STD="1.1581127643585205"
+# The shipped clogp@1.2.0 normalisation, checked so a clogP adapter is directly
+# comparable to it. Set empty for any OTHER property: there is nothing to match, the
+# statistics differ per property, and a hardcoded logP mean would reject every one of
+# them. Empty means "report the values, do not gate on them".
+WANT_MEAN="${WANT_MEAN-2.825129270553589}"
+WANT_STD="${WANT_STD-1.1581127643585205}"
 
 echo "xattn+fourier clogP adapter @ $(date) on $(hostname)"
 echo "base=${BASE} property=${PROPERTY} from=${PROPERTY_FROM} vocab=${VOCAB}"
+echo "reference normalisation: mean=${WANT_MEAN:-<none, will report only>} std=${WANT_STD:-<none>}"
 echo "fourier=${COND_FOURIER} xattn_tokens=${XATTN_TOKENS} dim=${XATTN_DIM} heads=${XATTN_HEADS} seed=${SEED} epochs=${EPOCHS}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
@@ -208,7 +213,7 @@ fi
 echo "result dir: ${RESULT_DIR:-<none>}"
 
 CKPT_PATH_FILE="xafo_ckpt_${SLURM_JOB_ID:-local}.path"
-$PY - "$RESULT_DIR" "${WANT_MEAN}" "${WANT_STD}" "${COND_FOURIER}" "${XATTN_TOKENS}" "${XATTN_DIM}" "${XATTN_HEADS}" <<'PY' > "$CKPT_PATH_FILE"
+$PY - "$RESULT_DIR" "${WANT_MEAN}" "${WANT_STD}" "${COND_FOURIER}" "${XATTN_TOKENS}" "${XATTN_DIM}" "${XATTN_HEADS}" "${PROPERTY}" <<'PY' > "$CKPT_PATH_FILE"
 import glob, os, sys, torch
 sys.path.insert(0, ".")
 
@@ -218,20 +223,27 @@ sys.path.insert(0, ".")
 def say(*a):
     print(*a, file=sys.stderr)
 
-d, want_mean, want_std = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+d = sys.argv[1]
+# Empty -> no reference normalisation for this property; report rather than gate.
+want_mean = float(sys.argv[2]) if sys.argv[2] else None
+want_std = float(sys.argv[3]) if sys.argv[3] else None
 # Read from the launcher instead of hardcoded, so the attribution ablation this
 # experiment's own analysis prescribes (each mechanism alone) can be run with this script.
 want_fourier, want_xattn = int(sys.argv[4]), int(sys.argv[5])
 want_dim, want_heads = int(sys.argv[6]), int(sys.argv[7])
-final = os.path.join(d, "clogp_adapter.ckpt")
+# argv, not os.environ: the heredoc is quoted so nothing is interpolated, and relying
+# on the variable having been exported is a silent failure waiting to happen.
+prop = sys.argv[8]
+final = os.path.join(d, f"{prop}_adapter.ckpt")
 if not os.path.exists(final):
     say(f"FAIL: {final} missing"); sys.exit(1)
 bad = 0
-for f in [final] + sorted(glob.glob(os.path.join(d, "clogp_adapter_ep*.ckpt"))):
+for f in [final] + sorted(glob.glob(os.path.join(d, f"{prop}_adapter_ep*.ckpt"))):
     ck = torch.load(f, map_location="cpu", weights_only=False)
     cfg, sd = ck["config"], ck["state_dict"]
     m, s = float(sd["cond_mean"][0]), float(sd["cond_std"][0])
-    scale_ok = abs(m - want_mean) < 1e-4 and abs(s - want_std) < 1e-4
+    scale_ok = (want_mean is None or
+                (abs(m - want_mean) < 1e-4 and abs(s - want_std) < 1e-4))
     # dim/heads included: they were NOT overridable at one point, so every arm silently
     # trained the default and four 14-hour runs produced the same model. Checking only
     # fourier/tokens let that through.

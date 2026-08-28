@@ -39,9 +39,36 @@ from defog.core import (
 RDLogger.DisableLog("rdApp.*")
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Synthetic accessibility, from RDKit's contrib SA_Score. Not importable by default --
+# it lives outside the installed package tree -- so the path is added explicitly rather
+# than left to fail at first use, hours into a training run.
+def _load_sascorer():
+    import os, sys
+    from rdkit import RDConfig
+    p = os.path.join(RDConfig.RDContribDir, "SA_Score")
+    if p not in sys.path:
+        sys.path.append(p)
+    import sascorer
+    return sascorer
+
+
+_SASCORER = None
+
+
+def _sa_score(m):
+    """SA score, roughly 1 (easy) to 10 (hard). Unlike logp/tpsa it is a heuristic over
+    fragment frequencies plus complexity penalties, so it is bounded in practice to about
+    [1, 8] on drug-like molecules and is NOT symmetric -- most of ZINC sits near 2-3."""
+    global _SASCORER
+    if _SASCORER is None:
+        _SASCORER = _load_sascorer()
+    return float(_SASCORER.calculateScore(m))
+
+
 PROP_FNS = {"logp": lambda m: float(Crippen.MolLogP(m)),
             "clogp": lambda m: float(Crippen.MolLogP(m)),   # alias; same Crippen estimate
             "tpsa": lambda m: float(Descriptors.TPSA(m)),
+            "sascore": _sa_score,
             # QED is bounded in [0, 1] and its mass sits mid-range, unlike logp and
             # tpsa which are unbounded and roughly symmetric. That matters twice: the
             # conditioning normaliser sees a much narrower spread, and a low MAE can be
@@ -127,7 +154,7 @@ SMILES_COLUMN: str = "smiles"
 
 BASE_CKPT: str = os.path.expanduser("~/Downloads/zinc_uncond_4e-4_connectivity.ckpt")
 
-PROPERTY: str = "logp"          # logp | clogp | tpsa | qed
+PROPERTY: str = "logp"          # logp | clogp | tpsa | qed | sascore
 
 # --- Adapter architecture ---
 H_HIDDEN: int = 256

@@ -43,7 +43,11 @@ STEPS=500
 ETA=25
 # The shipped adapter's OWN per-target output, not just its headline number: same seed,
 # split, target count, steps, eta and blend space, so the comparison is target-paired.
-BASELINE_JSON="adapter_improvements/blend_results/e2_prob_w2.0.json"
+# logP only. For any other property there is no shipped per-target baseline, and the
+# paired block correctly refuses to pair against a different property's targets -- but
+# pointing it at the logP file anyway would be a misleading thing to leave in the log.
+BASELINE_JSON="${BASELINE_JSON-adapter_improvements/blend_results/e2_prob_w2.0.json}"
+PROPERTY="${PROPERTY:-logp}"
 
 # Set ADAPTER_CKPT, or the newest training result is used.
 # The preflight below refuses a checkpoint missing either mechanism, so a plain FiLM
@@ -88,7 +92,7 @@ OUT="xafo_eval_${SLURM_JOB_ID:-local}"
 mkdir -p "$OUT"
 
 echo "xattn+fourier E2 eval @ $(date) on $(hostname)"
-echo "adapter=${ADAPTER_CKPT}  targets=${NT}  steps=${STEPS}  eta=${ETA}"
+echo "adapter=${ADAPTER_CKPT}  property=${PROPERTY}  targets=${NT}  steps=${STEPS}  eta=${ETA}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
 $PY - <<'PY' || { echo "ERROR: CUDA preflight failed"; exit 1; }
@@ -214,7 +218,7 @@ for i in 0 1 2 3 4 5 6 7; do
     gpu=$(( i % 4 ))
     (
         CUDA_VISIBLE_DEVICES=$gpu $PY -u scripts/e2_targeting.py \
-            --adapter-ckpt "$ADAPTER_CKPT" --property logp --split validation \
+            --adapter-ckpt "$ADAPTER_CKPT" --property "$PROPERTY" --split validation \
             --method adapter --n-targets ${NT} --per-target 10 \
             --weight ${W[$i]} --steps ${STEPS} --eta ${ETA} \
             --blend-space prob \
@@ -242,7 +246,7 @@ echo "finished at $(date)"
 [ $FAILED -eq 0 ] || echo "WARNING: at least one arm failed; the table below is INCOMPLETE"
 
 echo
-echo "=== E2 logP, validation, xattn+fourier adapter ==="
+echo "=== E2 ${PROPERTY}, validation, xattn+fourier adapter ==="
 $PY - "$OUT" "$BASELINE_JSON" "$ADAPTER_CKPT" "${NAMES[@]}" <<'PY'
 import json, math, os, sys
 
