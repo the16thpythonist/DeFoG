@@ -164,12 +164,33 @@ def main() -> int:
         from defog.core import LearnedSizeDistribution
         for p, sm, mod in zip(props, sizes, modules):
             m = LearnedSizeDistribution.load(sm)
-            # Refuses a size model fit under a different label convention than the
-            # adapter it is paired with -- they agree everywhere except the extremes,
-            # which is exactly where targeting is hardest and nobody is looking.
-            m.check_compatible(mod)
+            # SCALE-FREE compatibility check, not LearnedSizeDistribution.check_compatible.
+            #
+            # The library default is torch.allclose(atol=1e-4) on RAW values, which is
+            # scale-dependent: 1e-4 is loose for QED (std 0.13) and absurdly tight for
+            # TPSA (std 23). It also assumes both were fit on identical data, and they are
+            # not -- the size model is fit on the holdout-excluded subset while the adapter
+            # used every molecule, so their label means differ by construction. Measured
+            # here: 4.25e-4 raw on logP, which is 0.037% of a standard deviation.
+            #
+            # The failure this check EXISTS for is a label-convention mismatch (source vs
+            # decoded), which on logP is 0.4256 raw -- a thousand times larger. Requiring
+            # agreement to 1% of a standard deviation separates the two cleanly instead of
+            # rejecting an arithmetically inevitable difference.
+            am = float(mod.cond_mean.reshape(-1)[0])
+            asd = float(mod.cond_std.reshape(-1)[0])
+            zm = float(m.cond_mean.reshape(-1)[0])
+            zsd = float(m.cond_std.reshape(-1)[0])
+            dm, dsd = abs(zm - am) / asd, abs(zsd - asd) / asd
+            if dm > 1e-2 or dsd > 1e-2:
+                sys.exit(f"REFUSING: {p} size model and adapter disagree on the condition "
+                         f"scale by {dm:.4f} std (mean) / {dsd:.4f} std (std). That is far "
+                         f"beyond a data-subset difference and indicates they were fit "
+                         f"under different label conventions, so the size draw would not "
+                         f"match the steering.")
             size_models.append(m)
-            print(f"size model[{p}]: {sm}  grid {m.min_size}..{m.max_size}")
+            print(f"size model[{p}]: {sm}  grid {m.min_size}..{m.max_size}  "
+                  f"scale agrees to {dm:.2e} std (mean), {dsd:.2e} std (std)")
 
     def _compose_sizes(vals):
         """Product-of-experts over each property's P(n | target).
