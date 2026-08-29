@@ -114,6 +114,12 @@ FP_RADIUS: int = 2      # discriminative fingerprint + a cleaner Tanimoto signal
 #     reason, so the two cannot drift apart once shipped.
 FP_COUNTS: bool = False
 
+# --- Node -> condition cross-attention (0 = off, the historical default) ---
+# Same knobs as the scalar-property adapters. The measured best there was 64/128/16.
+XATTN_TOKENS: int = 0
+XATTN_DIM: int = 128
+XATTN_HEADS: int = 8
+
 # --- Adapter architecture ---
 # :param H_HIDDEN: Width of the shared trunk that feeds EVERY FiLM head. Without a
 #     cond_encoder this is also the narrowest point in the whole conditioning path:
@@ -434,6 +440,12 @@ def experiment(e: Experiment) -> None:
         streams=tuple(e.STREAMS), cond_mean=cond_mean, cond_std=cond_std,
         interior_ff=e.INTERIOR_FF, interior_attn=e.INTERIOR_ATTN,
         cond_encoder=enc_spec,
+        # cond_fourier is deliberately absent: it is refused when a cond_encoder is
+        # present, and rightly so -- Fourier features are a LOW-dimensional-input result
+        # and expanding hashed fingerprint bits into frequency bands would be meaningless.
+        # So the new architecture reduces to cross-attention alone here, which is also the
+        # component the ablation showed carries the effect.
+        xattn_tokens=e.XATTN_TOKENS, xattn_dim=e.XATTN_DIM, xattn_heads=e.XATTN_HEADS,
         name="fp_adapter", cond_type=f"morgan{e.FP_BITS}")
     e["adapter/num_params"] = sum(p.numel() for p in adapter.parameters())
     e["adapter/cond_encoder"] = enc_spec

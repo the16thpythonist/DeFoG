@@ -37,8 +37,13 @@
 set -u
 cd "${SLURM_SUBMIT_DIR:-/home/tm4030/Programming/DeFoG}"
 
-BASE="ckpts/zinc_rl2_seed42/best_model"
-VOCAB="e1_kekulized"
+# Overridable. ckpts/zinc_rl2_seed42/best_model and ckpts/zinc_kek_base are
+# weight-identical (verified: 524 tensors, 0 differing), so either names the same model,
+# but the adapters under test were trained against zinc_kek_base and the head should say
+# so. PROPS is settable so a single missing head can be trained without retraining the
+# ones that already exist.
+BASE="${BASE:-ckpts/zinc_kek_base}"
+VOCAB="${VOCAB:-e1_kekulized}"
 PY=.venv/bin/python
 mkdir -p ckpts/heads
 
@@ -57,10 +62,10 @@ torch.zeros(8, device="cuda").sum().item()
 print("CUDA preflight OK:", torch.cuda.device_count(), "device(s)")
 PY
 
-PROPS=( logp qed )
-for i in 0 1; do
+IFS=" " read -r -a PROPS <<< "${PROPS:-logp qed}"
+for i in "${!PROPS[@]}"; do
     p=${PROPS[$i]}
-    CUDA_VISIBLE_DEVICES=$i $PY -u scripts/train_property_head.py \
+    CUDA_VISIBLE_DEVICES=$(( i % 2 )) $PY -u scripts/train_property_head.py \
         --base "$BASE" \
         --vocabulary "$VOCAB" \
         --property "$p" \
@@ -70,7 +75,7 @@ for i in 0 1; do
         --seed 0 --holdout 5000 \
         --out "ckpts/heads/${p}_head" \
         > "zinc_head_${p}_${SLURM_JOB_ID}.out" 2>&1 &
-    echo "launched ${p} head on GPU ${i} (pid $!)"
+    echo "launched ${p} head on GPU $(( i % 2 )) (pid $!)"
     sleep 3
 done
 
