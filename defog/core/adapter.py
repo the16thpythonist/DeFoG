@@ -804,18 +804,12 @@ class AdapterComposition:
                     f"autoguidance requires blend_space='prob', got {blend_space!r}. "
                     f"In rate space the forbidden-transition guard would be derived from "
                     f"the guide instead of the base, and w>1 is broken there anyway.")
-        # Cross-attention branches: single-branch only, for now, ON PURPOSE.
-        # Modulation carries them as (row_slice, closure) per layer, so a second branch
-        # is structurally just one more entry at a different offset -- the door is open.
-        # It is refused rather than allowed because nothing tests it, and an untested
-        # composition path that "should work" is how a wrong number gets shipped. Delete
-        # this guard together with a test that stacks two xattn adapters.
-        n_xattn = sum(1 for b in self.branches if getattr(b.adapter, "xattn_tokens", 0))
-        if n_xattn > 1:
-            raise NotImplementedError(
-                f"{n_xattn} branches use node cross-attention; stacking them is untested. "
-                f"Compose at most one cross-attention adapter (FiLM-only adapters stack "
-                f"as before), or add a test and remove this guard.")
+        # Cross-attention branches stack. Modulation carries them as (row_slice, closure)
+        # per layer and stack_groups re-homes each closure onto its own group's rows, so a
+        # second branch is one more entry at a different offset. This was refused while
+        # nothing tested it; test_two_xattn_adapters_stack_without_crosstalk now checks
+        # that each group's output equals that adapter's SOLO forward, which is the
+        # property that makes composition mean anything.
         if base is not None:
             for b in self.branches:
                 b.adapter.check_compatible(base)

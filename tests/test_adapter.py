@@ -903,22 +903,54 @@ def test_xattn_bypass_rows_silences_it():
     return "bypass_rows silences cross-attention as well as the FiLM gates"
 
 
-def test_xattn_stacking_is_refused():
-    """Two cross-attention branches is untested, so it must raise rather than run."""
-    model, _ = build_tiny_model()
-    kw = dict(cond_dim=1, hidden=32, xattn_tokens=4, xattn_dim=16, xattn_heads=4)
-    a1 = AdaLNAdapter.for_base(model, **kw).eval()
-    a2 = AdaLNAdapter.for_base(model, **kw).eval()
-    c = torch.tensor([0.7])
-    try:
-        AdapterComposition([ConditionBranch(a1, c, 2.0), ConditionBranch(a2, c, 2.0)], base=model)
-        raise AssertionError("stacked cross-attention adapters were accepted")
-    except NotImplementedError as e:
-        assert "untested" in str(e)
-    # one xattn + one FiLM-only must still compose
-    plain = AdaLNAdapter.for_base(model, cond_dim=1, hidden=32).eval()
-    AdapterComposition([ConditionBranch(a1, c, 2.0), ConditionBranch(plain, c, 2.0)], base=model)
-    return "2x xattn refused; xattn + FiLM-only still composes"
+def test_two_xattn_adapters_stack_without_crosstalk():
+    """Composition of TWO cross-attention adapters: each group must reproduce that
+    adapter's solo forward, and group 0 must stay the frozen base.
+
+    This is the property the composition guard used to stand in for. Getting it wrong is
+    not a crash -- the offsets would simply route one adapter's closure onto another's
+    rows, and the run would produce plausible molecules steered by a blend nobody chose."""
+    import torch.nn.functional as F
+    from defog.core.data import PlaceHolder
+    model, loader = build_tiny_model()
+    noisy, extra, mask, bs = a_noisy(model, loader)
+    a1 = _wake_xattn(AdaLNAdapter.for_base(model, cond_dim=1, hidden=32, xattn_tokens=8,
+                                           xattn_dim=32, xattn_heads=4).eval(), seed=41)
+    a2 = _wake_xattn(AdaLNAdapter.for_base(model, cond_dim=1, hidden=32, xattn_tokens=4,
+                                           xattn_dim=32, xattn_heads=4).eval(), seed=42)
+    c1, c2 = torch.tensor([0.7]), torch.tensor([-1.3])
+
+    def group_probs(comp):
+        rep = len(comp) + 1
+        mod = comp.build_modulation(bs, noisy["t"])
+        nd = {"X_t": noisy["X_t"].repeat(rep, 1, 1), "E_t": noisy["E_t"].repeat(rep, 1, 1, 1),
+              "y_t": noisy["y_t"].repeat(rep, 1), "t": noisy["t"].repeat(rep, 1),
+              "node_mask": mask.repeat(rep, 1)}
+        eb = PlaceHolder(X=extra.X.repeat(rep, 1, 1), E=extra.E.repeat(rep, 1, 1, 1),
+                         y=extra.y.repeat(rep, 1))
+        pred = model.forward(nd, eb, nd["node_mask"], cond_modulation=mod)
+        return F.softmax(pred.X, -1).view(rep, bs, *pred.X.shape[1:]), mod
+
+    both, mod = group_probs(AdapterComposition(
+        [ConditionBranch(a1, c1, 2.0), ConditionBranch(a2, c2, 2.0)], base=model, mode="mean"))
+    # the closures must land on their own group's rows, in branch order
+    got = [sl for sl, _ in mod.xattn[0]]
+    assert got == [slice(bs, 2 * bs), slice(2 * bs, 3 * bs)], f"closure offsets wrong: {got}"
+
+    solo1, _ = group_probs(AdapterComposition([ConditionBranch(a1, c1, 2.0)], base=model))
+    solo2, _ = group_probs(AdapterComposition([ConditionBranch(a2, c2, 2.0)], base=model))
+    base_p = F.softmax(model.forward(noisy, extra, mask).X, -1)
+    assert torch.allclose(both[0], base_p, atol=1e-6), "group 0 is not the frozen base"
+    # solo compositions have ONE branch, so their conditional group is index 1 in both
+    # cases; in the composed run a1 is group 1 and a2 is group 2.
+    d1 = (both[1] - solo1[1]).abs().max().item()
+    d2 = (both[2] - solo2[1]).abs().max().item()
+    assert d1 < 1e-6, f"branch 1 changed when composed (max {d1:.2e}) -- crosstalk"
+    assert d2 < 1e-6, f"branch 2 changed when composed (max {d2:.2e}) -- crosstalk"
+    # and the two branches must actually differ, or the test proves nothing
+    assert not torch.allclose(both[1], both[2], atol=1e-4), "the two branches are identical"
+    return (f"two xattn adapters stack: offsets correct, each group == its solo forward "
+            f"(max {max(d1, d2):.1e}), group 0 == base")
 
 
 def test_fourier_xattn_save_load_roundtrip():
@@ -990,7 +1022,7 @@ if __name__ == "__main__":
         test_xattn_masks_padded_nodes,
         test_xattn_only_touches_its_own_group_in_a_stacked_forward,
         test_xattn_bypass_rows_silences_it,
-        test_xattn_stacking_is_refused,
+        test_two_xattn_adapters_stack_without_crosstalk,
         test_fourier_xattn_save_load_roundtrip,
     ]
     fails = 0
