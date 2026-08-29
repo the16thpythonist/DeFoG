@@ -218,17 +218,29 @@ def main() -> int:
     ap.add_argument("--guide", default=None,
                     help="Path to an AdaLNAdapter .ckpt to use as the autoguidance "
                          "negative branch, in place of the unconditional base.")
+    # FK's energy is a learned PropertyHead. A packaged adapter bundles one; a raw
+    # checkpoint under test does not, so it is supplied here -- the same caller-supplied
+    # pattern as --adapter-ckpt and --guide.
+    ap.add_argument("--head-ckpt", default=None,
+                    help="PropertyHead .ckpt to use as the FK energy, for an adapter "
+                         "that carries no bundled head.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     if bool(args.adapter) == bool(args.adapter_ckpt):
         sys.exit("give exactly one of --adapter (a store ref) or --adapter-ckpt (a raw .ckpt)")
-    if args.adapter_ckpt and args.method == "fk":
-        sys.exit("REFUSING: --adapter-ckpt with --method fk. FK needs the property head "
-                 "the package bundles; a raw checkpoint has none, and FK would silently "
-                 "reduce to plain adapter sampling.")
+
     if args.size_mode == "learned" and not args.size_model:
         sys.exit("--size-mode learned needs --size-model PATH")
+    # Fail at argument time rather than after loading a base and a dataset: FK's energy
+    # is a learned head, a raw checkpoint bundles none, and without one FK silently
+    # degrades to plain adapter sampling while still being recorded as fk.
+    if args.adapter_ckpt and args.method == "fk" and not args.head_ckpt:
+        sys.exit("REFUSING: --adapter-ckpt with --method fk needs --head-ckpt. A raw "
+                 "checkpoint bundles no property head, and FK without one is plain "
+                 "adapter sampling wearing an fk label.")
+    if args.head_ckpt and args.method != "fk":
+        sys.exit("--head-ckpt is only meaningful with --method fk (it is the FK energy)")
     if args.guide and args.method == "fk":
         sys.exit("REFUSING: --guide with --method fk. FeynmanKacSampler assigns the "
                  "composition without calling check_compatible on anything "
@@ -428,6 +440,29 @@ def main() -> int:
         print(f"guide base check: OK (token {tok:.8g}); "
               f"cond_mean/std match adapter ({main_adapter.cond_mean.item():.6f} / "
               f"{main_adapter.cond_std.item():.6f})")
+    if args.head_ckpt:
+        from defog.core.property_head import PropertyHead
+        # not `base_dev`: that is only bound on the raw-checkpoint path, and a packaged
+        # adapter with a supplied head would hit a NameError here.
+        head_dev = next(loaded.base.parameters()).device
+        head = PropertyHead.load(args.head_ckpt, device="cpu").to(head_dev).eval()
+        # The head must speak the SAME property scale as the adapter, or the energy is
+        # computed against a differently-normalised target and FK steers toward a value
+        # nobody asked for -- with every log line still printing the requested one. The
+        # head stores prop_mean/prop_std; the adapter stores cond_mean/cond_std; for one
+        # property fit on one label convention they are the same numbers.
+        hm, hs = float(head.prop_mean), float(head.prop_std)
+        am = float(adapter_module.cond_mean.reshape(-1)[0]) if adapter_module is not None else hm
+        asd = float(adapter_module.cond_std.reshape(-1)[0]) if adapter_module is not None else hs
+        if abs(hm - am) > 1e-3 * max(abs(am), 1.0) or abs(hs - asd) > 1e-3 * max(asd, 1.0):
+            sys.exit(f"REFUSING: head normalisation ({hm:.6f}, {hs:.6f}) does not match the "
+                     f"adapter's ({am:.6f}, {asd:.6f}). They were fit on differently-scaled "
+                     f"targets, so the FK energy would score against a different value than "
+                     f"the one being steered to.")
+        loaded.heads[adapter_key] = head
+        print(f"FK head: {args.head_ckpt}  prop_mean={hm:.6f} prop_std={hs:.6f} "
+              f"(matches the adapter)")
+
     if args.method == "fk":
         h = loaded.heads.get(adapter_key)
         if h is None:

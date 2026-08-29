@@ -74,6 +74,7 @@ for i in "${!PROPS[@]}"; do
         --epochs 60 --lr 1e-3 --batch-size 32 \
         --seed 0 --holdout 5000 \
         --out "ckpts/heads/${p}_head" \
+        ${EXTRA_ARGS:-} \
         > "zinc_head_${p}_${SLURM_JOB_ID}.out" 2>&1 &
     echo "launched ${p} head on GPU $(( i % 2 )) (pid $!)"
     sleep 3
