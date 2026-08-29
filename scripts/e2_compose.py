@@ -200,9 +200,13 @@ def main() -> int:
         conditioning itself, and uses the same mode so the two halves cannot disagree
         about what 'product' means.
         """
+        import torch
         from defog.core.size_distribution import ComposedSizeDistribution, SizeBranch
+        # torch.tensor([v]), not a bare float: LearnedSizeDistribution._prepare handles a
+        # 1-D or 2-D condition and reshapes it, but a Python scalar becomes a 0-dim tensor
+        # and `c.size(-1)` then raises. Same shape the single-property path passes.
         return ComposedSizeDistribution(
-            [SizeBranch(dist=m, condition=float(v), weight=1.0)
+            [SizeBranch(dist=m, condition=torch.tensor([float(v)]), weight=1.0)
              for m, v in zip(size_models, vals)], mode=args.composite_mode)
 
     def cfg_for(vals, seed):
