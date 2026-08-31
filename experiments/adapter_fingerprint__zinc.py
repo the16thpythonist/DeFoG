@@ -172,12 +172,11 @@ N_TARGETS_TRAIN: int = 6
 N_PER_TARGET: int = 64
 N_BASELINE: int = 256
 EVAL_CHUNK: int = 32
-# Steering weights must stay <= 1. The composition blends rate matrices as
-# log R_uncond + sum_i w_i (log R_cond_i - log R_uncond); with w > 1 the
-# unconditional coefficient 1 - sum(w_i) goes NEGATIVE, so the blend
-# extrapolates past the conditional instead of interpolating toward it, and
-# _stabilize's >1e5 clamp then silently drops rates. Empirically w=2 does not
-# work -- it degrades rather than steers harder.
+# The "weights must stay <= 1" rule was a property of RATE-space blending, which
+# extrapolated past the conditional at w > 1 and got silently clamped. The default
+# blend_space is now "prob" (marginals, FreeGress Eq. 10/11), where w > 1 is
+# well-behaved: the measured fingerprint optimum is w=1.5, and the curve only turns
+# over past 2.0 as validity falls (0.987 -> 0.641 at w=3.0, job 43583).
 GUIDANCE_WEIGHTS: list = [0.25, 0.5, 1.0]
 
 # :param LOAD_ADAPTER: Evaluate an already-trained adapter instead of training one.
@@ -187,6 +186,19 @@ GUIDANCE_WEIGHTS: list = [0.25, 0.5, 1.0]
 #     still climbing at the top of that grid, so the optimum is probably outside it, and
 #     finding out should not cost another 16-hour training run.
 LOAD_ADAPTER: str = None
+
+# :param FIXED_SIZE: Generate every molecule with EXACTLY the target's node count
+#     instead of drawing the size from the base model's marginal.
+#     This is not oracle leakage: in the intended use (find analogs of a query
+#     molecule) the query is in hand -- it is where the fingerprint comes from -- so
+#     its heavy-atom count is available for free. It is extra information the free-size
+#     arm did not use, though, so any lift is "fingerprint steering PLUS size
+#     agreement" and cannot be attributed to the adapter alone without an
+#     unsteered-at-fixed-size control, which this run does not include.
+#     The size used is the NODE COUNT OF THE STORED GRAPH, not GetNumHeavyAtoms() of
+#     the source SMILES -- those agree for every kept molecule, but the graph is what
+#     the sampler actually builds, so it is the authoritative number.
+FIXED_SIZE: bool = False
 GRID_N: int = 24
 GRID_SCALE: float = 2.0
 
@@ -273,14 +285,21 @@ def decode_and_fp(samples, atom_decoder, bond_decoder, radius, n_bits):
     return mols, smis, fp, (n_disc / len(mols) if mols else float("nan"))
 
 
-def guided_sample(base, adapter, target_fp, weight, n, steps, eta, omega, td, chunk, device):
+def guided_sample(base, adapter, target_fp, weight, n, steps, eta, omega, td, chunk, device,
+                  num_nodes=None):
+    """Sample ``n`` molecules under the fingerprint adapter at guidance ``weight``.
+
+    ``num_nodes`` (optional int) pins every generated graph to that exact node count;
+    left at None the base model's own size marginal is used, which is what every
+    previous fingerprint run did.
+    """
     comp = AdapterComposition([ConditionBranch(adapter, torch.as_tensor(target_fp, dtype=torch.float32), weight)],
                               base=base, mode="product")
     samp = AdaptedSampler(base, comp, eta=eta, omega=omega, sample_steps=steps, time_distortion=td)
     out, rem = [], n
     while rem > 0:
         cur = min(chunk, rem)
-        out += samp.sample(cur, device=device, show_progress=False)
+        out += samp.sample(cur, num_nodes=num_nodes, device=device, show_progress=False)
         rem -= cur
     return out
 
@@ -555,6 +574,27 @@ def experiment(e: Experiment) -> None:
                                      e.FP_RADIUS, e.FP_BITS) for i in tgt_idx],
     }
     tgt_mols = [Chem.MolFromSmiles(smiles_kept[i]) for i in tgt_idx]
+    # Size of each target as the SAMPLER would have to build it: the node count of the
+    # stored graph. GetNumHeavyAtoms() of the source SMILES should agree for every kept
+    # molecule (decoding drops charges and aromaticity, never atoms) -- checked rather
+    # than assumed, because a silent disagreement would pin the wrong size.
+    tgt_nodes = [int(graphs[i].x.shape[0]) for i in tgt_idx]
+    _bad = [(int(i), n, m.GetNumHeavyAtoms())
+            for i, n, m in zip(tgt_idx, tgt_nodes, tgt_mols) if m.GetNumHeavyAtoms() != n]
+    if _bad:
+        e.log(f"WARNING: {len(_bad)}/{len(tgt_idx)} targets whose graph node count differs "
+              f"from the source heavy-atom count, e.g. {_bad[:3]} (idx, graph_n, heavy_n)")
+    if e.FIXED_SIZE:
+        _over = [(int(i), n) for i, n in zip(tgt_idx, tgt_nodes) if n > base.max_nodes]
+        if _over:
+            raise ValueError(
+                f"FIXED_SIZE: {len(_over)} target(s) larger than the base model's "
+                f"max_nodes={base.max_nodes}: {_over[:5]}. _prepare_generation CLAMPS to "
+                f"max_nodes, so the run would report a size-matched result that was not "
+                f"size-matched. Drop those targets or use a base with more nodes.")
+        e.log(f"FIXED_SIZE: every generated graph pinned to its target's node count "
+              f"(targets span {min(tgt_nodes)}-{max(tgt_nodes)} nodes, "
+              f"base max_nodes={base.max_nodes})")
     e.log(f"{len(tgt_idx)} target molecules; conditioning on '{e.FP_FROM}' FPs, "
           f"scoring against both conventions")
 
@@ -581,6 +621,7 @@ def experiment(e: Experiment) -> None:
         split = tgt_split[ti]
         rec = {"index": int(tgt_idx[ti]), "smiles": smiles_kept[tgt_idx[ti]],
                "split": split, "n_heavy": tmol.GetNumHeavyAtoms(),
+               "n_nodes_graph": tgt_nodes[ti], "fixed_size": bool(e.FIXED_SIZE),
                "baseline_mean_tanimoto": {}, "per_w": {}}
         for c in CONVS:
             bs = tanimoto_to_target(base_fp, tgt_by_conv[c][ti])
@@ -590,11 +631,19 @@ def experiment(e: Experiment) -> None:
         best_grid = None
         for w in e.GUIDANCE_WEIGHTS:
             samples = guided_sample(base, adapter, traw, w, e.N_PER_TARGET, e.EVAL_STEPS,
-                                    e.ETA, e.OMEGA, e.TIME_DISTORTION, e.EVAL_CHUNK, device)
+                                    e.ETA, e.OMEGA, e.TIME_DISTORTION, e.EVAL_CHUNK, device,
+                                    num_nodes=(tgt_nodes[ti] if e.FIXED_SIZE else None))
             mols, smis, gfp, gdisc = decode_and_fp(samples, atom_decoder, bond_decoder, e.FP_RADIUS, e.FP_BITS)
+            # Did the pin actually take? Nothing else in this run would notice if the
+            # sampler quietly returned a different size (virtual-class cleanup, clamping),
+            # and a "size-matched" number that is not size-matched is worse than no number.
+            gsz = [m.GetNumHeavyAtoms() for m in mols]
+            size_hit = (sum(z == tgt_nodes[ti] for z in gsz) / len(gsz)) if gsz else float("nan")
             entry = {"n_valid": len(mols), "n_unique": len(set(smis)),
                      "validity": len(mols) / len(samples) if samples else 0.0,
-                     "disconnected": gdisc}
+                     "disconnected": gdisc,
+                     "mean_n_heavy": (float(np.mean(gsz)) if gsz else None),
+                     "size_hit_rate": size_hit}
             sims = None
             for c in CONVS:
                 s = tanimoto_to_target(gfp, tgt_by_conv[c][ti])
@@ -607,7 +656,9 @@ def experiment(e: Experiment) -> None:
             rec["per_w"][str(w)] = entry
             e.log(f"  [t{ti} {split}] w={w}: valid={len(mols)}/{len(samples)} uniq={len(set(smis))} "
                   f"<T>decoded={entry['mean_tanimoto_decoded']} "
-                  f"<T>source={entry['mean_tanimoto_source']} disc={gdisc:.3f}")
+                  f"<T>source={entry['mean_tanimoto_source']} disc={gdisc:.3f} "
+                  f"n_target={tgt_nodes[ti]} <n>gen={entry['mean_n_heavy']} "
+                  f"size_hit={size_hit:.3f}")
             if abs(w - e.GRID_SCALE) < 1e-9 and mols:
                 order = np.argsort(-sims)[:e.GRID_N]
                 best_grid = ([tmol] + [mols[j] for j in order], ["TARGET"] + [f"T={sims[j]:.2f}" for j in order])
