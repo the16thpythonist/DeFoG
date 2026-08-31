@@ -743,8 +743,11 @@ def test_xattn_is_nonlinear_in_node_content_unlike_film():
     # carries both deltas, and their SUM is not affine, which is the very thing being
     # demonstrated. So the contrast is between two real modulations, one per mechanism.
     em = torch.ones(bs, n, n, 1)
-    film_only = _wake_gates(AdaLNAdapter.for_base(model, cond_dim=1, hidden=32).eval(),
-                            seed=23)
+    # xattn_tokens=0 EXPLICITLY: for_base defaults to cross-attention now, and a control
+    # that quietly acquired the mechanism it is the control for would make the contrast
+    # vacuous. The assert below caught exactly that when the default flipped.
+    film_only = _wake_gates(AdaLNAdapter.for_base(model, cond_dim=1, hidden=32,
+                                                  xattn_tokens=0).eval(), seed=23)
     fmod = film_only(torch.full((bs, 1), 0.7), t=noisy["t"])
     assert fmod.xattn is None, "the FiLM-only control picked up a cross-attention path"
     def film(Z):
@@ -985,6 +988,79 @@ def test_fourier_xattn_save_load_roundtrip():
 
 
 
+
+# ===========================================================================
+# The DEFAULT architecture (for_base) vs what a stored config rebuilds (__init__)
+# ===========================================================================
+def test_for_base_defaults_to_cross_attention_and_fourier():
+    """for_base is where the current default architecture lives."""
+    model, _ = build_tiny_model()
+    a = AdaLNAdapter.for_base(model, cond_dim=1, hidden=32)
+    assert a.xattn_tokens == 64, a.xattn_tokens
+    assert a.xattn_dim == 128 and a.xattn_heads == 16
+    assert a.cond_fourier == 3, a.cond_fourier
+    # still an exact no-op at init, which is the property the whole design rests on
+    g = sum(float(p.detach().abs().sum()) for lay in a.gate for k in lay for p in lay[k].parameters())
+    o = sum(float(m.out.weight.detach().abs().sum() + m.out.bias.detach().abs().sum())
+            for m in a.xattn)
+    assert g == 0.0 and o == 0.0, (g, o)
+    return f"default = xattn {a.xattn_tokens}/{a.xattn_dim}/{a.xattn_heads}, fourier {a.cond_fourier}"
+
+
+def test_for_base_still_builds_the_legacy_film_adapter_on_request():
+    """Every result before 2026-08-28 was measured on the FiLM-only adapter; it has to
+    stay one explicit call away, or those numbers stop being reproducible."""
+    model, _ = build_tiny_model()
+    a = AdaLNAdapter.for_base(model, cond_dim=1, hidden=32, xattn_tokens=0, cond_fourier=0)
+    assert a.xattn_tokens == 0 and a.cond_fourier == 0
+    assert not hasattr(a, "xattn") or len(getattr(a, "xattn", [])) == 0
+    return "legacy FiLM-only adapter still reachable"
+
+
+def test_for_base_skips_fourier_where_the_condition_forbids_it():
+    """A blanket cond_fourier default would make for_base RAISE for every fingerprint and
+    spectrum adapter, since __init__ refuses bands next to an encoder or a wide
+    condition. The default has to be 'on where legal', and this is the test that says so."""
+    model, _ = build_tiny_model()
+    wide = AdaLNAdapter.for_base(model, cond_dim=64, hidden=32,
+                                 cond_encoder={"kind": "mlp", "in_dim": 64, "out_dim": 16,
+                                               "hidden": 32, "n_blocks": 1})
+    assert wide.cond_fourier == 0, wide.cond_fourier
+    assert wide.xattn_tokens == 64, "cross-attention is independent of the condition width"
+    no_enc = AdaLNAdapter.for_base(model, cond_dim=16, hidden=32)   # > 8 dims, no encoder
+    assert no_enc.cond_fourier == 0, no_enc.cond_fourier
+    return "fourier auto-disabled for encoder and wide conditions; xattn unaffected"
+
+
+def test_init_stays_conservative_so_old_checkpoints_rebuild_unchanged():
+    """THE REGRESSION GUARD for moving the defaults into __init__.
+
+    load()/from_config() rebuild an adapter by calling __init__ with the stored config,
+    and a checkpoint written before cross-attention existed has no xattn_tokens key at
+    all. If __init__ ever defaults it on, every one of those adapters is rebuilt with a
+    path its state_dict does not contain -- and an encoder adapter raises on the Fourier
+    guard instead of loading."""
+    model, _ = build_tiny_model()
+    legacy = AdaLNAdapter.for_base(model, cond_dim=1, hidden=32,
+                                   xattn_tokens=0, cond_fourier=0).eval()
+    cfg = legacy._config()
+    # simulate a config written before either mechanism existed
+    for k in ("xattn_tokens", "xattn_dim", "xattn_heads", "cond_fourier"):
+        cfg.pop(k, None)
+    rebuilt = AdaLNAdapter.from_config(cfg, legacy.state_dict())
+    assert rebuilt.xattn_tokens == 0, rebuilt.xattn_tokens
+    assert rebuilt.cond_fourier == 0, rebuilt.cond_fourier
+    with tempfile.TemporaryDirectory() as d:
+        path = legacy.save(os.path.join(d, "legacy"))
+        back = AdaLNAdapter.load(path)
+    c = torch.tensor([[0.7]])
+    m_a, m_b = legacy(c, torch.tensor([[0.3]])), back(c, torch.tensor([[0.3]]))
+    dev = max(float((m_a.layers[i][k] - m_b.layers[i][k]).abs().max())
+              for i in range(len(m_a.layers)) for k in m_a.layers[i])
+    assert dev < 1e-6, dev
+    return f"pre-xattn config rebuilds FiLM-only; save/load deviation {dev:.2e}"
+
+
 if __name__ == "__main__":
     tests = [
         test_null_equals_base,
@@ -1024,6 +1100,10 @@ if __name__ == "__main__":
         test_xattn_bypass_rows_silences_it,
         test_two_xattn_adapters_stack_without_crosstalk,
         test_fourier_xattn_save_load_roundtrip,
+        test_for_base_defaults_to_cross_attention_and_fourier,
+        test_for_base_still_builds_the_legacy_film_adapter_on_request,
+        test_for_base_skips_fourier_where_the_condition_forbids_it,
+        test_init_stays_conservative_so_old_checkpoints_rebuild_unchanged,
     ]
     fails = 0
     for t in tests:

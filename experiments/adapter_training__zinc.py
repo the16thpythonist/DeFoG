@@ -164,25 +164,39 @@ INTERIOR_FF: bool = False        # L4: pre-FFN adaLN-Zero FiLM on X,E
 INTERIOR_ATTN: bool = False      # L10: condition e_mul (edge->attention logits)
 L10_LR_SCALE: float = 0.3        # smaller LR on the L10 heads (validity guard)
 
-# --- Condition path: Fourier bands on the target (0 = off, the historical default) ---
+# --- Condition path: Fourier bands on the target ---
 # Without this the trunk sees the property as ONE raw float while the flow-time gets a
 # 64-dim sinusoidal embedding. See AdaLNAdapter for the measured bandwidth table; 3 is
 # the ceiling that keeps neighbouring targets correlated enough to interpolate between.
-COND_FOURIER: int = 0
+# Set 0 for the pre-2026-08-28 FiLM-only adapter.
+COND_FOURIER: int = 3
 
-# --- Node -> condition cross-attention (0 tokens = off, the historical default) ---
+# --- Node -> condition cross-attention (0 tokens = off) ---
 # Each atom queries the condition instead of every atom receiving the same broadcast
-# FiLM correction. Nodes only: edges and the global vector keep the FiLM path.
-XATTN_TOKENS: int = 0
+# FiLM correction. Nodes only: edges and the global vector keep the FiLM path. This is
+# the half that carries the effect: attribution at 60 epochs was -0.153 MAE for
+# cross-attention against -0.024 for the Fourier bands.
+XATTN_TOKENS: int = 64
 XATTN_DIM: int = 128
-XATTN_HEADS: int = 8
+XATTN_HEADS: int = 16
 
 # --- Training ---
-EPOCHS: int = 20
+# THESE THREE DEFAULTS TOGETHER ARE THE MEASURED RECIPE (logP MAE 0.3250). Changing any
+# one of them in isolation does not reproduce it:
+#   * EPOCHS. The old default of 20 was badly under-trained for this architecture --
+#     0.4299 at 20 epochs against 0.3596 at 40. ep40->60 bought only -0.0095, so 60-80 is
+#     the saturated region and 80 is what the shipped arms ran.
+#   * LEARNING_RATE. 4e-4, NOT the 2e-4 this module used to default to. Every measured
+#     number, including the FiLM baseline the architecture is compared against, is a
+#     4e-4 arm; at 2e-4 a bigger adapter trains at half the LR of the thing it is
+#     supposed to beat, which is a comparison of two changes at once.
+#   * MAX_TIME_HOURS bounds trainer.fit and NOTHING else, so it must clear the epoch
+#     count or training stops early and the run still reports a checkpoint.
+EPOCHS: int = 80
 BATCH_SIZE: int = 24
-LEARNING_RATE: float = 2e-4      # swept per-arm (2 LRs per property)
+LEARNING_RATE: float = 4e-4
 COND_DROP_PROB: float = 0.0      # uncond branch IS the frozen base -> dropout not needed
-MAX_TIME_HOURS: float = 5.0
+MAX_TIME_HOURS: float = 20.0
 
 # --- Sampling / evaluation ---
 EVAL_STEPS: int = 500

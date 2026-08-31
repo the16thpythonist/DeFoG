@@ -219,10 +219,17 @@ class CreditHead(nn.Module):
             self.net = [base]                      # hidden from .parameters()
             for p in base.parameters():
                 p.requires_grad_(False)
+        # PINNED TO THE FiLM-ONLY ADAPTER. `for_base` now defaults to node->condition
+        # cross-attention plus Fourier condition bands, which is the right default for a
+        # conditional adapter but would silently change this head's capacity. Every
+        # DAM/credit number on record was measured without it, and that line of work
+        # closed on a NEGATIVE result whose entire value is that it stays reproducible.
+        # Opt in by passing xattn_tokens=... through adapter_kw.
+        credit_kw = {"xattn_tokens": 0, "cond_fourier": 0, **adapter_kw}
         self.adapter = AdaLNAdapter.for_base(
             base, cond_dim=cond_dim,
             cond_mean=cond_mean, cond_std=cond_std,
-            name="credit_head", cond_type="credit", **adapter_kw)
+            name="credit_head", cond_type="credit", **credit_kw)
 
         # ZERO-INIT GATED READOUT -- the same idiom AdaLNAdapter uses to start as an
         # exact no-op. The backbone's output layer carries a SKIP CONNECTION

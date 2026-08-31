@@ -43,6 +43,24 @@ from .guidance import _GuidanceModuleBase
 _STREAMS = ("X", "E", "y")
 _DIMKEY = {"X": "dx", "E": "de", "y": "dy"}
 
+# --- the default adapter architecture ---------------------------------------------
+# Measured on ZINC logP under the E2 protocol (100 targets x 10 generations): the
+# FiLM-only adapter reached MAE 0.5420, and adding node->condition cross-attention plus
+# Fourier condition bands took it to 0.3250 at equal or better validity. Attribution at
+# 60 epochs: cross-attention -0.153, Fourier -0.024, both together -0.192 (superadditive).
+#
+# 64/128/16 comes from the capacity sweep, but READ THAT SWEEP CAREFULLY: seed-to-seed
+# spread on an identical configuration was 0.058 MAE, which is larger than nearly every
+# difference in it. These are a defensible point in a flat region, not a measured optimum,
+# and re-tuning them on one seed will mostly measure the seed.
+#
+# Applied by `for_base`, NOT by `__init__` -- see for_base's docstring for why that
+# distinction is load-bearing for old checkpoints.
+DEFAULT_XATTN_TOKENS = 64
+DEFAULT_XATTN_DIM = 128
+DEFAULT_XATTN_HEADS = 16
+DEFAULT_COND_FOURIER = 3
+
 # Accepted keys of AdaLNAdapter.__init__, used by from_config to ignore extras rather
 # than raise on a config written by a newer version.
 _CONFIG_KEYS = frozenset({
@@ -574,11 +592,35 @@ class AdaLNAdapter(nn.Module):
     @classmethod
     def for_base(cls, base, cond_dim: int, **kw) -> "AdaLNAdapter":
         """Build an adapter matching ``base``'s transformer dims (read from the live
-        module) and layer count."""
+        module) and layer count, in the CURRENT DEFAULT ARCHITECTURE.
+
+        The defaults live here and deliberately not in ``__init__``. ``load`` and
+        ``from_config`` rebuild a saved adapter by calling ``__init__`` with the stored
+        config, and a checkpoint written before cross-attention existed has no
+        ``xattn_tokens`` key in it at all. Defaulting the mechanism ON in ``__init__``
+        would reconstruct every one of those adapters with a cross-attention path their
+        state_dict does not contain -- and for an encoder adapter (fingerprint, spectrum)
+        it would hit the Fourier guard and raise outright. So ``__init__`` stays
+        conservative and means "exactly what the config says", while ``for_base`` means
+        "what we would build today".
+
+        Pass ``xattn_tokens=0, cond_fourier=0`` for the FiLM-only adapter that every
+        result before 2026-08-28 was measured on.
+        """
         attn = base.model.tf_layers[0].self_attn
         dims = {"dx": attn.dx, "de": attn.de, "dy": attn.dy}
         n_layers = len(base.model.tf_layers)
         kw.setdefault("base_token", _base_token(base))
+        kw.setdefault("xattn_tokens", DEFAULT_XATTN_TOKENS)
+        kw.setdefault("xattn_dim", DEFAULT_XATTN_DIM)
+        kw.setdefault("xattn_heads", DEFAULT_XATTN_HEADS)
+        if "cond_fourier" not in kw:
+            # Fourier features are a result about LOW-dimensional inputs, and __init__
+            # refuses them next to an encoder or a wide condition. An unconditional
+            # default would therefore make for_base() raise for every fingerprint and
+            # spectrum adapter, so the default is "on where it is legal", not "on".
+            legal = kw.get("cond_encoder") is None and cond_dim <= 8
+            kw["cond_fourier"] = DEFAULT_COND_FOURIER if legal else 0
         return cls(cond_dim, n_layers, dims, **kw)
 
     # --- forward ------------------------------------------------------------

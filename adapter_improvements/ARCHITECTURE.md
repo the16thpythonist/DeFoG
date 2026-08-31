@@ -464,3 +464,61 @@ for all of them is bounded, and only L3 (node-resolved) and Wave 5 (closed-loop)
 The reason to run the open-loop leads first anyway is that they are cheap, they are pre-freeze, and
 **L4 measures how much of the plateau the diagnosis actually explains.** Right now "open loop" is a
 mechanism story supported by a failure signature. After L4 it is a number.
+
+---
+
+## Part 6 — Outcome, and what is now the default
+
+Written after the leads were run. Everything below is measured on ZINC-kekulized under the E2
+protocol (100 validation targets, 10 generations each, pooled MAE), at each arm's own best
+guidance weight, prob-space blending, 500 steps, eta 25.
+
+### What shipped
+
+**L3 (decoupled cross-attention) and L1 (Fourier bands) both work, and L3 is the one that
+matters.** Attribution at a matched 60 epochs:
+
+| arm | logP MAE | share of the effect |
+|---|---|---|
+| shipped FiLM baseline (20 ep) | 0.5420 | — |
+| Fourier alone @60 | 0.5194 | -0.024 (12%) |
+| cross-attention alone @60 | 0.3741 | -0.153 (80%) |
+| both @60 | 0.3501 | -0.192, superadditive |
+| both, 64/128/16 @80 | **0.3250** | |
+| + Feynman-Kac (K=10) + learned size | **0.2988** | |
+
+The gap this document opened with — shipped 0.5420, in-house full conditional ~0.30, FreeGress
+0.16, of which ~0.24 was judged adapter-attributable — is closed on the adapter-attributable part.
+The adapter now matches the from-scratch conditional model it was losing to, without training one.
+
+**L4 was rejected on the cost argument, not on the evidence,** and that rejection stands: it
+required training the full conditional model *and* the adapter, which removes the reason the
+adapter design exists. L5 depended on it and died with it. L6 (autoguidance) was built and is
+available via `GuideBranch`, but is not part of the default.
+
+### Two things this document got wrong
+
+1. **L1 was ranked "cheapest thing in this document" and treated as the obvious first win.** It is
+   the cheapest, but it carries an eighth of the effect. The ranking was by implementation cost,
+   which is not the same as expected value.
+2. **The capacity sweep that chose 64/128/16 is mostly unreadable.** Seed-to-seed spread on an
+   identical configuration is 0.058 MAE — larger than nearly every difference in the sweep. The
+   chosen point is defensible and sits at the good end, but it is not a measured optimum, and
+   re-tuning those three numbers on a single seed will mostly measure the seed.
+
+### The default
+
+`AdaLNAdapter.for_base()` now builds cross-attention 64/128/16 plus 3 Fourier bands (bands only
+where the condition allows them — `__init__` refuses them next to an encoder or above 8 dims, so
+fingerprint and spectrum adapters get cross-attention only). `experiments/adapter_training__zinc.py`
+defaults to the full measured recipe: 80 epochs at LR 4e-4, not the old 20 at 2e-4.
+
+`__init__` deliberately keeps every mechanism OFF by default. It is what `load`/`from_config` call
+with a stored config, and a checkpoint written before cross-attention existed has no `xattn_tokens`
+key — defaulting it on there would rebuild those adapters with a path their `state_dict` lacks.
+`test_init_stays_conservative_so_old_checkpoints_rebuild_unchanged` fails if that distinction is
+ever collapsed. `defog/core/credit.py` is pinned to the FiLM-only adapter so the closed DAM/credit
+line stays reproducible.
+
+Pass `xattn_tokens=0, cond_fourier=0` for the pre-2026-08-28 adapter that every earlier number in
+this repository was measured on.
