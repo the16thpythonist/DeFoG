@@ -179,6 +179,14 @@ EVAL_CHUNK: int = 32
 # _stabilize's >1e5 clamp then silently drops rates. Empirically w=2 does not
 # work -- it degrades rather than steers harder.
 GUIDANCE_WEIGHTS: list = [0.25, 0.5, 1.0]
+
+# :param LOAD_ADAPTER: Evaluate an already-trained adapter instead of training one.
+#     Fingerprint weights were only ever swept to 1.0 -- FingerprintTarget.weight
+#     defaults there and was never raised, because the w=2 optimum was measured on the
+#     SCALAR adapters and never re-tested for a 1024-dimensional condition. The lift was
+#     still climbing at the top of that grid, so the optimum is probably outside it, and
+#     finding out should not cost another 16-hour training run.
+LOAD_ADAPTER: str = None
 GRID_N: int = 24
 GRID_SCALE: float = 2.0
 
@@ -483,13 +491,31 @@ def experiment(e: Experiment) -> None:
                            e.PROBE_EVERY_K, e.PROBE_N, e.PROBE_STEPS, e.PROBE_WEIGHT,
                            e.ETA, e.OMEGA, e.TIME_DISTORTION, e.EVAL_CHUNK)
 
-    trainer = pl.Trainer(max_epochs=e.EPOCHS, max_time={"hours": e.MAX_TIME_HOURS}, accelerator="auto",
-                         devices=1, enable_progress_bar=True, enable_checkpointing=False, logger=False,
-                         gradient_clip_val=1.0, callbacks=[probe])
-    e.log(f"Training adapter: epochs<={e.EPOCHS} max_time={e.MAX_TIME_HOURS}h batch={e.BATCH_SIZE} LR={e.LEARNING_RATE}")
-    trainer.fit(module, train_dataloaders=train_loader)
-
-    ckpt = adapter.save(os.path.join(e.path, "fp_adapter"))
+    if e.LOAD_ADAPTER:
+        # Load into the adapter just constructed, so every architectural field is still
+        # checked against the base by for_base() before the weights land on it.
+        _ck = torch.load(e.LOAD_ADAPTER if e.LOAD_ADAPTER.endswith(".ckpt")
+                         else e.LOAD_ADAPTER + ".ckpt", map_location="cpu",
+                         weights_only=False)
+        _cfg = _ck["config"]
+        for k, want in (("cond_dim", e.FP_BITS), ("xattn_tokens", e.XATTN_TOKENS),
+                        ("xattn_dim", e.XATTN_DIM), ("xattn_heads", e.XATTN_HEADS)):
+            if _cfg.get(k) != want:
+                raise ValueError(f"{e.LOAD_ADAPTER}: {k}={_cfg.get(k)} but this run "
+                                 f"declares {want}; it is not the adapter it claims.")
+        adapter.load_state_dict(_ck["state_dict"])
+        adapter = adapter.to(device).eval()
+        e.log(f"LOADED adapter from {e.LOAD_ADAPTER} -- skipping training, evaluating at "
+              f"weights {e.GUIDANCE_WEIGHTS}")
+        ckpt = e.LOAD_ADAPTER
+    else:
+        trainer = pl.Trainer(max_epochs=e.EPOCHS, max_time={"hours": e.MAX_TIME_HOURS}, accelerator="auto",
+                             devices=1, enable_progress_bar=True, enable_checkpointing=False,
+                             logger=False, gradient_clip_val=1.0, callbacks=[probe])
+        e.log(f"Training adapter: epochs<={e.EPOCHS} max_time={e.MAX_TIME_HOURS}h "
+              f"batch={e.BATCH_SIZE} LR={e.LEARNING_RATE}")
+        trainer.fit(module, train_dataloaders=train_loader)
+        ckpt = adapter.save(os.path.join(e.path, "fp_adapter"))
     with open(os.path.join(e.path, "fp_adapter_stats.json"), "w") as f:
         json.dump({"fp_bits": e.FP_BITS, "fp_radius": e.FP_RADIUS, "atom_types": atom_types,
                    "cond_mean": cond_mean.tolist(), "cond_std": cond_std.tolist(),
